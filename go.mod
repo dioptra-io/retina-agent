@@ -4,7 +4,6 @@ go 1.24.4
 
 require (
 	github.com/dioptra-io/retina-commons v0.0.1-dev
-	github.com/gorilla/websocket v1.5.3
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.19.0
 )
