@@ -1,0 +1,62 @@
+version: 2
+
+run:
+  concurrency: 4
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    # correctness & safety
+    - govet
+    - errcheck
+    - staticcheck
+    - gosec
+    - unconvert
+    - ineffassign
+    - gocritic
+    - nakedret
+    - funlen
+    - gocyclo
+    - prealloc
+    - dupl
+    - misspell
+    - whitespace
+    - exhaustive
+    - unparam
+
+linters-settings:
+  gocyclo:
+    min-complexity: 10
+  funlen:
+    lines: 50
+    statements: 100
+  misspell:
+    locale: US
+  dupl:
+    threshold: 100
+  gocritic:
+    enabled-checks:
+      - appendAssign
+      - captLocal
+      - channelClose
+      - commentFormatting
+      - hugeParam
+      - ifElseChain
+      - importShadow
+      - lenCompare
+      - paramTypeCombine
+      - sloppyLen
+      - stringXbytes
+      - undeclaredname
+      - unnecessaryTypeConversion
+      - valueOf
+      - wrapperFunc
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: false
+  severity:
+    errcheck: error
+    gocritic: error
