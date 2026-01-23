@@ -34,12 +34,11 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 
 **Three-stage pipeline:**
 1. **Reader**: Receives `ProbingDirective` messages from orchestrator
-2. **Processor**: Launches two concurrent probes per directive (near TTL, far TTL), correlates results
+2. **Processor**: Executes two probes per directive (near TTL, far TTL) in parallel, sends FIE when both complete
 3. **Writer**: Sends `ForwardingInfoElement` results back to orchestrator
 
 **Key features:**
 - Non-blocking probe execution (thousands of concurrent probes)
-- Map-based correlation of probe pairs
 - Automatic reconnection with exponential backoff
 - Graceful shutdown on SIGINT/SIGTERM
 
@@ -207,7 +206,7 @@ Partial FIEs complicate downstream processing. Clean failure (no FIE) is simpler
 
 ### Why non-blocking probes?
 
-Sequential probing is too slow. The map-based correlation allows launching thousands of concurrent probes while maintaining correct pairing.
+Sequential probing is too slow. Each directive spawns a goroutine that launches both probes in parallel and waits for results. This allows processing thousands of directives concurrently without blocking the main pipeline.
 
 ### Why interface for Prober?
 

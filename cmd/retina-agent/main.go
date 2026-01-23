@@ -1,9 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Copyright (c) 2025 Dioptra
-// SPDX-License-Identifier: MIT
-
 // Command retina-agent is a network measurement agent that connects to
 // an orchestrator to receive probing directives and return measurements.
 //
@@ -11,8 +8,14 @@
 //
 //	retina-agent [flags]
 //
+// Example:
+//
+//	retina-agent -id agent-1 -address orchestrator.example.com:50050 -prober-type caracal
+//
 // The agent automatically reconnects on connection loss using exponential
 // backoff. Press Ctrl+C for graceful shutdown.
+//
+// Available prober types: caracal (default), mock
 package main
 
 import (
@@ -28,43 +31,43 @@ import (
 )
 
 var (
-	// Connection flags
-	id      = flag.String("id", "agent-1", "Unique identifier for this agent")
-	address = flag.String("address", "localhost:50050", "Orchestrator address (host:port)")
+	// Agent identity and connection
+	agentID          = flag.String("id", "agent-1", "Unique identifier for this agent")
+	orchestratorAddr = flag.String("address", "localhost:50050", "Orchestrator address (host:port)")
 
-	// Buffer size flags
-	directivesBuffer = flag.Int("directives-buffer", 100, "Directives channel buffer size")
-	fiesBuffer       = flag.Int("fies-buffer", 100, "FIEs channel buffer size")
-
-	// Timeout flags
-	readDeadline        = flag.Duration("read-deadline", 60*time.Second, "Read timeout for orchestrator connection")
-	writeDeadline       = flag.Duration("write-deadline", 5*time.Second, "Write timeout for orchestrator connection")
-	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", 5*time.Minute, "Maximum wait time between reconnection attempts")
-	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "Timeout for individual probe responses")
-
-	// Error handling flags
-	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
-
-	// Prober flags
+	// Prober configuration
 	proberType = flag.String("prober-type", "caracal", "Prober implementation (caracal, mock)")
 	proberPath = flag.String("prober-path", "", "Path to prober executable (searches PATH if empty)")
+
+	// Buffer sizes
+	directivesBufferSize = flag.Int("directives-buffer", 100, "Directives channel buffer size")
+	fiesBufferSize       = flag.Int("fies-buffer", 100, "FIEs channel buffer size")
+
+	// Timeouts and deadlines
+	readDeadline        = flag.Duration("read-deadline", 60*time.Second, "Read timeout for orchestrator connection")
+	writeDeadline       = flag.Duration("write-deadline", 5*time.Second, "Write timeout for orchestrator connection")
+	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "Timeout for individual probe responses")
+	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", 5*time.Minute, "Maximum wait time between reconnection attempts")
+
+	// Error handling
+	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
 )
 
 func main() {
 	flag.Parse()
 
 	cfg := &agent.Config{
-		AgentID:                    *id,
-		OrchestratorAddr:           *address,
-		DirectivesBufferSize:       *directivesBuffer,
-		FIEsBufferSize:             *fiesBuffer,
-		ReadDeadline:               *readDeadline,
-		WriteDeadline:              *writeDeadline,
-		MaxReconnectBackoff:        *maxReconnectBackoff,
-		ProbeTimeout:               *probeTimeout,
-		MaxConsecutiveDecodeErrors: *maxConsecutiveDecodeErrors,
+		AgentID:                    *agentID,
+		OrchestratorAddr:           *orchestratorAddr,
 		ProberType:                 *proberType,
 		ProberPath:                 *proberPath,
+		DirectivesBufferSize:       *directivesBufferSize,
+		FIEsBufferSize:             *fiesBufferSize,
+		ReadDeadline:               *readDeadline,
+		WriteDeadline:              *writeDeadline,
+		ProbeTimeout:               *probeTimeout,
+		MaxReconnectBackoff:        *maxReconnectBackoff,
+		MaxConsecutiveDecodeErrors: *maxConsecutiveDecodeErrors,
 	}
 
 	if err := cfg.Validate(); err != nil {

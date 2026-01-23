@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 // Package agent implements a network probing agent that connects to an orchestrator
-// via TCP, receives probing directives, executes network probes, and returns
-// forwarding information elements.
+// via TCP, receives probing directives (PDs), sends network probes and collects
+// replies, then returns forwarding information elements (FIEs) derived from the
+// probe responses.
 //
 // # Architecture
 //
 // The agent uses a three-stage pipeline with separate goroutines:
 //   - Reader: Receives ProbingDirective messages from orchestrator
-//   - Processor: Executes network probes based on directives
+//   - Processor: Sends probes, collects replies, and constructs FIEs from responses
 //   - Writer: Sends ForwardingInfoElement results to orchestrator
 //
 // These goroutines communicate via buffered channels and are coordinated by errgroup,
@@ -30,8 +31,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -64,7 +63,11 @@ func Run(ctx context.Context, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to create prober: %w", err)
 	}
-	defer prober.Close()
+	defer func() {
+		if err := prober.Close(); err != nil {
+			log.Printf("failed to close prober: %v", err)
+		}
+	}()
 
 	a := &agent{
 		config: cfg,
@@ -73,247 +76,24 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	conn, err := net.Dial("tcp", a.config.OrchestratorAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to orchestrator: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("failed to close connection: %v", err)
+		}
+	}()
 
 	log.Printf("Agent %s: Connected to orchestrator at %s", a.config.AgentID, a.config.OrchestratorAddr)
 
-	directives := make(chan *api.ProbingDirective, a.config.DirectivesBufferSize)
+	pds := make(chan *api.ProbingDirective, a.config.DirectivesBufferSize)
 	fies := make(chan *api.ForwardingInfoElement, a.config.FIEsBufferSize)
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	// Reader: receives ProbingDirective messages from orchestrator via TCP.
-	// Each message is a newline-delimited JSON object. Network errors trigger
-	// reconnection; malformed JSON is logged and skipped to handle transient
-	// corruption. After MaxConsecutiveDecodeErrors consecutive failures, the
-	// connection is terminated (set to 0 to disable this check).
-	g.Go(func() error {
-		defer close(directives)
-		decoder := json.NewDecoder(conn)
-		consecutiveDecodeErrors := 0
-
-		for {
-			conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline))
-
-			var directive api.ProbingDirective
-			if err := decoder.Decode(&directive); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
-				if isNetworkError(err) {
-					return fmt.Errorf("connection lost while reading: %w", err)
-				}
-
-				consecutiveDecodeErrors++
-
-				if a.config.MaxConsecutiveDecodeErrors > 0 {
-					log.Printf("Agent %s: Failed to decode directive (attempt %d/%d, skipping): %v",
-						a.config.AgentID, consecutiveDecodeErrors, a.config.MaxConsecutiveDecodeErrors, err)
-
-					if consecutiveDecodeErrors >= a.config.MaxConsecutiveDecodeErrors {
-						return fmt.Errorf("too many consecutive decode errors (%d), protocol may be broken: %w",
-							consecutiveDecodeErrors, err)
-					}
-				} else {
-					log.Printf("Agent %s: Failed to decode directive (skipping): %v", a.config.AgentID, err)
-				}
-
-				continue
-			}
-
-			consecutiveDecodeErrors = 0
-
-			// Log directive received
-			log.Printf("Agent %s: ← Directive for %s (TTL %d → %d)",
-				a.config.AgentID,
-				directive.DestinationAddress,
-				directive.NearTTL,
-				directive.NearTTL+1)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case directives <- &directive:
-			}
-		}
-	})
-
-	// Processor: execute probes and generate FIEs using map-based correlation.
-	// For each directive, two probes are launched concurrently (near and far TTL).
-	// Results are correlated by directive ID and assembled into FIEs when both complete.
-	g.Go(func() error {
-		defer close(fies)
-
-		// directiveState tracks probe results for a single directive
-		type directiveState struct {
-			pd         *api.ProbingDirective
-			nearResult *ProbeResult
-			farResult  *ProbeResult
-		}
-
-		pending := make(map[uint64]*directiveState)
-		var mu sync.Mutex
-
-		// completion represents a probe result ready for correlation
-		type completion struct {
-			id     uint64
-			isNear bool
-			result *ProbeResult
-			err    error
-		}
-		completions := make(chan *completion, 200)
-
-		// Completion handler: correlates probe results and builds FIEs
-		go func() {
-			for c := range completions {
-				var fieToSend *api.ForwardingInfoElement
-
-				mu.Lock()
-				state := pending[c.id]
-				if state != nil {
-					// Handle errors
-					if c.err != nil {
-						if c.isNear {
-							log.Printf("Agent %s: Near probe failed for destination %s (TTL %d): %v",
-								a.config.AgentID, state.pd.DestinationAddress, state.pd.NearTTL, c.err)
-						} else {
-							log.Printf("Agent %s: Far probe failed for destination %s (TTL %d): %v",
-								a.config.AgentID, state.pd.DestinationAddress, state.pd.NearTTL+1, c.err)
-						}
-						delete(pending, c.id)
-						mu.Unlock()
-						continue
-					}
-
-					// Update result
-					if c.isNear {
-						state.nearResult = c.result
-					} else {
-						state.farResult = c.result
-					}
-
-					// Both probes complete?
-					if state.nearResult != nil && state.farResult != nil {
-						// Both succeeded (no timeouts)?
-						if !state.nearResult.TimedOut && !state.farResult.TimedOut {
-							fieToSend = &api.ForwardingInfoElement{
-								Agent: api.Agent{
-									AgentID: a.config.AgentID,
-								},
-								IPVersion:           state.pd.IPVersion,
-								Protocol:            state.pd.Protocol,
-								DestinationAddress:  state.pd.DestinationAddress,
-								NearInfo:            probeResultToInfo(state.nearResult, state.pd.NearTTL),
-								FarInfo:             probeResultToInfo(state.farResult, state.pd.NearTTL+1),
-								ProductionTimestamp: time.Now().UTC(),
-							}
-						}
-						// No logging for timeouts - they're expected
-						delete(pending, c.id)
-					}
-				}
-				mu.Unlock()
-
-				// Send FIE outside lock
-				if fieToSend != nil {
-					select {
-					case fies <- fieToSend:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}()
-
-		var counter uint64
-
-		// Main loop: receive directives and launch probes
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case pd, ok := <-directives:
-				if !ok {
-					return nil
-				}
-
-				if err := validateDirective(pd); err != nil {
-					log.Printf("Agent %s: Invalid directive: %v", a.config.AgentID, err)
-					continue
-				}
-
-				id := atomic.AddUint64(&counter, 1)
-
-				mu.Lock()
-				pending[id] = &directiveState{pd: pd}
-				mu.Unlock()
-
-				// Launch near probe
-				go func(probeID uint64, directive *api.ProbingDirective) {
-					result, err := a.prober.Probe(ctx, directive, directive.NearTTL)
-					completions <- &completion{
-						id:     probeID,
-						isNear: true,
-						result: result,
-						err:    err,
-					}
-				}(id, pd)
-
-				// Launch far probe
-				go func(probeID uint64, directive *api.ProbingDirective) {
-					result, err := a.prober.Probe(ctx, directive, directive.NearTTL+1)
-					completions <- &completion{
-						id:     probeID,
-						isNear: false,
-						result: result,
-						err:    err,
-					}
-				}(id, pd)
-			}
-		}
-	})
-
-	// Writer: sends ForwardingInfoElement results to orchestrator via TCP.
-	// Each result is encoded as a newline-delimited JSON object. Network errors
-	// trigger reconnection; encoding errors indicate a bug and also terminate
-	// the connection.
-	g.Go(func() error {
-		encoder := json.NewEncoder(conn)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case fie, ok := <-fies:
-				if !ok {
-					return nil
-				}
-
-				conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline))
-
-				if err := encoder.Encode(fie); err != nil {
-					if isNetworkError(err) {
-						return fmt.Errorf("connection lost while writing: %w", err)
-					}
-					return fmt.Errorf("failed to encode FIE: %w", err)
-				}
-
-				// Log FIE sent
-				nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
-				farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
-				log.Printf("Agent %s: → FIE for %s | Near(TTL%d): %v | Far(TTL%d): %v",
-					a.config.AgentID,
-					fie.DestinationAddress,
-					fie.NearInfo.ProbeTTL,
-					nearRTT,
-					fie.FarInfo.ProbeTTL,
-					farRTT)
-			}
-		}
-	})
+	g.Go(func() error { return a.readerLoop(ctx, conn, pds) })
+	g.Go(func() error { return a.processorLoop(ctx, pds, fies) })
+	g.Go(func() error { return a.writerLoop(ctx, conn, fies) })
 
 	if err := g.Wait(); err != nil && err != ctx.Err() {
 		log.Printf("Agent %s: Connection terminated with error: %v", a.config.AgentID, err)
@@ -322,6 +102,195 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	log.Printf("Agent %s: Shut down gracefully", a.config.AgentID)
 	return nil
+}
+
+// readerLoop receives ProbingDirective messages from orchestrator via TCP.
+// Each message is a newline-delimited JSON object. Network errors trigger
+// reconnection; malformed JSON is logged and skipped to handle transient
+// corruption. After MaxConsecutiveDecodeErrors consecutive failures, the
+// connection is terminated (set to 0 to disable this check).
+func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
+	defer close(pds)
+	decoder := json.NewDecoder(conn)
+	consecutiveDecodeErrors := 0
+
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
+			log.Printf("Agent %s: Failed to set read deadline: %v", a.config.AgentID, err)
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+
+		var directive api.ProbingDirective
+		if err := decoder.Decode(&directive); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if isNetworkError(err) {
+				return fmt.Errorf("connection lost while reading: %w", err)
+			}
+
+			consecutiveDecodeErrors++
+
+			if a.config.MaxConsecutiveDecodeErrors > 0 {
+				log.Printf("Agent %s: Failed to decode directive (attempt %d/%d, skipping): %v",
+					a.config.AgentID, consecutiveDecodeErrors, a.config.MaxConsecutiveDecodeErrors, err)
+
+				if consecutiveDecodeErrors >= a.config.MaxConsecutiveDecodeErrors {
+					return fmt.Errorf("too many consecutive decode errors (%d), protocol may be broken: %w",
+						consecutiveDecodeErrors, err)
+				}
+			} else {
+				log.Printf("Agent %s: Failed to decode directive (skipping): %v", a.config.AgentID, err)
+			}
+
+			continue
+		}
+
+		consecutiveDecodeErrors = 0
+
+		// Log directive received
+		log.Printf("Agent %s: ← Directive for %s (TTL %d → %d)",
+			a.config.AgentID,
+			directive.DestinationAddress,
+			directive.NearTTL,
+			directive.NearTTL+1)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case pds <- &directive:
+		}
+	}
+}
+
+// processorLoop executes probes and generates FIEs.
+// For each directive, spawns one goroutine that executes both probes
+// (near and far TTL) in parallel and sends the FIE when both complete.
+func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) error {
+	defer close(fies)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case pd, ok := <-pds:
+			if !ok {
+				return nil
+			}
+
+			if err := validateDirective(pd); err != nil {
+				log.Printf("Agent %s: Invalid directive: %v", a.config.AgentID, err)
+				continue
+			}
+
+			// Launch a single goroutine that handles both probes
+			go a.processDirective(ctx, pd, fies)
+		}
+	}
+}
+
+// writerLoop sends ForwardingInfoElement results to orchestrator via TCP.
+// Each result is encoded as a newline-delimited JSON object. Network errors
+// trigger reconnection; encoding errors indicate a bug and also terminate
+// the connection.
+func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
+	encoder := json.NewEncoder(conn)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case fie, ok := <-fies:
+			if !ok {
+				return nil
+			}
+
+			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
+				log.Printf("Agent %s: Failed to set write deadline: %v", a.config.AgentID, err)
+				return fmt.Errorf("failed to set write deadline: %w", err)
+			}
+
+			if err := encoder.Encode(fie); err != nil {
+				if isNetworkError(err) {
+					return fmt.Errorf("connection lost while writing: %w", err)
+				}
+				return fmt.Errorf("failed to encode FIE: %w", err)
+			}
+
+			// Log FIE sent
+			nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
+			farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
+			log.Printf("Agent %s: → FIE for %s | Near(TTL%d): %v | Far(TTL%d): %v",
+				a.config.AgentID,
+				fie.DestinationAddress,
+				fie.NearInfo.ProbeTTL,
+				nearRTT,
+				fie.FarInfo.ProbeTTL,
+				farRTT)
+		}
+	}
+}
+
+// processDirective executes near and far probes for a directive and sends the FIE
+func (a *agent) processDirective(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
+	type result struct {
+		probe *ProbeResult
+		err   error
+	}
+
+	nearCh := make(chan result, 1)
+	farCh := make(chan result, 1)
+
+	// Launch both probes in parallel
+	go func() {
+		probe, err := a.prober.Probe(ctx, pd, pd.NearTTL)
+		nearCh <- result{probe, err}
+	}()
+
+	go func() {
+		probe, err := a.prober.Probe(ctx, pd, pd.NearTTL+1)
+		farCh <- result{probe, err}
+	}()
+
+	// Wait for both results
+	nearRes := <-nearCh
+	farRes := <-farCh
+
+	// Handle errors
+	if nearRes.err != nil {
+		log.Printf("Agent %s: Near probe failed for %s (TTL %d): %v",
+			a.config.AgentID, pd.DestinationAddress, pd.NearTTL, nearRes.err)
+		return
+	}
+	if farRes.err != nil {
+		log.Printf("Agent %s: Far probe failed for %s (TTL %d): %v",
+			a.config.AgentID, pd.DestinationAddress, pd.NearTTL+1, farRes.err)
+		return
+	}
+
+	// Skip if either timed out (expected, no logging needed)
+	if nearRes.probe.TimedOut || farRes.probe.TimedOut {
+		return
+	}
+
+	// Build and send FIE
+	fie := &api.ForwardingInfoElement{
+		Agent: api.Agent{
+			AgentID: a.config.AgentID,
+		},
+		IPVersion:           pd.IPVersion,
+		Protocol:            pd.Protocol,
+		DestinationAddress:  pd.DestinationAddress,
+		NearInfo:            probeResultToInfo(nearRes.probe, pd.NearTTL),
+		FarInfo:             probeResultToInfo(farRes.probe, pd.NearTTL+1),
+		ProductionTimestamp: time.Now().UTC(),
+	}
+
+	select {
+	case fies <- fie:
+	case <-ctx.Done():
+	}
 }
 
 // createProber instantiates a prober based on cfg.ProberType.
@@ -393,8 +362,5 @@ func isNetworkError(err error) bool {
 		return true
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &netErr)
 }
