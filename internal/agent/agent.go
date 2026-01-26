@@ -104,11 +104,12 @@ func Run(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
-// readerLoop receives ProbingDirective messages from orchestrator via TCP.
+// readerLoop receives and validates ProbingDirective messages from orchestrator via TCP.
 // Each message is a newline-delimited JSON object. Network errors trigger
 // reconnection; malformed JSON is logged and skipped to handle transient
 // corruption. After MaxConsecutiveDecodeErrors consecutive failures, the
 // connection is terminated (set to 0 to disable this check).
+// Invalid directives are logged and skipped without terminating the connection.
 func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
 	defer close(pds)
 	decoder := json.NewDecoder(conn)
@@ -116,12 +117,11 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
-			log.Printf("Agent %s: Failed to set read deadline: %v", a.config.AgentID, err)
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
 
-		var directive api.ProbingDirective
-		if err := decoder.Decode(&directive); err != nil {
+		var pd api.ProbingDirective
+		if err := decoder.Decode(&pd); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -149,17 +149,23 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 
 		consecutiveDecodeErrors = 0
 
-		// Log directive received
+		// Validate directive.
+		if err := validatePD(&pd); err != nil {
+			log.Printf("Agent %s: Invalid directive: %v", a.config.AgentID, err)
+			continue
+		}
+
+		// Log directive received.
 		log.Printf("Agent %s: ← Directive for %s (TTL %d → %d)",
 			a.config.AgentID,
-			directive.DestinationAddress,
-			directive.NearTTL,
-			directive.NearTTL+1)
+			pd.DestinationAddress,
+			pd.NearTTL,
+			pd.NearTTL+1)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case pds <- &directive:
+		case pds <- &pd:
 		}
 	}
 }
@@ -179,13 +185,8 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 				return nil
 			}
 
-			if err := validateDirective(pd); err != nil {
-				log.Printf("Agent %s: Invalid directive: %v", a.config.AgentID, err)
-				continue
-			}
-
-			// Launch a single goroutine that handles both probes
-			go a.processDirective(ctx, pd, fies)
+			// Launch a single goroutine that handles both probes.
+			go a.processPD(ctx, pd, fies)
 		}
 	}
 }
@@ -207,7 +208,6 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 			}
 
 			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
-				log.Printf("Agent %s: Failed to set write deadline: %v", a.config.AgentID, err)
 				return fmt.Errorf("failed to set write deadline: %w", err)
 			}
 
@@ -218,63 +218,62 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return fmt.Errorf("failed to encode FIE: %w", err)
 			}
 
-			// Log FIE sent
-			nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
-			farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
-			log.Printf("Agent %s: → FIE for %s | Near(TTL%d): %v | Far(TTL%d): %v",
+			// Log FIE sent.
+			log.Printf("Agent %s: → FIE for %s | Near(TTL%d) | Far(TTL%d)",
 				a.config.AgentID,
 				fie.DestinationAddress,
 				fie.NearInfo.ProbeTTL,
-				nearRTT,
-				fie.FarInfo.ProbeTTL,
-				farRTT)
+				fie.FarInfo.ProbeTTL)
 		}
 	}
 }
 
-// processDirective executes near and far probes for a directive and sends the FIE
-func (a *agent) processDirective(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
+// processPD executes near and far probes for a directive and sends the FIE.
+func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
+	nearTTL := pd.NearTTL
+	farTTL := pd.NearTTL + 1
+
 	type result struct {
-		probe *ProbeResult
-		err   error
+		probeResult *ProbeResult
+		err         error
 	}
 
 	nearCh := make(chan result, 1)
 	farCh := make(chan result, 1)
 
-	// Launch both probes in parallel
+	// Launch both probes in parallel.
 	go func() {
-		probe, err := a.prober.Probe(ctx, pd, pd.NearTTL)
-		nearCh <- result{probe, err}
+		probeResult, err := a.prober.Probe(ctx, pd, nearTTL)
+		nearCh <- result{probeResult, err}
 	}()
 
 	go func() {
-		probe, err := a.prober.Probe(ctx, pd, pd.NearTTL+1)
-		farCh <- result{probe, err}
+		probeResult, err := a.prober.Probe(ctx, pd, farTTL)
+		farCh <- result{probeResult, err}
 	}()
 
-	// Wait for both results
+	// Wait for both results.
 	nearRes := <-nearCh
 	farRes := <-farCh
 
-	// Handle errors
+	// Handle errors.
 	if nearRes.err != nil {
 		log.Printf("Agent %s: Near probe failed for %s (TTL %d): %v",
-			a.config.AgentID, pd.DestinationAddress, pd.NearTTL, nearRes.err)
+			a.config.AgentID, pd.DestinationAddress, nearTTL, nearRes.err)
 		return
 	}
 	if farRes.err != nil {
 		log.Printf("Agent %s: Far probe failed for %s (TTL %d): %v",
-			a.config.AgentID, pd.DestinationAddress, pd.NearTTL+1, farRes.err)
+			a.config.AgentID, pd.DestinationAddress, farTTL, farRes.err)
 		return
 	}
 
-	// Skip if either timed out (expected, no logging needed)
-	if nearRes.probe.TimedOut || farRes.probe.TimedOut {
+	// Skip if either timed out (expected, no logging needed).
+	if nearRes.probeResult.TimedOut || farRes.probeResult.TimedOut {
 		return
 	}
 
-	// Build and send FIE
+	// Build and send FIE.
 	fie := &api.ForwardingInfoElement{
 		Agent: api.Agent{
 			AgentID: a.config.AgentID,
@@ -282,8 +281,8 @@ func (a *agent) processDirective(ctx context.Context, pd *api.ProbingDirective, 
 		IPVersion:           pd.IPVersion,
 		Protocol:            pd.Protocol,
 		DestinationAddress:  pd.DestinationAddress,
-		NearInfo:            probeResultToInfo(nearRes.probe, pd.NearTTL),
-		FarInfo:             probeResultToInfo(farRes.probe, pd.NearTTL+1),
+		NearInfo:            probeResultToInfo(nearRes.probeResult, nearTTL),
+		FarInfo:             probeResultToInfo(farRes.probeResult, farTTL),
 		ProductionTimestamp: time.Now().UTC(),
 	}
 
@@ -310,9 +309,9 @@ func createProber(cfg *Config) (Prober, error) {
 	}
 }
 
-// validateDirective checks that a directive has all required fields and
+// validatePD checks that a directive has all required fields and
 // protocol-specific headers.
-func validateDirective(pd *api.ProbingDirective) error {
+func validatePD(pd *api.ProbingDirective) error {
 	if pd == nil {
 		return fmt.Errorf("%w: directive is nil", ErrInvalidDirective)
 	}

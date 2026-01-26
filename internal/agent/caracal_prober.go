@@ -63,19 +63,20 @@ import (
 // CaracalProber implements high-throughput probing using caracal.
 // It uses a pipelined architecture for maximum throughput.
 type CaracalProber struct {
+	// Caracal subprocess management.
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *csv.Reader
 	stderr io.ReadCloser
 
-	// Pending probes - unified for all protocols
-	// Keyed by tuple (dst_addr + dst_port + ttl + time_second)
+	// Probe correlation - maps sent probes to waiting goroutines.
 	pending   map[probeKey]*pendingProbe
 	pendingMu sync.RWMutex
 
-	// Writer queue
+	// Non-blocking write pipeline.
 	writeQueue chan *probeRequest
 
+	// Configuration and lifecycle management.
 	config *Config
 	cancel context.CancelFunc
 	g      *errgroup.Group
@@ -83,10 +84,12 @@ type CaracalProber struct {
 
 // probeKey uniquely identifies a probe within a time window.
 type probeKey struct {
-	dstAddr    string
-	dstPort    uint16 // 0 for ICMP
-	ttl        uint8
-	timeSecond int64 // Unix timestamp in seconds
+	dstAddr        string
+	firstHalfWord  uint16 // FirstHalfWord for ICMP/ICMPv6, SourcePort for UDP
+	secondHalfWord uint16 // SecondHalfWord for ICMP/ICMPv6, DestinationPort for UDP
+	ttl            uint8
+	protocol       api.Protocol // Protocol type (ICMP, ICMPv6, UDP)
+	timeSecond     int64        // Unix timestamp in seconds
 }
 
 // pendingProbe tracks a probe waiting for a result.
@@ -95,11 +98,11 @@ type pendingProbe struct {
 	sentTime time.Time
 }
 
-// probeRequest represents a single probe to be sent.
+// probeRequest represents a single probe to be sent to caracal.
 type probeRequest struct {
-	directive *api.ProbingDirective
-	ttl       uint8
-	resultCh  chan *ProbeResult
+	pd       *api.ProbingDirective
+	ttl      uint8
+	resultCh chan *ProbeResult
 }
 
 // NewCaracalProber creates and starts a caracal prober.
@@ -125,7 +128,7 @@ func NewCaracalProber(cfg *Config) (*CaracalProber, error) {
 		g:          g,
 	}
 
-	// Skip CSV header
+	// Skip CSV header.
 	if _, err := p.stdout.Read(); err != nil {
 		if killErr := cmd.Process.Kill(); killErr != nil {
 			log.Printf("failed to kill caracal: %v", killErr)
@@ -134,7 +137,7 @@ func NewCaracalProber(cfg *Config) (*CaracalProber, error) {
 		return nil, fmt.Errorf("failed to read CSV header: %w", err)
 	}
 
-	// Start all workers in errgroup
+	// Start all workers in errgroup.
 	g.Go(func() error { return p.writerLoop(ctx) })
 	g.Go(func() error { return p.readerLoop(ctx) })
 	g.Go(func() error { return p.logStderr(ctx) })
@@ -144,47 +147,100 @@ func NewCaracalProber(cfg *Config) (*CaracalProber, error) {
 }
 
 // setupCaracalProcess creates and starts the caracal subprocess with all pipes configured.
+//
+// Uses cfg.ProberPath to locate the caracal executable (defaults to searching PATH).
+// Runs caracal with --probing-rate 100000 by default.
+//
+// Custom caracal arguments can be added via cfg.ProberArgs.
+// Example: cfg.ProberArgs = []string{"--n-packets", "3", "--interface", "eth0"}
+// Note: ProberArgs is not exposed as a command-line flag; set it programmatically if needed.
 func setupCaracalProcess(cfg *Config) (*exec.Cmd, io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
-	// Use ProberPath as caracal executable path
+	// Use ProberPath as caracal executable path.
 	caracalPath := cfg.ProberPath
 	if caracalPath == "" {
-		caracalPath = "caracal" // Default: search in PATH
+		caracalPath = "caracal" // Default: search in PATH.
 	}
 
-	cmd := exec.Command(caracalPath,
-		"--probing-rate", "100000",
-		"--sniffer-wait-time", fmt.Sprintf("%d", int(cfg.ProbeTimeout.Seconds())),
-	)
+	// Base args.
+	args := []string{"--probing-rate", "100000"}
 
-	stdin, err := cmd.StdinPipe()
+	// Add custom args if provided.
+	if len(cfg.ProberArgs) > 0 {
+		args = append(args, cfg.ProberArgs...)
+	}
+
+	cmd := exec.Command(caracalPath, args...)
+
+	// Track pipes for cleanup on error.
+	var stdin io.WriteCloser
+	var stdout io.ReadCloser
+	var stderr io.ReadCloser
+	success := false
+
+	// Cleanup pipes if function fails.
+	defer func() {
+		if !success {
+			closePipe(stdin, "stdin")
+			closePipe(stdout, "stdout")
+			closePipe(stderr, "stderr")
+		}
+	}()
+
+	// Create pipes.
+	var err error
+	stdin, err = cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to get stdin pipe: %w", err)
 	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	stdout, err = cmd.StdoutPipe()
 	if err != nil {
-		if closeErr := stdin.Close(); closeErr != nil {
-			log.Printf("failed to close stdin: %v", closeErr)
-		}
 		return nil, nil, nil, nil, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
-	stderr, err := cmd.StderrPipe()
+	stderr, err = cmd.StderrPipe()
 	if err != nil {
-		if closeErr := stdin.Close(); closeErr != nil {
-			log.Printf("failed to close stdin: %v", closeErr)
-		}
 		return nil, nil, nil, nil, fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
 
+	// Start caracal.
 	if err := cmd.Start(); err != nil {
-		if closeErr := stdin.Close(); closeErr != nil {
-			log.Printf("failed to close stdin: %v", closeErr)
-		}
 		return nil, nil, nil, nil, fmt.Errorf("failed to start caracal: %w", err)
 	}
 
-	return cmd, stdin, stdoutPipe, stderr, nil
+	success = true
+	return cmd, stdin, stdout, stderr, nil
+}
+
+// closePipe safely closes a pipe and logs errors.
+func closePipe(pipe io.Closer, name string) {
+	if pipe != nil {
+		if err := pipe.Close(); err != nil {
+			log.Printf("Failed to close %s: %v", name, err)
+		}
+	}
+}
+
+// extractHalfWords returns the firstHalfWord and secondHalfWord from a directive.
+func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
+	switch pd.Protocol {
+	case api.ICMP:
+		if pd.NextHeader.ICMPNextHeader != nil {
+			return pd.NextHeader.ICMPNextHeader.FirstHalfWord,
+				pd.NextHeader.ICMPNextHeader.SecondHalfWord
+		}
+	case api.ICMPv6:
+		if pd.NextHeader.ICMPv6NextHeader != nil {
+			return pd.NextHeader.ICMPv6NextHeader.FirstHalfWord,
+				pd.NextHeader.ICMPv6NextHeader.SecondHalfWord
+		}
+	case api.UDP:
+		if pd.NextHeader.UDPNextHeader != nil {
+			return pd.NextHeader.UDPNextHeader.SourcePort,
+				pd.NextHeader.UDPNextHeader.DestinationPort
+		}
+	}
+	return 0, 0
 }
 
 // Probe sends a probe and waits for the result.
@@ -192,24 +248,23 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
 
-	// Build key for correlation
+	// Build key for correlation.
+	firstHalf, secondHalf := extractHalfWords(pd)
 	key := probeKey{
-		dstAddr:    pd.DestinationAddress.String(),
-		ttl:        ttl,
-		timeSecond: now.Unix(),
-	}
-
-	// Add destination port for UDP
-	if pd.Protocol == api.UDP && pd.NextHeader.UDPNextHeader != nil {
-		key.dstPort = pd.NextHeader.UDPNextHeader.DestinationPort
+		dstAddr:        pd.DestinationAddress.String(),
+		firstHalfWord:  firstHalf,
+		secondHalfWord: secondHalf,
+		ttl:            ttl,
+		protocol:       pd.Protocol,
+		timeSecond:     now.Unix(),
 	}
 
 	p.pendingMu.Lock()
 
-	// Check if duplicate probe already pending in same second
+	// Check if duplicate probe already pending in same second.
 	if existing, exists := p.pending[key]; exists {
 		p.pendingMu.Unlock()
-		// Wait for existing probe to complete (share result)
+		// Wait for existing probe to complete (share result).
 		return <-existing.resultCh, nil
 	}
 
@@ -219,18 +274,18 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	}
 	p.pendingMu.Unlock()
 
-	// Cleanup function
+	// Cleanup function.
 	defer func() {
 		p.pendingMu.Lock()
 		delete(p.pending, key)
 		p.pendingMu.Unlock()
 	}()
 
-	// Queue probe for writing
+	// Queue probe for writing.
 	req := &probeRequest{
-		directive: pd,
-		ttl:       ttl,
-		resultCh:  resultCh,
+		pd:       pd,
+		ttl:      ttl,
+		resultCh: resultCh,
 	}
 
 	select {
@@ -239,7 +294,7 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 		return nil, ctx.Err()
 	}
 
-	// Wait for result with timeout
+	// Wait for result with timeout.
 	timeout := time.NewTimer(p.config.ProbeTimeout)
 	defer timeout.Stop()
 
@@ -279,45 +334,28 @@ func (p *CaracalProber) writerLoop(ctx context.Context) error {
 
 // encodeAndSendProbe formats a probe request as CSV and writes it to caracal's stdin.
 func (p *CaracalProber) encodeAndSendProbe(req *probeRequest) error {
-	pd := req.directive
+	pd := req.pd
 
 	// CSV format: dst_addr,src_port,dst_port,ttl,protocol
-	var csvLine string
+	firstHalfWord, secondHalfWord := extractHalfWords(pd)
 
-	switch pd.Protocol {
-	case api.ICMP, api.ICMPv6:
-		csvLine = fmt.Sprintf("%s,0,0,%d,%s\n",
-			pd.DestinationAddress.String(),
-			req.ttl,
-			protocolToString(pd.Protocol),
-		)
-
-	case api.UDP:
-		var srcPort, dstPort uint16
-
-		if pd.NextHeader.UDPNextHeader != nil {
-			srcPort = pd.NextHeader.UDPNextHeader.SourcePort
-			dstPort = pd.NextHeader.UDPNextHeader.DestinationPort
+	// Apply UDP defaults if needed.
+	if pd.Protocol == api.UDP {
+		if firstHalfWord == 0 {
+			firstHalfWord = 50000
 		}
-
-		// Defaults
-		if srcPort == 0 {
-			srcPort = 50000
+		if secondHalfWord == 0 {
+			secondHalfWord = 33434
 		}
-		if dstPort == 0 {
-			dstPort = 33434
-		}
-
-		csvLine = fmt.Sprintf("%s,%d,%d,%d,UDP\n",
-			pd.DestinationAddress.String(),
-			srcPort,
-			dstPort,
-			req.ttl,
-		)
-
-	default:
-		return fmt.Errorf("unsupported protocol: %d", pd.Protocol)
 	}
+
+	csvLine := fmt.Sprintf("%s,%d,%d,%d,%s\n",
+		pd.DestinationAddress.String(),
+		firstHalfWord,
+		secondHalfWord,
+		req.ttl,
+		protocolToString(pd.Protocol),
+	)
 
 	_, err := p.stdin.Write([]byte(csvLine))
 	return err
@@ -377,24 +415,24 @@ func (p *CaracalProber) handleResult(record []string) error {
 func parseProbeResult(record []string) *ProbeResult {
 	result := &ProbeResult{}
 
-	// Parse timestamps
+	// Parse timestamps.
 	if captureTS := record[0]; captureTS != "" {
 		if ts, err := strconv.ParseInt(captureTS, 10, 64); err == nil {
-			// Timestamp in microseconds
+			// Timestamp in microseconds.
 			result.ReceivedTime = time.Unix(0, ts*1000)
 		}
 	}
 
-	// Parse RTT to calculate sent time
+	// Parse RTT to calculate sent time.
 	if rttStr := record[15]; rttStr != "" {
 		if rtt, err := strconv.ParseInt(rttStr, 10, 64); err == nil {
-			// RTT in tenths of milliseconds = 100 microseconds
+			// RTT in tenths of milliseconds = 100 microseconds.
 			rttMicros := rtt * 100
 			result.SentTime = result.ReceivedTime.Add(-time.Duration(rttMicros) * time.Microsecond)
 		}
 	}
 
-	// Parse reply address
+	// Parse reply address.
 	replyAddrStr := record[8]
 	if replyAddrStr == "" {
 		result.TimedOut = true
@@ -402,7 +440,7 @@ func parseProbeResult(record []string) *ProbeResult {
 		result.ReplyAddress = net.ParseIP(replyAddrStr)
 	}
 
-	// Fallback timestamps
+	// Fallback timestamps.
 	if result.ReceivedTime.IsZero() {
 		result.ReceivedTime = time.Now()
 	}
@@ -416,24 +454,42 @@ func parseProbeResult(record []string) *ProbeResult {
 // buildProbeKey constructs a correlation key from the CSV record.
 func buildProbeKey(record []string, protocol uint64, result *ProbeResult) (probeKey, error) {
 	dstAddr := record[3]
+
 	ttl, err := strconv.ParseUint(record[6], 10, 8)
 	if err != nil {
 		return probeKey{}, fmt.Errorf("invalid TTL: %s", record[6])
 	}
 
-	key := probeKey{
-		dstAddr:    dstAddr,
-		ttl:        uint8(ttl),
-		timeSecond: result.SentTime.Unix(),
+	firstHalfWord, err := strconv.ParseUint(record[4], 10, 16)
+	if err != nil {
+		return probeKey{}, fmt.Errorf("invalid first half word: %s", record[4])
 	}
 
-	// Add destination port for UDP
-	if protocol == 17 { // UDP
-		dstPort, err := strconv.ParseUint(record[5], 10, 16)
-		if err != nil {
-			return probeKey{}, fmt.Errorf("invalid UDP destination port: %s", record[5])
-		}
-		key.dstPort = uint16(dstPort)
+	secondHalfWord, err := strconv.ParseUint(record[5], 10, 16)
+	if err != nil {
+		return probeKey{}, fmt.Errorf("invalid second half word: %s", record[5])
+	}
+
+	// Convert protocol number to api.Protocol type.
+	var protoType api.Protocol
+	switch protocol {
+	case 1:
+		protoType = api.ICMP
+	case 17:
+		protoType = api.UDP
+	case 58:
+		protoType = api.ICMPv6
+	default:
+		return probeKey{}, fmt.Errorf("unsupported protocol: %d", protocol)
+	}
+
+	key := probeKey{
+		dstAddr:        dstAddr,
+		firstHalfWord:  uint16(firstHalfWord),
+		secondHalfWord: uint16(secondHalfWord),
+		ttl:            uint8(ttl),
+		protocol:       protoType,
+		timeSecond:     result.SentTime.Unix(),
 	}
 
 	return key, nil
@@ -441,7 +497,7 @@ func buildProbeKey(record []string, protocol uint64, result *ProbeResult) (probe
 
 // matchAndDeliverResult attempts to match the result with a pending probe and deliver it.
 func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
-	// Try to match (with ±1 second tolerance for clock drift)
+	// Try to match (with ±1 second tolerance for clock drift).
 	for _, ts := range []int64{key.timeSecond, key.timeSecond - 1} {
 		key.timeSecond = ts
 
@@ -500,7 +556,7 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 		log.Printf("caracal: %s", scanner.Text())
 	}
 
-	// EOF is normal when caracal exits
+	// EOF is normal when caracal exits.
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("stderr scan error: %w", err)
 	}
@@ -509,13 +565,13 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 
 // Close stops caracal and cleans up.
 func (p *CaracalProber) Close() error {
-	// Cancel context (stops all goroutines)
+	// Cancel context (stops all goroutines).
 	p.cancel()
 
-	// Wait for all goroutines to finish
+	// Wait for all goroutines to finish.
 	err := p.g.Wait()
 
-	// Kill caracal process
+	// Kill caracal process.
 	if killErr := p.cmd.Process.Kill(); killErr != nil {
 		log.Printf("failed to kill caracal: %v", killErr)
 	}

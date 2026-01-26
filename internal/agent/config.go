@@ -28,6 +28,11 @@ type Config struct {
 	// If empty, searches PATH. Only required for "caracal" prober type.
 	ProberPath string
 
+	// ProberArgs contains additional command-line arguments to pass to the prober.
+	// Optional. Only applies to caracal prober type.
+	// Example: []string{"--n-packets", "3", "--interface", "eth0"}
+	ProberArgs []string
+
 	// DirectivesBufferSize is the channel buffer for incoming directives.
 	// Larger buffers provide more tolerance for processing delays.
 	DirectivesBufferSize int
@@ -63,6 +68,7 @@ type Config struct {
 //   - AgentID: "agent-1" (should be overridden per instance)
 //   - OrchestratorAddr: "localhost:50050" (local development)
 //   - ProberType: "mock" (for testing; use "caracal" in production)
+//   - ProberArgs: nil (no additional arguments)
 //   - Buffer sizes: 100 (balances memory vs. throughput)
 //   - ReadDeadline: 60s (tolerates slow networks)
 //   - WriteDeadline: 5s (fail fast on write issues)
@@ -75,6 +81,7 @@ func DefaultConfig() *Config {
 		OrchestratorAddr:           "localhost:50050",
 		ProberType:                 "mock",
 		ProberPath:                 "",
+		ProberArgs:                 nil,
 		DirectivesBufferSize:       100,
 		FIEsBufferSize:             100,
 		ReadDeadline:               60 * time.Second,

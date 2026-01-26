@@ -35,7 +35,12 @@ import (
 //	    log.Printf("Reply from %s, RTT: %v", result.ReplyAddress, rtt)
 //	}
 type Prober interface {
-	// Probe sends a network probe with the specified TTL and blocks until complete.
+	// Probe sends a network probe according to the directive with the specified TTL
+	// and blocks until complete.
+	//
+	// The TTL is passed as a separate parameter rather than being part of the directive
+	// to allow probing multiple hops (near and far) with the same directive without
+	// creating duplicate directive structures. This keeps the API simple and flexible.
 	//
 	// Returns a ProbeResult indicating success or timeout. A timeout (no reply within
 	// the configured probe timeout) is not an error - it returns a ProbeResult with
