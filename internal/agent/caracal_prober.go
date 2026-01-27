@@ -31,7 +31,7 @@
 //   - Logs caracal's stderr output for debugging
 //
 // Correlation mechanism:
-//   - Each probe is identified by (dst_addr, dst_port, ttl, time_second)
+//   - Each probe is identified by (dst_addr, first_half_word, second_half_word, ttl, protocol, time_second)
 //   - When Probe() is called, an entry is added to the pending map with this key
 //   - When a result arrives, the key is reconstructed from the result
 //   - A ±1 second time tolerance handles clock drift
@@ -40,7 +40,7 @@
 //
 // Deduplication:
 //   - If multiple callers request identical probes in the same second,
-//     only one probe is sent and all callers share the result
+//     the latest request wins and earlier callers will timeout
 package agent
 
 import (
@@ -243,7 +243,14 @@ func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
 	return 0, 0
 }
 
-// Probe sends a probe and waits for the result.
+// Probe queues a probe request and waits for the result.
+//
+// This function does not directly send the probe - instead it:
+//  1. Registers the request in the pending map
+//  2. Queues it to the write queue (non-blocking)
+//  3. Waits for the result from the reader loop (or timeout)
+//
+// The actual probing happens asynchronously via writerLoop → caracal → network.
 func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
@@ -261,17 +268,14 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 
 	p.pendingMu.Lock()
 
-	// Check if duplicate probe already pending in same second.
-	if existing, exists := p.pending[key]; exists {
-		p.pendingMu.Unlock()
-		// Wait for existing probe to complete (share result).
-		return <-existing.resultCh, nil
-	}
-
+	// Latest wins: if a duplicate probe is already pending, replace it.
+	// Old callers waiting on the previous result channel will timeout
+	// (their channel is no longer in the map and won't receive results).
 	p.pending[key] = &pendingProbe{
 		resultCh: resultCh,
 		sentTime: now,
 	}
+
 	p.pendingMu.Unlock()
 
 	// Cleanup function.
@@ -400,7 +404,11 @@ func (p *CaracalProber) handleResult(record []string) error {
 		return fmt.Errorf("invalid protocol: %s", record[1])
 	}
 
-	result := parseProbeResult(record)
+	result, err := parseProbeResult(record)
+	if err != nil {
+		log.Printf("Skipping probe result: %v", err)
+		return nil // Skip this result but continue processing others
+	}
 
 	key, err := buildProbeKey(record, protocol, result)
 	if err != nil {
@@ -412,7 +420,7 @@ func (p *CaracalProber) handleResult(record []string) error {
 }
 
 // parseProbeResult extracts timestamps and reply information from a CSV record.
-func parseProbeResult(record []string) *ProbeResult {
+func parseProbeResult(record []string) (*ProbeResult, error) {
 	result := &ProbeResult{}
 
 	// Parse timestamps.
@@ -432,23 +440,15 @@ func parseProbeResult(record []string) *ProbeResult {
 		}
 	}
 
-	// Parse reply address.
-	replyAddrStr := record[8]
-	if replyAddrStr == "" {
-		result.TimedOut = true
-	} else {
-		result.ReplyAddress = net.ParseIP(replyAddrStr)
+	// Parse reply address (always present if caracal outputs the line).
+	result.ReplyAddress = net.ParseIP(record[8])
+
+	// Validate timestamps - missing timestamps indicate caracal malfunction.
+	if result.ReceivedTime.IsZero() || result.SentTime.IsZero() {
+		return nil, fmt.Errorf("missing timestamps (caracal malfunction)")
 	}
 
-	// Fallback timestamps.
-	if result.ReceivedTime.IsZero() {
-		result.ReceivedTime = time.Now()
-	}
-	if result.SentTime.IsZero() {
-		result.SentTime = result.ReceivedTime.Add(-100 * time.Millisecond)
-	}
-
-	return result
+	return result, nil
 }
 
 // buildProbeKey constructs a correlation key from the CSV record.
@@ -497,7 +497,10 @@ func buildProbeKey(record []string, protocol uint64, result *ProbeResult) (probe
 
 // matchAndDeliverResult attempts to match the result with a pending probe and deliver it.
 func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
-	// Try to match (with ±1 second tolerance for clock drift).
+	// Try to match with up to 1 second tolerance for queue delay.
+	// Result has timeSecond from when probe was sent (e.g., 101).
+	// Pending map has timeSecond from when probe was queued (e.g., 100).
+	// Try exact match first, then check 1 second earlier.
 	for _, ts := range []int64{key.timeSecond, key.timeSecond - 1} {
 		key.timeSecond = ts
 

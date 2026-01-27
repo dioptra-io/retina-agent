@@ -65,9 +65,9 @@ go build -o retina-agent ./cmd/retina-agent
 ```
 2026/01/21 17:02:54 Agent agent-1: Connected to orchestrator at localhost:50050
 2026/01/21 17:02:54 Agent agent-1: ← Directive for 8.8.8.8 (TTL 10 → 11)
-2026/01/21 17:02:54 Agent agent-1: → FIE for 8.8.8.8 | Near(TTL10): 45ms | Far(TTL11): 73ms
+2026/01/21 17:02:54 Agent agent-1: → FIE for 8.8.8.8 | Near(TTL10) | Far(TTL11)
 2026/01/21 17:02:55 Agent agent-1: ← Directive for 1.1.1.1 (TTL 15 → 16)
-2026/01/21 17:02:55 Agent agent-1: → FIE for 1.1.1.1 | Near(TTL15): 32ms | Far(TTL16): 68ms
+2026/01/21 17:02:55 Agent agent-1: → FIE for 1.1.1.1 | Near(TTL15) | Far(TTL16)
 ```
 
 ## Testing End-to-End
@@ -100,6 +100,14 @@ You should see directives flowing in and FIEs flowing out in both terminals.
 
 See `--help` for all options.
 
+### Advanced Configuration
+
+**Caracal-specific arguments** can be set programmatically via `Config.ProberArgs`:
+```go
+cfg.ProberArgs = []string{"--n-packets", "3", "--interface", "eth0"}
+```
+Not exposed as CLI flag for MVP - modify code if needed.
+
 ## How It Works
 
 ### Directive Processing
@@ -109,9 +117,18 @@ For each `ProbingDirective`:
 1. **Launch two probes concurrently**:
    - Near probe: TTL = `directive.NearTTL`
    - Far probe: TTL = `directive.NearTTL + 1`
-2. **Correlate results** by directive ID
+2. **Correlate results** by destination, protocol, header fields, TTL, and timestamp
 3. **If both succeed**: Build and send FIE
 4. **If either times out**: Discard (no FIE)
+
+### Caracal Prober Architecture
+
+The caracal prober uses a high-throughput pipeline:
+- Multiple goroutines queue probe requests (non-blocking)
+- Single writer goroutine sends to caracal stdin (CSV format)
+- Single reader goroutine receives from caracal stdout (CSV format)
+- Results correlated back to waiting goroutines via shared map
+- Supports thousands of concurrent probes without blocking
 
 ### Error Handling
 
@@ -130,6 +147,7 @@ retina-agent/
 │   ├── agent.go          # Core pipeline logic
 │   ├── config.go         # Configuration
 │   ├── prober.go         # Prober interface
+│   ├── caracal_prober.go # Caracal implementation
 │   ├── mock_prober.go    # Mock for testing
 │   └── agent_test.go     # Tests
 └── test/
@@ -211,6 +229,10 @@ Sequential probing is too slow. Each directive spawns a goroutine that launches 
 ### Why interface for Prober?
 
 Allows testing with mock prober and easy addition of new implementations without changing agent code.
+
+### Why separate TTL parameter?
+
+Passing TTL separately (rather than embedding in the directive) allows probing multiple hops with the same directive without duplicating the directive structure. This keeps the API simple and flexible.
 
 ## License
 
