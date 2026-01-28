@@ -34,13 +34,13 @@
 //   - Each probe is identified by (dst_addr, first_half_word, second_half_word, ttl, protocol, time_second)
 //   - When Probe() is called, an entry is added to the pending map with this key
 //   - When a result arrives, the key is reconstructed from the result
-//   - A ±1 second time tolerance handles clock drift
-//   - ASSUMPTION: Probes are sent within ~1 second of being queued
-//     (if writeQueue backpressure causes >1 second delay, correlation may fail)
+//   - A ±2 second time tolerance handles queue delays and clock variations
+//   - ASSUMPTION: Probes are sent within ~2 seconds of being queued
+//     (if writeQueue backpressure causes >2 second delay, correlation may fail)
 //
 // Deduplication:
 //   - If multiple callers request identical probes in the same second,
-//     the latest request wins and earlier callers will timeout
+//     the first request wins and subsequent requests return an error
 package agent
 
 import (
@@ -64,10 +64,11 @@ import (
 // It uses a pipelined architecture for maximum throughput.
 type CaracalProber struct {
 	// Caracal subprocess management.
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *csv.Reader
-	stderr io.ReadCloser
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	csvWriter *csv.Writer
+	stdout    *csv.Reader
+	stderr    io.ReadCloser
 
 	// Probe correlation - maps sent probes to waiting goroutines.
 	pending   map[probeKey]*pendingProbe
@@ -119,6 +120,7 @@ func NewCaracalProber(cfg *Config) (*CaracalProber, error) {
 	p := &CaracalProber{
 		cmd:        cmd,
 		stdin:      stdin,
+		csvWriter:  csv.NewWriter(stdin),
 		stdout:     csv.NewReader(stdout),
 		stderr:     stderr,
 		pending:    make(map[probeKey]*pendingProbe),
@@ -169,7 +171,7 @@ func setupCaracalProcess(cfg *Config) (*exec.Cmd, io.WriteCloser, io.ReadCloser,
 		args = append(args, cfg.ProberArgs...)
 	}
 
-	cmd := exec.Command(caracalPath, args...)
+	cmd := exec.Command(caracalPath, args...) // #nosec G204 -- caracalPath is user-controlled by design (ProberPath config)
 
 	// Track pipes for cleanup on error.
 	var stdin io.WriteCloser
@@ -258,7 +260,7 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	// Build key for correlation.
 	firstHalf, secondHalf := extractHalfWords(pd)
 	key := probeKey{
-		dstAddr:        pd.DestinationAddress.String(),
+		dstAddr:        normalizeIPAddress(pd.DestinationAddress.String()),
 		firstHalfWord:  firstHalf,
 		secondHalfWord: secondHalf,
 		ttl:            ttl,
@@ -268,9 +270,14 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 
 	p.pendingMu.Lock()
 
-	// Latest wins: if a duplicate probe is already pending, replace it.
-	// Old callers waiting on the previous result channel will timeout
-	// (their channel is no longer in the map and won't receive results).
+	// Check for duplicate probe already pending.
+	if _, exists := p.pending[key]; exists {
+		p.pendingMu.Unlock()
+		return nil, fmt.Errorf("duplicate probe already pending for %s (TTL %d)",
+			pd.DestinationAddress.String(), ttl)
+	}
+
+	// Register probe.
 	p.pending[key] = &pendingProbe{
 		resultCh: resultCh,
 		sentTime: now,
@@ -353,16 +360,19 @@ func (p *CaracalProber) encodeAndSendProbe(req *probeRequest) error {
 		}
 	}
 
-	csvLine := fmt.Sprintf("%s,%d,%d,%d,%s\n",
+	record := []string{
 		pd.DestinationAddress.String(),
-		firstHalfWord,
-		secondHalfWord,
-		req.ttl,
+		strconv.Itoa(int(firstHalfWord)),
+		strconv.Itoa(int(secondHalfWord)),
+		strconv.Itoa(int(req.ttl)),
 		protocolToString(pd.Protocol),
-	)
+	}
 
-	_, err := p.stdin.Write([]byte(csvLine))
-	return err
+	if err := p.csvWriter.Write(record); err != nil {
+		return err
+	}
+	p.csvWriter.Flush()
+	return p.csvWriter.Error()
 }
 
 // readerLoop continuously reads results from caracal's stdout.
@@ -404,6 +414,12 @@ func (p *CaracalProber) handleResult(record []string) error {
 		return fmt.Errorf("invalid protocol: %s", record[1])
 	}
 
+	// Skip protocol 0 (caracal sometimes outputs this for invalid/malformed packets).
+	if protocol == 0 {
+		log.Printf("Skipping result with protocol 0 (likely invalid packet)")
+		return nil
+	}
+
 	result, err := parseProbeResult(record)
 	if err != nil {
 		log.Printf("Skipping probe result: %v", err)
@@ -426,8 +442,8 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 	// Parse timestamps.
 	if captureTS := record[0]; captureTS != "" {
 		if ts, err := strconv.ParseInt(captureTS, 10, 64); err == nil {
-			// Timestamp in microseconds.
-			result.ReceivedTime = time.Unix(0, ts*1000)
+			// Timestamp in seconds (Unix timestamp).
+			result.ReceivedTime = time.Unix(ts, 0)
 		}
 	}
 
@@ -451,9 +467,25 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 	return result, nil
 }
 
+// normalizeIPAddress converts IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) back to IPv4.
+// This ensures consistent key matching between stored probes and caracal results.
+func normalizeIPAddress(addr string) string {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return addr // Return as-is if not parseable
+	}
+
+	// Convert IPv4-mapped IPv6 to IPv4
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String()
+	}
+
+	return ip.String()
+}
+
 // buildProbeKey constructs a correlation key from the CSV record.
 func buildProbeKey(record []string, protocol uint64, result *ProbeResult) (probeKey, error) {
-	dstAddr := record[3]
+	dstAddr := normalizeIPAddress(record[3])
 
 	ttl, err := strconv.ParseUint(record[6], 10, 8)
 	if err != nil {
@@ -497,12 +529,13 @@ func buildProbeKey(record []string, protocol uint64, result *ProbeResult) (probe
 
 // matchAndDeliverResult attempts to match the result with a pending probe and deliver it.
 func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
-	// Try to match with up to 1 second tolerance for queue delay.
-	// Result has timeSecond from when probe was sent (e.g., 101).
-	// Pending map has timeSecond from when probe was queued (e.g., 100).
-	// Try exact match first, then check 1 second earlier.
-	for _, ts := range []int64{key.timeSecond, key.timeSecond - 1} {
-		key.timeSecond = ts
+	// Try to match with up to 2 seconds tolerance for queue delay.
+	// Result has timeSecond from when probe was sent (e.g., 100).
+	// Pending map has timeSecond from when probe was queued (e.g., 98-102).
+	// Try exact match, then check up to 2 seconds in either direction.
+	originalTime := key.timeSecond
+	for _, offset := range []int64{0, -1, 1, -2, 2} {
+		key.timeSecond = originalTime + offset
 
 		p.pendingMu.RLock()
 		probe, exists := p.pending[key]
@@ -516,6 +549,10 @@ func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 			return
 		}
 	}
+
+	// Log when we can't match the result (correlation failure).
+	log.Printf("No pending probe found for result: dst=%s ttl=%d protocol=%d time=%d",
+		key.dstAddr, key.ttl, key.protocol, originalTime)
 }
 
 // cleanupLoop periodically removes stale probes.
@@ -586,11 +623,11 @@ func (p *CaracalProber) Close() error {
 func protocolToString(protocol api.Protocol) string {
 	switch protocol {
 	case api.ICMP:
-		return "ICMP"
+		return "icmp"
 	case api.ICMPv6:
-		return "ICMPv6"
+		return "icmp6"
 	case api.UDP:
-		return "UDP"
+		return "udp"
 	default:
 		return fmt.Sprintf("%d", protocol)
 	}
