@@ -6,7 +6,7 @@ package main
 import (
 	"testing"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 func TestGeneratePD(t *testing.T) {

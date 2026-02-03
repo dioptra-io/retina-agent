@@ -43,7 +43,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 // ===== Flexible Stubs =====

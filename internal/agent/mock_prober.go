@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 // MockProber simulates network probing for testing without sending real packets.

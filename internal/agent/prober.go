@@ -9,7 +9,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 // Prober sends network probes and returns timing information.

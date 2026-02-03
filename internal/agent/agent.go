@@ -35,7 +35,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 var ErrInvalidDirective = errors.New("invalid probing directive")
