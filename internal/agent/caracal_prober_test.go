@@ -1,4 +1,21 @@
 //nolint:funlen // Test functions can be long for readability
+
+// ## Test Coverage
+//
+// Current coverage: ~96.9%
+//
+// The remaining ~3% consists of defensive error handlers for catastrophic system-level failures:
+// - File descriptor exhaustion during pipe creation (StdinPipe, StdoutPipe, StderrPipe)
+// - These error paths in setupCaracalProcess cannot be reliably tested without:
+//   * Exhausting system file descriptors (ulimit -n manipulation)
+//   * Root access and dangerous system state manipulation
+//   * Flaky tests that depend on exact system resource availability
+//
+// These are defensive checks that handle scenarios indicating severe system resource problems
+// (e.g., running out of file descriptors). They remain untested by design.
+//
+// See TestSetupCaracalProcessPipeErrors for documentation of these untestable paths.
+
 package agent
 
 import (
