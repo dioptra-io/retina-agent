@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
+//nolint:funlen // Test functions can be long for readability
 package agent
 
 import (
@@ -25,10 +26,62 @@ func createTempProber(t *testing.T) string {
 	t.Helper()
 	tmpDir := t.TempDir()
 	proberPath := filepath.Join(tmpDir, "test-prober")
+	//nolint:gosec // Test file needs to be executable
 	if err := os.WriteFile(proberPath, []byte("#!/bin/sh\necho test\n"), 0755); err != nil {
 		t.Fatalf("failed to create temp prober: %v", err)
 	}
 	return proberPath
+}
+
+// testDurationField is a helper to test time.Duration config fields.
+func testDurationField(t *testing.T, fieldName string, setField func(*Config, time.Duration)) {
+	t.Helper()
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		duration time.Duration
+		wantErr  bool
+	}{
+		{
+			name:     "valid duration",
+			duration: 5 * time.Second,
+			wantErr:  false,
+		},
+		{
+			name:     "small valid duration",
+			duration: 100 * time.Millisecond,
+			wantErr:  false,
+		},
+		{
+			name:     "zero duration",
+			duration: 0,
+			wantErr:  true,
+		},
+		{
+			name:     "negative duration",
+			duration: -1 * time.Second,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := validConfig()
+			setField(cfg, tt.duration)
+
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("%s: expected error but got none", fieldName)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("%s: unexpected error: %v", fieldName, err)
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -557,101 +610,15 @@ func TestValidate_WriteQueueSize(t *testing.T) {
 }
 
 func TestValidate_CleanupInterval(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		interval time.Duration
-		wantErr  bool
-	}{
-		{
-			name:     "valid interval",
-			interval: 10 * time.Second,
-			wantErr:  false,
-		},
-		{
-			name:     "small valid interval",
-			interval: 1 * time.Millisecond,
-			wantErr:  false,
-		},
-		{
-			name:     "zero interval",
-			interval: 0,
-			wantErr:  true,
-		},
-		{
-			name:     "negative interval",
-			interval: -1 * time.Second,
-			wantErr:  true,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			cfg.CleanupInterval = tt.interval
-
-			err := cfg.Validate()
-			if tt.wantErr && err == nil {
-				t.Error("expected error but got none")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
-	}
+	testDurationField(t, "CleanupInterval", func(c *Config, d time.Duration) {
+		c.CleanupInterval = d
+	})
 }
 
 func TestValidate_ProbeTimeout(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		timeout time.Duration
-		wantErr bool
-	}{
-		{
-			name:    "valid timeout",
-			timeout: 5 * time.Second,
-			wantErr: false,
-		},
-		{
-			name:    "small valid timeout",
-			timeout: 100 * time.Millisecond,
-			wantErr: false,
-		},
-		{
-			name:    "zero timeout",
-			timeout: 0,
-			wantErr: true,
-		},
-		{
-			name:    "negative timeout",
-			timeout: -1 * time.Second,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			cfg.ProbeTimeout = tt.timeout
-
-			err := cfg.Validate()
-			if tt.wantErr && err == nil {
-				t.Error("expected error but got none")
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
-	}
+	testDurationField(t, "ProbeTimeout", func(c *Config, d time.Duration) {
+		c.ProbeTimeout = d
+	})
 }
 
 // ============================================================================

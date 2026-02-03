@@ -1,5 +1,3 @@
-//nolint:funlen // Test functions can be long for readability
-
 // ## Test Coverage
 //
 // Current coverage: ~96.9%
@@ -16,6 +14,7 @@
 //
 // See TestSetupCaracalProcessPipeErrors for documentation of these untestable paths.
 
+//nolint:funlen // Test functions can be long for readability
 package agent
 
 import (
