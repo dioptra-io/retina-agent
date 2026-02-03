@@ -15,13 +15,14 @@
 // The agent automatically reconnects on connection loss using exponential
 // backoff. Press Ctrl+C for graceful shutdown.
 //
-// Available prober types: caracal (default), mock
+// Available prober types: caracal, mock
 package main
 
 import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os/signal"
 	"syscall"
@@ -36,7 +37,8 @@ var (
 	orchestratorAddr = flag.String("address", "localhost:50050", "Orchestrator address (host:port)")
 
 	// Prober configuration
-	proberType = flag.String("prober-type", "caracal", "Prober implementation (caracal, mock)")
+	proberType = flag.String("prober-type", agent.ProberTypeCaracal,
+		fmt.Sprintf("Prober implementation (%s, %s)", agent.ProberTypeCaracal, agent.ProberTypeMock))
 	proberPath = flag.String("prober-path", "", "Path to prober executable (searches PATH if empty)")
 
 	// Prober tuning
