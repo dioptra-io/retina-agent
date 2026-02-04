@@ -1275,3 +1275,422 @@ func TestIsNetworkError_AllCases(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// MOCK CONNECTION FOR TESTING
+// ============================================================================
+
+// mockConn implements net.Conn for testing authentication.
+type mockConn struct {
+	readBuf             *bytes.Buffer
+	writeBuf            *bytes.Buffer
+	closed              bool
+	readErr             error
+	writeErr            error
+	setWriteDeadlineErr error
+	setReadDeadlineErr  error
+}
+
+func newMockConn() *mockConn {
+	return &mockConn{
+		readBuf:  &bytes.Buffer{},
+		writeBuf: &bytes.Buffer{},
+	}
+}
+
+func (m *mockConn) Read(b []byte) (n int, err error) {
+	if m.readErr != nil {
+		return 0, m.readErr
+	}
+	return m.readBuf.Read(b)
+}
+
+func (m *mockConn) Write(b []byte) (n int, err error) {
+	if m.writeErr != nil {
+		return 0, m.writeErr
+	}
+	return m.writeBuf.Write(b)
+}
+
+func (m *mockConn) Close() error {
+	m.closed = true
+	return nil
+}
+
+func (m *mockConn) LocalAddr() net.Addr           { return nil }
+func (m *mockConn) RemoteAddr() net.Addr          { return nil }
+func (m *mockConn) SetDeadline(t time.Time) error { return nil }
+
+func (m *mockConn) SetReadDeadline(t time.Time) error {
+	if m.setReadDeadlineErr != nil {
+		return m.setReadDeadlineErr
+	}
+	return nil
+}
+
+func (m *mockConn) SetWriteDeadline(t time.Time) error {
+	if m.setWriteDeadlineErr != nil {
+		return m.setWriteDeadlineErr
+	}
+	return nil
+}
+
+// queueAuthResponse queues an AuthResponse to be read by the agent.
+func (m *mockConn) queueAuthResponse(resp *api.AuthResponse) error {
+	return json.NewEncoder(m.readBuf).Encode(resp)
+}
+
+// getAuthRequest decodes the AuthRequest sent by the agent.
+func (m *mockConn) getAuthRequest() (*api.AuthRequest, error) {
+	var req api.AuthRequest
+	if err := json.NewDecoder(m.writeBuf).Decode(&req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// ============================================================================
+// AUTHENTICATION TESTS
+// ============================================================================
+
+func TestAuthenticate_Success(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+
+	// Queue successful response
+	if err := conn.queueAuthResponse(&api.AuthResponse{
+		Authenticated: true,
+		Message:       "OK",
+	}); err != nil {
+		t.Fatalf("failed to queue response: %v", err)
+	}
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "test-secret-1234567890",
+		},
+	}
+
+	// Authenticate should succeed
+	if err := a.authenticate(conn); err != nil {
+		t.Errorf("authenticate() should succeed, got error: %v", err)
+	}
+
+	// Verify AuthRequest was sent with correct fields
+	req, err := conn.getAuthRequest()
+	if err != nil {
+		t.Fatalf("failed to decode auth request: %v", err)
+	}
+	if req.AgentID != "test-agent" {
+		t.Errorf("expected AgentID 'test-agent', got: %s", req.AgentID)
+	}
+	if req.Secret != "test-secret-1234567890" {
+		t.Errorf("expected Secret 'test-secret-1234567890', got: %s", req.Secret)
+	}
+}
+
+func TestAuthenticate_Rejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		response    api.AuthResponse
+		expectedErr string
+	}{
+		{
+			name: "rejected with message",
+			response: api.AuthResponse{
+				Authenticated: false,
+				Message:       "Invalid secret",
+			},
+			expectedErr: "Invalid secret",
+		},
+		{
+			name: "rejected without message",
+			response: api.AuthResponse{
+				Authenticated: false,
+			},
+			expectedErr: "authentication rejected",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conn := newMockConn()
+			if err := conn.queueAuthResponse(&tt.response); err != nil {
+				t.Fatalf("failed to queue response: %v", err)
+			}
+
+			a := &agent{
+				config: &Config{
+					AgentID: "test-agent",
+					Secret:  "wrong-secret",
+				},
+			}
+
+			err := a.authenticate(conn)
+			if err == nil {
+				t.Fatal("authenticate() should fail when rejected")
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Errorf("error should contain %q, got: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestAuthenticate_ReadError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		readErr     error
+		expectedErr string
+	}{
+		{
+			name:        "network error",
+			readErr:     io.EOF,
+			expectedErr: "failed to receive auth response",
+		},
+		{
+			name:        "unexpected EOF",
+			readErr:     io.ErrUnexpectedEOF,
+			expectedErr: "failed to receive auth response",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conn := newMockConn()
+			conn.readErr = tt.readErr
+
+			a := &agent{
+				config: &Config{
+					AgentID: "test-agent",
+					Secret:  "test-secret-1234567890",
+				},
+			}
+
+			err := a.authenticate(conn)
+			if err == nil {
+				t.Fatal("authenticate() should fail on read error")
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Errorf("error should contain %q, got: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestAuthenticate_WriteError(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	conn.writeErr = errors.New("connection broken")
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "test-secret-1234567890",
+		},
+	}
+
+	err := a.authenticate(conn)
+	if err == nil {
+		t.Fatal("authenticate() should fail on write error")
+	}
+	if !strings.Contains(err.Error(), "failed to send auth request") {
+		t.Errorf("error should mention send failure, got: %v", err)
+	}
+}
+
+func TestAuthenticate_InvalidResponse(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+
+	// Write malformed JSON
+	conn.readBuf.WriteString("{invalid json")
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "test-secret-1234567890",
+		},
+	}
+
+	err := a.authenticate(conn)
+	if err == nil {
+		t.Fatal("authenticate() should fail on malformed response")
+	}
+	if !strings.Contains(err.Error(), "failed to receive auth response") {
+		t.Errorf("error should mention receive failure, got: %v", err)
+	}
+}
+
+func TestAuthenticate_EmptySecret(t *testing.T) {
+	t.Parallel()
+
+	// This tests that authenticate() works with empty secret
+	// (even though Run() won't call it if secret is empty)
+	conn := newMockConn()
+
+	if err := conn.queueAuthResponse(&api.AuthResponse{
+		Authenticated: true,
+		Message:       "OK",
+	}); err != nil {
+		t.Fatalf("failed to queue response: %v", err)
+	}
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "", // Empty secret
+		},
+	}
+
+	// Should still send empty secret
+	if err := a.authenticate(conn); err != nil {
+		t.Errorf("authenticate() should succeed, got error: %v", err)
+	}
+
+	req, err := conn.getAuthRequest()
+	if err != nil {
+		t.Fatalf("failed to decode auth request: %v", err)
+	}
+	if req.Secret != "" {
+		t.Errorf("expected empty Secret, got: %s", req.Secret)
+	}
+}
+
+func TestAuthenticate_SetWriteDeadlineError(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	conn.setWriteDeadlineErr = errors.New("failed to set deadline")
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "test-secret-1234567890",
+		},
+	}
+
+	err := a.authenticate(conn)
+	if err == nil {
+		t.Fatal("authenticate() should fail on SetWriteDeadline error")
+	}
+	if !strings.Contains(err.Error(), "failed to set write deadline") {
+		t.Errorf("error should mention write deadline, got: %v", err)
+	}
+}
+
+func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+
+	// Need to queue response so we get past the write phase
+	if err := conn.queueAuthResponse(&api.AuthResponse{
+		Authenticated: true,
+		Message:       "OK",
+	}); err != nil {
+		t.Fatalf("failed to queue response: %v", err)
+	}
+
+	// Inject error for SetReadDeadline
+	conn.setReadDeadlineErr = errors.New("failed to set read deadline")
+
+	a := &agent{
+		config: &Config{
+			AgentID: "test-agent",
+			Secret:  "test-secret-1234567890",
+		},
+	}
+
+	err := a.authenticate(conn)
+	if err == nil {
+		t.Fatal("authenticate() should fail on SetReadDeadline error")
+	}
+	if !strings.Contains(err.Error(), "failed to set read deadline") {
+		t.Errorf("error should mention read deadline, got: %v", err)
+	}
+}
+
+// ============================================================================
+// INTEGRATION TEST - Authentication in Run()
+// ============================================================================
+
+// TestRun_AuthenticationFailure tests that Run() properly handles authentication errors.
+// This requires a mock orchestrator that rejects authentication.
+func TestRun_AuthenticationFailure(t *testing.T) {
+	t.Parallel()
+
+	// Create a test server that rejects authentication
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+
+	// Accept one connection and reject auth
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+
+		// Read auth request (but ignore it)
+		decoder := json.NewDecoder(conn)
+		var authReq api.AuthRequest
+		_ = decoder.Decode(&authReq)
+
+		// Send rejection
+		encoder := json.NewEncoder(conn)
+		_ = encoder.Encode(&api.AuthResponse{
+			Authenticated: false,
+			Message:       "Invalid secret",
+		})
+	}()
+
+	cfg := &Config{
+		AgentID:          "test-agent",
+		OrchestratorAddr: listener.Addr().String(),
+		Secret:           "wrong-secret-1234567890",
+		ProberType:       ProberTypeMock,
+		PDsBufferSize:    10,
+		FIEsBufferSize:   10,
+		ReadDeadline:     5 * time.Second,
+		WriteDeadline:    5 * time.Second,
+		ProbeTimeout:     1 * time.Second,
+		WriteQueueSize:   100,
+		CleanupInterval:  1 * time.Second,
+	}
+
+	// Run should fail with authentication error
+	ctx := context.Background()
+	err = Run(ctx, cfg)
+
+	if err == nil {
+		t.Fatal("Run() should fail when authentication is rejected")
+	}
+	if !strings.Contains(err.Error(), "authentication failed") {
+		t.Errorf("error should mention authentication failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "authentication rejected") {
+		t.Errorf("error should contain rejection reason, got: %v", err)
+	}
+}

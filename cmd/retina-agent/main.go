@@ -16,6 +16,11 @@
 // backoff. Press Ctrl+C for graceful shutdown.
 //
 // Available prober types: caracal, mock
+//
+// Authentication:
+//
+//	Set RETINA_SECRET environment variable to enable authentication.
+//	Leave unset for local testing without authentication.
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -65,6 +71,7 @@ func main() {
 	cfg := &agent.Config{
 		AgentID:                    *agentID,
 		OrchestratorAddr:           *orchestratorAddr,
+		Secret:                     os.Getenv("RETINA_SECRET"), // Read from environment variable
 		ProberType:                 *proberType,
 		ProberPath:                 *proberPath,
 		WriteQueueSize:             *writeQueueSize,

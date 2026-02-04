@@ -102,6 +102,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.OrchestratorAddr == "" {
 		t.Error("OrchestratorAddr should not be empty")
 	}
+	if cfg.Secret != "" {
+		t.Error("Secret should be empty by default (no auth)")
+	}
 	if cfg.ReadDeadline <= 0 {
 		t.Error("ReadDeadline should be positive")
 	}
@@ -262,6 +265,113 @@ func TestValidate_OrchestratorAddr(t *testing.T) {
 
 			cfg := validConfig()
 			cfg.OrchestratorAddr = tt.addr
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// ============================================================================
+// VALIDATION TESTS - Secret (Authentication)
+// ============================================================================
+
+func TestValidate_Secret(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		secret  string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "empty secret (valid - no auth)",
+			secret:  "",
+			wantErr: false,
+		},
+		{
+			name:    "valid strong secret",
+			secret:  "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+			wantErr: false,
+		},
+		{
+			name:    "valid minimum length (16 chars)",
+			secret:  "1234567890abcdef",
+			wantErr: false,
+		},
+		{
+			name:    "too short (15 chars)",
+			secret:  "123456789012345",
+			wantErr: true,
+			errMsg:  "too short",
+		},
+		{
+			name:    "too short (1 char)",
+			secret:  "a",
+			wantErr: true,
+			errMsg:  "too short",
+		},
+		{
+			name:    "weak secret: test",
+			secret:  "test",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "weak secret: secret",
+			secret:  "secret",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "weak secret: password",
+			secret:  "password",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "weak secret: 123456",
+			secret:  "123456",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "weak secret: abc123",
+			secret:  "abc123",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "weak secret: changeme",
+			secret:  "changeme",
+			wantErr: true,
+			errMsg:  "weak/test value",
+		},
+		{
+			name:    "long strong secret",
+			secret:  "thisIsAVeryLongAndStrongSecretThatIsDefinitelySecure123456",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := validConfig()
+			cfg.Secret = tt.secret
 
 			err := cfg.Validate()
 			if tt.wantErr {
@@ -656,7 +766,7 @@ func TestValidate_BufferSizes(t *testing.T) {
 				c.PDsBufferSize = 0
 			},
 			wantErr: true,
-			errMsg:  "directives buffer",
+			errMsg:  "PDs buffer",
 		},
 		{
 			name: "negative PDs buffer",
@@ -664,7 +774,7 @@ func TestValidate_BufferSizes(t *testing.T) {
 				c.PDsBufferSize = -1
 			},
 			wantErr: true,
-			errMsg:  "directives buffer",
+			errMsg:  "PDs buffer",
 		},
 		{
 			name: "zero FIEs buffer",

@@ -31,6 +31,11 @@ type Config struct {
 	// OrchestratorAddr is the TCP address of the orchestrator (host:port).
 	OrchestratorAddr string
 
+	// Secret is the authentication credential shared between agent and orchestrator.
+	// If empty, authentication is disabled.
+	// Both agent and orchestrator must know this value for authentication to succeed.
+	Secret string
+
 	// ReadDeadline is the timeout for receiving messages from orchestrator.
 	// Should be longer than expected message intervals.
 	ReadDeadline time.Duration
@@ -89,6 +94,7 @@ type Config struct {
 // Defaults:
 //   - AgentID: "agent-1" (should be overridden per instance)
 //   - OrchestratorAddr: "localhost:50050" (local development)
+//   - Secret: "" (authentication disabled; set via RETINA_SECRET environment variable)
 //   - ProberType: ProberTypeMock (for testing; use ProberTypeCaracal in production)
 //   - ProberArgs: nil (no additional arguments)
 //   - WriteQueueSize: 1000 (balances memory vs. throughput)
@@ -106,6 +112,7 @@ func DefaultConfig() *Config {
 
 		// Orchestrator Connection
 		OrchestratorAddr:           "localhost:50050",
+		Secret:                     "", // Empty = no authentication
 		ReadDeadline:               60 * time.Second,
 		WriteDeadline:              5 * time.Second,
 		MaxReconnectBackoff:        5 * time.Minute,
@@ -128,19 +135,42 @@ func DefaultConfig() *Config {
 // Validate checks that all configuration values are valid.
 // Returns an error describing the first invalid field encountered.
 func (c *Config) Validate() error {
-	// ===== Agent Identity =====
+	if err := c.validateAgentIdentity(); err != nil {
+		return err
+	}
+	if err := c.validateConnection(); err != nil {
+		return err
+	}
+	if err := c.validateProber(); err != nil {
+		return err
+	}
+	if err := c.validateBuffers(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateAgentIdentity checks agent identity fields.
+func (c *Config) validateAgentIdentity() error {
 	if c.AgentID == "" {
 		return errors.New("agent ID cannot be empty")
 	}
+	return nil
+}
 
-	// ===== Orchestrator Connection =====
+// validateConnection checks orchestrator connection and authentication fields.
+func (c *Config) validateConnection() error {
 	if c.OrchestratorAddr == "" {
 		return errors.New("orchestrator address cannot be empty")
 	}
-	// Validate format is host:port
 	if _, _, err := net.SplitHostPort(c.OrchestratorAddr); err != nil {
 		return fmt.Errorf("orchestrator address must be in host:port format: %w", err)
 	}
+
+	if err := c.validateSecret(); err != nil {
+		return err
+	}
+
 	if c.ReadDeadline <= 0 {
 		return fmt.Errorf("read deadline must be positive, got: %v", c.ReadDeadline)
 	}
@@ -153,8 +183,33 @@ func (c *Config) Validate() error {
 	if c.MaxConsecutiveDecodeErrors < 0 {
 		return fmt.Errorf("max consecutive decode errors cannot be negative, got: %d", c.MaxConsecutiveDecodeErrors)
 	}
+	return nil
+}
 
-	// ===== Prober Configuration =====
+// validateSecret checks that the secret meets security requirements if provided.
+func (c *Config) validateSecret() error {
+	if c.Secret == "" {
+		return nil // Empty is valid (no authentication)
+	}
+
+	// Check for obviously weak/test secrets FIRST (even if they're short)
+	weakSecrets := []string{"test", "secret", "password", "123456", "abc123", "changeme"}
+	for _, weak := range weakSecrets {
+		if c.Secret == weak {
+			return fmt.Errorf("secret '%s' is a known weak/test value; use a strong randomly-generated secret", weak)
+		}
+	}
+
+	// Check minimum length (at least 16 characters for security)
+	if len(c.Secret) < 16 {
+		return fmt.Errorf("secret is too short (%d chars); use at least 16 characters for security (generate with: openssl rand -hex 32)", len(c.Secret))
+	}
+
+	return nil
+}
+
+// validateProber checks prober configuration fields.
+func (c *Config) validateProber() error {
 	validProbers := map[string]bool{
 		ProberTypeCaracal: true,
 		ProberTypeMock:    true,
@@ -177,14 +232,16 @@ func (c *Config) Validate() error {
 	if c.ProbeTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got: %v", c.ProbeTimeout)
 	}
+	return nil
+}
 
-	// ===== Pipeline Buffers =====
+// validateBuffers checks pipeline buffer size fields.
+func (c *Config) validateBuffers() error {
 	if c.PDsBufferSize <= 0 {
-		return fmt.Errorf("directives buffer size must be positive, got: %d", c.PDsBufferSize)
+		return fmt.Errorf("PDs buffer size must be positive, got: %d", c.PDsBufferSize)
 	}
 	if c.FIEsBufferSize <= 0 {
 		return fmt.Errorf("FIEs buffer size must be positive, got: %d", c.FIEsBufferSize)
 	}
-
 	return nil
 }

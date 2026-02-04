@@ -92,6 +92,16 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	log.Printf("Agent %s: Connected to orchestrator at %s", a.config.AgentID, a.config.OrchestratorAddr)
 
+	// Authenticate if secret is configured
+	if a.config.Secret != "" {
+		if err := a.authenticate(conn); err != nil {
+			return fmt.Errorf("authentication failed: %w", err)
+		}
+		log.Printf("Agent %s: ✓ Authentication ENABLED - authenticated successfully", a.config.AgentID)
+	} else {
+		log.Printf("Agent %s: ⚠️  Authentication DISABLED - running without authentication (not recommended for production)", a.config.AgentID)
+	}
+
 	pds := make(chan *api.ProbingDirective, a.config.PDsBufferSize)
 	fies := make(chan *api.ForwardingInfoElement, a.config.FIEsBufferSize)
 
@@ -107,6 +117,50 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	log.Printf("Agent %s: Shut down gracefully", a.config.AgentID)
+	return nil
+}
+
+// authenticate sends authentication request and waits for orchestrator's response.
+// This must be called immediately after connection, before any other messages.
+// Returns error if authentication fails or times out.
+func (a *agent) authenticate(conn net.Conn) error {
+	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
+
+	// Send authentication request with agent ID and secret
+	authReq := &api.AuthRequest{
+		AgentID: a.config.AgentID,
+		Secret:  a.config.Secret,
+	}
+
+	// Set timeout for authentication exchange (5 seconds)
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	if err := encoder.Encode(authReq); err != nil {
+		return fmt.Errorf("failed to send auth request: %w", err)
+	}
+
+	// Wait for orchestrator's authentication response
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
+	var authResp api.AuthResponse
+	if err := decoder.Decode(&authResp); err != nil {
+		return fmt.Errorf("failed to receive auth response: %w", err)
+	}
+
+	// Check if authentication succeeded
+	if !authResp.Authenticated {
+		return fmt.Errorf("authentication rejected: %s", authResp.Message)
+	}
+
+	// Clear deadlines for normal operation
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
+
 	return nil
 }
 
@@ -277,6 +331,7 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	// Build and send FIE.
 	fie := &api.ForwardingInfoElement{
 		Agent:               api.Agent{AgentID: a.config.AgentID},
+		ProbingDirectiveID:  pd.ID,
 		IPVersion:           pd.IPVersion,
 		Protocol:            pd.Protocol,
 		DestinationAddress:  pd.DestinationAddress,
