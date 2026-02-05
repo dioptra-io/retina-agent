@@ -1,4 +1,4 @@
-github.com/dioptra-io/retina-commons v0.1.1 h1:tffhQTWMxTDfU9SdcmdOf2L2LCua4oUHID8m2tmJQYE=
-github.com/dioptra-io/retina-commons v0.1.1/go.mod h1:hfCZsurLyNnlnj7+/Rf5kl1DI7BN9HA+oaLY4dLe1vI=
+github.com/dioptra-io/retina-commons v0.1.2 h1:ObOA+GVZK9rcR/Mz3hILar+rmyyLePdwisRhLRm1D2s=
+github.com/dioptra-io/retina-commons v0.1.2/go.mod h1:hfCZsurLyNnlnj7+/Rf5kl1DI7BN9HA+oaLY4dLe1vI=
 golang.org/x/sync v0.19.0 h1:vV+1eWNmZ5geRlYjzm2adRgW2/mcpevXNg50YZtPCE4=
 golang.org/x/sync v0.19.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=

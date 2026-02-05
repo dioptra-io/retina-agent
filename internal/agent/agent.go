@@ -182,33 +182,11 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 
 		var pd api.ProbingDirective
 		if err := decoder.Decode(&pd); err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Agent %s: Read timeout, no data received", a.config.AgentID)
-				continue
+			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
+			consecutiveDecodeErrors = newCount
+			if !shouldContinue {
+				return handledErr
 			}
-
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			if isNetworkError(err) {
-				return fmt.Errorf("connection lost while reading: %w", err)
-			}
-
-			consecutiveDecodeErrors++
-
-			if a.config.MaxConsecutiveDecodeErrors > 0 {
-				log.Printf("Agent %s: Failed to decode directive (attempt %d/%d, skipping): %v",
-					a.config.AgentID, consecutiveDecodeErrors, a.config.MaxConsecutiveDecodeErrors, err)
-
-				if consecutiveDecodeErrors >= a.config.MaxConsecutiveDecodeErrors {
-					return fmt.Errorf("too many consecutive decode errors (%d), protocol may be broken: %w",
-						consecutiveDecodeErrors, err)
-				}
-			} else {
-				log.Printf("Agent %s: Failed to decode directive (skipping): %v", a.config.AgentID, err)
-			}
-
 			continue
 		}
 
@@ -219,8 +197,9 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			continue
 		}
 
-		log.Printf("Agent %s: ← Directive for %s (TTL %d → %d)",
+		log.Printf("Agent %s: ← PD %d for %s (TTL %d → %d)",
 			a.config.AgentID,
+			pd.ProbingDirectiveID,
 			pd.DestinationAddress,
 			pd.NearTTL,
 			pd.NearTTL+1)
@@ -231,6 +210,45 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		case pds <- &pd:
 		}
 	}
+}
+
+// handleDecodeError processes JSON decode errors during directive reception.
+// Returns (shouldContinue, newErrorCount, wrappedError) where shouldContinue indicates
+// whether to retry reading, newErrorCount is the updated consecutive error count,
+// and wrappedError is the error to return if shouldContinue is false.
+func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
+	// Check for read timeout (expected, just retry)
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		log.Printf("Agent %s: Read timeout, no data received", a.config.AgentID)
+		return true, consecutiveErrors, nil
+	}
+
+	// Check for context cancellation (clean shutdown)
+	if ctx.Err() != nil {
+		return false, consecutiveErrors, ctx.Err()
+	}
+
+	// Check for network errors (trigger reconnection)
+	if isNetworkError(err) {
+		return false, consecutiveErrors, fmt.Errorf("connection lost while reading: %w", err)
+	}
+
+	// Malformed JSON - log and potentially skip
+	consecutiveErrors++
+
+	if a.config.MaxConsecutiveDecodeErrors > 0 {
+		log.Printf("Agent %s: Failed to decode directive (attempt %d/%d, skipping): %v",
+			a.config.AgentID, consecutiveErrors, a.config.MaxConsecutiveDecodeErrors, err)
+
+		if consecutiveErrors >= a.config.MaxConsecutiveDecodeErrors {
+			return false, consecutiveErrors, fmt.Errorf("too many consecutive decode errors (%d), protocol may be broken: %w",
+				consecutiveErrors, err)
+		}
+	} else {
+		log.Printf("Agent %s: Failed to decode directive (skipping): %v", a.config.AgentID, err)
+	}
+
+	return true, consecutiveErrors, nil
 }
 
 // processorLoop receives directives and dispatches them for processing.
@@ -281,8 +299,9 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return fmt.Errorf("failed to encode FIE: %w", err)
 			}
 
-			log.Printf("Agent %s: → FIE for %s | Near(TTL%d) | Far(TTL%d)",
+			log.Printf("Agent %s: → FIE for PD %d, dest %s | Near(TTL%d) | Far(TTL%d)",
 				a.config.AgentID,
+				fie.ProbingDirectiveID,
 				fie.DestinationAddress,
 				fie.NearInfo.ProbeTTL,
 				fie.FarInfo.ProbeTTL)
@@ -313,13 +332,13 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 
 	// Handle errors.
 	if nearRes.err != nil {
-		log.Printf("Agent %s: Near probe failed for %s (TTL %d): %v",
-			a.config.AgentID, pd.DestinationAddress, nearTTL, nearRes.err)
+		log.Printf("Agent %s: Near probe failed for PD %d, dest %s (TTL %d): %v",
+			a.config.AgentID, pd.ProbingDirectiveID, pd.DestinationAddress, nearTTL, nearRes.err)
 		return
 	}
 	if farRes.err != nil {
-		log.Printf("Agent %s: Far probe failed for %s (TTL %d): %v",
-			a.config.AgentID, pd.DestinationAddress, farTTL, farRes.err)
+		log.Printf("Agent %s: Far probe failed for PD %d, dest %s (TTL %d): %v",
+			a.config.AgentID, pd.ProbingDirectiveID, pd.DestinationAddress, farTTL, farRes.err)
 		return
 	}
 
@@ -331,7 +350,7 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	// Build and send FIE.
 	fie := &api.ForwardingInfoElement{
 		Agent:               api.Agent{AgentID: a.config.AgentID},
-		ProbingDirectiveID:  pd.ID,
+		ProbingDirectiveID:  pd.ProbingDirectiveID,
 		IPVersion:           pd.IPVersion,
 		Protocol:            pd.Protocol,
 		DestinationAddress:  pd.DestinationAddress,

@@ -135,8 +135,9 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 		nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
 		farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
 
-		log.Printf("[%s] ✓ FIE: %s → %s | Near(TTL%d, %v): %s | Far(TTL%d, %v): %s",
+		log.Printf("[%s] ✓ FIE for PD %d: %s → %s | Near(TTL%d, %v): %s | Far(TTL%d, %v): %s",
 			remoteAddr,
+			fie.ProbingDirectiveID, // ← Now shows the actual PD ID
 			fie.Agent.AgentID,
 			fie.DestinationAddress,
 			fie.NearInfo.ProbeTTL,
@@ -178,9 +179,10 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 			protocol = "UNKNOWN"
 		}
 
-		log.Printf("[%s] → Directive #%d: %s %s TTL %d",
+		log.Printf("[%s] → Directive #%d (PD ID %d): %s %s TTL %d",
 			remoteAddr,
 			pdCounter,
+			pd.ProbingDirectiveID, // ← Now shows the actual PD ID
 			pd.DestinationAddress,
 			protocol,
 			pd.NearTTL,
@@ -220,6 +222,7 @@ func generatePD(counter int) *api.ProbingDirective {
 
 	// Build base directive with common fields
 	pd := &api.ProbingDirective{
+		ProbingDirectiveID: uint64(counter + 1), // ← FIXED: Add unique ID (starting from 1)
 		AgentID:            "agent-1",
 		IPVersion:          ipVersion,
 		DestinationAddress: dstIP,
