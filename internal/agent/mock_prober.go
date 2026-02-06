@@ -1,6 +1,11 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
+// MockProber provides a simple network probe simulator for testing the agent
+// pipeline without requiring real network access or the caracal prober.
+// It simulates realistic timing and occasional timeouts for comprehensive
+// testing of directive processing, probe correlation, and FIE generation.
+
 package agent
 
 import (
@@ -32,11 +37,13 @@ func NewMockProber(cfg *Config) *MockProber {
 
 // Probe simulates sending a network probe with artificial delay and random outcomes.
 //
-// Returns a timeout 10% of the time, otherwise returns a successful probe result
-// after a simulated delay of 10-100ms. Respects context cancellation.
+// Simulates a 10-100ms network delay. Returns a timeout 10% of the time.
+// When successful, returns a reply from the destination address.
 //
-// This method blocks as required by the Prober interface.
+// Respects context cancellation during the simulated delay.
 func (m *MockProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+	sentTime := time.Now() // Record when "probe sent"
+
 	// Generate random values under lock (rand.Rand is not thread-safe)
 	m.mu.Lock()
 	delay := time.Duration(10+m.rng.Intn(90)) * time.Millisecond
@@ -55,16 +62,15 @@ func (m *MockProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl ui
 	if shouldTimeout {
 		return &ProbeResult{
 			TimedOut: true,
-			SentTime: time.Now().Add(-delay),
+			SentTime: sentTime,
 		}, nil
 	}
 
 	// Generate fake successful reply
-	now := time.Now()
 	return &ProbeResult{
 		ReplyAddress: pd.DestinationAddress,
-		SentTime:     now.Add(-delay),
-		ReceivedTime: now,
+		SentTime:     sentTime,
+		ReceivedTime: time.Now(),
 		TimedOut:     false,
 	}, nil
 }
