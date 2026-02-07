@@ -65,8 +65,12 @@ var (
 	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
 )
 
+// agentRun is a variable for dependency injection in tests.
+var agentRun = agent.Run
+
 func main() {
 	flag.Parse()
+	log.SetFlags(log.LstdFlags) // Add timestamps
 
 	cfg := &agent.Config{
 		AgentID:                    *agentID,
@@ -110,7 +114,7 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config) {
 	for {
 		log.Printf("Agent %s: Connecting to %s", cfg.AgentID, cfg.OrchestratorAddr)
 
-		err := agent.Run(ctx, cfg)
+		err := agentRun(ctx, cfg)
 
 		// Distinguish intentional shutdown from connection failure
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {

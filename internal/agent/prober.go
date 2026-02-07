@@ -1,11 +1,15 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package agent provides network probing interfaces and types.
+// Package agent implements the network probing pipeline for retina-agent.
+//
+// The Prober interface abstracts probe execution with implementations for
+// production (CaracalProber) and testing (MockProber).
 package agent
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 
@@ -13,67 +17,42 @@ import (
 )
 
 // Prober sends network probes and returns timing information.
-//
-// Implementations must be safe for concurrent use by multiple goroutines.
-//
-// Example usage:
-//
-//	prober, err := NewCaracalProber(cfg)
-//	if err != nil {
-//	    return err
-//	}
-//	defer prober.Close()
-//
-//	result, err := prober.Probe(ctx, directive, 10)
-//	if err != nil {
-//	    return fmt.Errorf("probe failed: %w", err)
-//	}
-//	if result.TimedOut {
-//	    log.Printf("Probe timed out")
-//	} else {
-//	    rtt := result.ReceivedTime.Sub(result.SentTime)
-//	    log.Printf("Reply from %s, RTT: %v", result.ReplyAddress, rtt)
-//	}
+// Implementations must be safe for concurrent use.
 type Prober interface {
-	// Probe sends a network probe according to the directive with the specified TTL
-	// and blocks until complete.
-	//
-	// The TTL is passed as a separate parameter rather than being part of the directive
-	// to allow probing multiple hops (near and far) with the same directive without
-	// creating duplicate directive structures. This keeps the API simple and flexible.
-	//
-	// Returns a ProbeResult indicating success or timeout. A timeout (no reply within
-	// the configured probe timeout) is not an error - it returns a ProbeResult with
-	// TimedOut=true and error=nil.
-	//
-	// Returns an error if:
-	//   - ctx is cancelled (returns ctx.Err())
-	//   - probe operation fails (e.g., permission denied, invalid parameters)
-	//   - prober is closed or not properly initialized
-	//
-	// The method respects context cancellation and returns immediately if ctx is done.
+	// Probe sends a network probe with the specified TTL and blocks until complete.
+	// Returns ProbeResult with TimedOut=true if no reply received (not an error).
+	// Returns error only for ctx cancellation or probe operation failures.
 	Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
 
-	// Close releases resources held by the prober.
-	// Should be called when done using the prober, typically via defer.
-	// Safe to call multiple times.
+	// Close releases resources. Safe to call multiple times.
 	Close() error
 }
 
-// ProbeResult contains the outcome and timing information for a single probe.
+// ProbeResult contains the outcome and timing for a single probe.
 type ProbeResult struct {
-	// ReplyAddress is the IP address that sent the reply packet.
-	// Nil if the probe timed out (no reply received).
 	ReplyAddress net.IP
-
-	// SentTime is when the probe packet was sent.
-	SentTime time.Time
-
-	// ReceivedTime is when the reply packet was received.
-	// Zero value if the probe timed out.
+	SentTime     time.Time
 	ReceivedTime time.Time
+	TimedOut     bool
+}
 
-	// TimedOut indicates whether the probe timed out (no reply received).
-	// When true, ReplyAddress will be nil.
-	TimedOut bool
+// Success returns true if the probe received a reply.
+func (r *ProbeResult) Success() bool {
+	return !r.TimedOut
+}
+
+// RTT returns the round-trip time (0 if timeout).
+func (r *ProbeResult) RTT() time.Duration {
+	if r.TimedOut {
+		return 0
+	}
+	return r.ReceivedTime.Sub(r.SentTime)
+}
+
+// String returns a human-readable representation.
+func (r *ProbeResult) String() string {
+	if r.TimedOut {
+		return fmt.Sprintf("TIMEOUT (sent at %s)", r.SentTime.Format(time.RFC3339Nano))
+	}
+	return fmt.Sprintf("SUCCESS from %s, RTT=%v", r.ReplyAddress, r.RTT())
 }

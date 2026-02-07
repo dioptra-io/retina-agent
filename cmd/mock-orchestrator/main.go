@@ -115,7 +115,7 @@ func handleAgent(conn net.Conn, rate int) {
 	// Start goroutine to receive FIEs from agent
 	go receiveFIEs(decoder, remoteAddr)
 
-	// Send PDs to the agentat specified rate
+	// Send PDs to the agent at specified rate
 	sendPDs(encoder, remoteAddr, rate)
 }
 
@@ -137,7 +137,7 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 
 		log.Printf("[%s] ✓ FIE for PD %d: %s → %s | Near(TTL%d, %v): %s | Far(TTL%d, %v): %s",
 			remoteAddr,
-			fie.ProbingDirectiveID, // ← Now shows the actual PD ID
+			fie.ProbingDirectiveID,
 			fie.Agent.AgentID,
 			fie.DestinationAddress,
 			fie.NearInfo.ProbeTTL,
@@ -182,7 +182,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		log.Printf("[%s] → Directive #%d (PD ID %d): %s %s TTL %d",
 			remoteAddr,
 			pdCounter,
-			pd.ProbingDirectiveID, // ← Now shows the actual PD ID
+			pd.ProbingDirectiveID,
 			pd.DestinationAddress,
 			protocol,
 			pd.NearTTL,
@@ -215,14 +215,14 @@ func generatePD(counter int) *api.ProbingDirective {
 	ttl := uint8(5 + ttlOffset) // #nosec G115 -- ttlOffset is 0-15, safe for uint8
 
 	// Determine IP version
-	ipVersion := api.IPVersion(4)
-	if dstIP.To4() == nil {
-		ipVersion = api.IPVersion(6)
+	ipVersion := api.TypeIPv4 // ← Start as IPv4
+	if dstIP.To4() == nil {   // ← If IPv6, switch to IPv6 ✓ CORRECT!
+		ipVersion = api.TypeIPv6
 	}
 
 	// Build base directive with common fields
 	pd := &api.ProbingDirective{
-		ProbingDirectiveID: uint64(counter + 1), // ← FIXED: Add unique ID (starting from 1)
+		ProbingDirectiveID: uint64(counter + 1), // #nosec G115 -- counter is test value, no overflow
 		AgentID:            "agent-1",
 		IPVersion:          ipVersion,
 		DestinationAddress: dstIP,
@@ -244,7 +244,7 @@ func generatePD(counter int) *api.ProbingDirective {
 		}
 	} else {
 		// ICMP probe
-		if ipVersion == api.IPVersion(6) {
+		if ipVersion == api.TypeIPv6 {
 			pd.Protocol = api.ICMPv6
 			pd.NextHeader = api.NextHeader{
 				ICMPv6NextHeader: &api.ICMPv6NextHeader{},
