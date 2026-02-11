@@ -215,9 +215,9 @@ func generatePD(counter int) *api.ProbingDirective {
 	ttl := uint8(5 + ttlOffset) // #nosec G115 -- ttlOffset is 0-15, safe for uint8
 
 	// Determine IP version
-	ipVersion := api.TypeIPv4 // ← Start as IPv4
-	if dstIP.To4() == nil {   // ← If IPv6, switch to IPv6 ✓ CORRECT!
-		ipVersion = api.TypeIPv6
+	ipVersion := api.IPv4   // ← Start as IPv4
+	if dstIP.To4() == nil { // ← If IPv6, switch to IPv6 ✓ CORRECT!
+		ipVersion = api.IPv6
 	}
 
 	// Build base directive with common fields
@@ -244,7 +244,7 @@ func generatePD(counter int) *api.ProbingDirective {
 		}
 	} else {
 		// ICMP probe
-		if ipVersion == api.TypeIPv6 {
+		if ipVersion == api.IPv6 {
 			pd.Protocol = api.ICMPv6
 			pd.NextHeader = api.NextHeader{
 				ICMPv6NextHeader: &api.ICMPv6NextHeader{},

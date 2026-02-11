@@ -2047,7 +2047,7 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 			NearTTL:            10,
 			DestinationAddress: net.ParseIP("8.8.8.8"),
 			Protocol:           api.ICMP,
-			IPVersion:          api.TypeIPv4,
+			IPVersion:          api.IPv4,
 			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
 		}
 		_ = encoder.Encode(pd)
@@ -2136,7 +2136,7 @@ func TestRun_NoAuthentication(t *testing.T) {
 			NearTTL:            10,
 			DestinationAddress: net.ParseIP("8.8.8.8"),
 			Protocol:           api.ICMP,
-			IPVersion:          api.TypeIPv4,
+			IPVersion:          api.IPv4,
 			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
 		}
 		_ = encoder.Encode(pd)
