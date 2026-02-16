@@ -28,6 +28,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"net"
@@ -102,6 +103,16 @@ func (e *errorCloseConn) Close() error {
 	e.closed = true
 	e.mu.Unlock()
 	return io.ErrClosedPipe
+}
+
+// errorWriteConn implements net.Conn but returns a custom error on Write.
+type errorWriteConn struct {
+	*mockConn
+	writeErr error
+}
+
+func (e *errorWriteConn) Write(b []byte) (n int, err error) {
+	return 0, e.writeErr
 }
 
 // ============================================================================
@@ -258,8 +269,6 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 // ============================================================================
 
 func TestReportStats_WithData(t *testing.T) {
-	t.Parallel()
-
 	origSent := directivesSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
@@ -274,8 +283,6 @@ func TestReportStats_WithData(t *testing.T) {
 }
 
 func TestReportStats_EarlyReturn(t *testing.T) {
-	t.Parallel()
-
 	origSent := directivesSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
@@ -294,8 +301,6 @@ func TestReportStats_EarlyReturn(t *testing.T) {
 // ============================================================================
 
 func TestReceiveFIEs_Success(t *testing.T) {
-	t.Parallel()
-
 	fie := createTestFIE(123)
 
 	var buf bytes.Buffer
@@ -334,8 +339,6 @@ func TestReceiveFIEs_DecodeError(t *testing.T) {
 // ============================================================================
 
 func TestSendPDs_AllProtocolCases(t *testing.T) {
-	t.Parallel()
-
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	origSent := directivesSent.Load()
@@ -485,7 +488,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		handleAgent(conn, 1000)
+		handleAgent(conn, 100)
 		done <- true
 	}()
 
@@ -519,6 +522,32 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	if !foundICMPv6 {
 		t.Error("Did not generate ICMPv6 directive")
+	}
+}
+
+func TestHandleAgent_WriteError(t *testing.T) {
+	t.Parallel()
+
+	customErr := errors.New("network timeout")
+	conn := &errorWriteConn{
+		mockConn: newMockConn(),
+		writeErr: customErr,
+	}
+
+	fie := createTestFIE(1)
+	encodeFIE(t, conn.mockConn, fie)
+
+	done := make(chan bool)
+	go func() {
+		handleAgent(conn, 10)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Success - should exit quickly due to write error
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for handleAgent to handle write error")
 	}
 }
 

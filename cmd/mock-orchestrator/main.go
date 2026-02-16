@@ -30,6 +30,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -161,6 +162,12 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		pdCounter++
 
 		if err := encoder.Encode(pd); err != nil {
+			// Handle graceful disconnection - connection closed by client
+			if strings.Contains(err.Error(), "closed pipe") ||
+				strings.Contains(err.Error(), "broken pipe") {
+				return
+			}
+			// Real error, log and exit
 			log.Printf("[%s] Send error: %v", remoteAddr, err)
 			return
 		}
