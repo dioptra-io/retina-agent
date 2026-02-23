@@ -186,7 +186,8 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 
 			pd := generatePD(tt.counter)
 			if pd == nil {
-				t.Fatal("generatePD returned nil")
+				t.Errorf("generatePD returned nil")
+				return
 			}
 
 			verifyPDField(t, "NearTTL", pd.NearTTL, tt.wantTTL)
@@ -242,7 +243,8 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		pd := generatePD(i)
 		if pd == nil {
-			t.Fatalf("generatePD(%d) returned nil", i)
+			t.Errorf("generatePD(%d) returned nil", i)
+			return
 		}
 
 		if pd.NearTTL < 5 || pd.NearTTL > 20 {
@@ -280,6 +282,7 @@ func TestReportStats_WithData(t *testing.T) {
 	fiesReceived.Store(75)
 
 	reportStats()
+	t.Log("reportStats ran with data")
 }
 
 func TestReportStats_EarlyReturn(t *testing.T) {
@@ -294,6 +297,7 @@ func TestReportStats_EarlyReturn(t *testing.T) {
 	fiesReceived.Store(0)
 
 	reportStats()
+	t.Log("reportStats returned early with zero sent")
 }
 
 // ============================================================================
