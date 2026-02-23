@@ -38,9 +38,9 @@ import (
 )
 
 var (
-	directivesSent atomic.Int64
-	fiesReceived   atomic.Int64
-	startTime      = time.Now()
+	pdsSent      atomic.Int64
+	fiesReceived atomic.Int64
+	startTime    = time.Now()
 )
 
 func main() {
@@ -58,7 +58,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Mock orchestrator listening on %s (sending %d directives/sec)", *address, *rate)
+	log.Printf("Mock orchestrator listening on %s (sending %d PDs/sec)", *address, *rate)
 
 	// Periodic stats reporting
 	go func() {
@@ -83,7 +83,7 @@ func main() {
 
 // reportStats logs current throughput statistics.
 func reportStats() {
-	sent := directivesSent.Load()
+	sent := pdsSent.Load()
 	received := fiesReceived.Load()
 	duration := time.Since(startTime).Seconds()
 
@@ -91,15 +91,15 @@ func reportStats() {
 		return
 	}
 
-	directivesPerSec := float64(sent) / duration
+	pdsPerSec := float64(sent) / duration
 	fiesPerSec := float64(received) / duration
 	successRate := float64(received) / float64(sent) * 100
 
-	log.Printf("📊 Throughput: %.1f directives/s, %.1f FIEs/s (%.1f%% success) | Total: %d directives, %d FIEs",
-		directivesPerSec, fiesPerSec, successRate, sent, received)
+	log.Printf("📊 Throughput: %.1f PDs/s, %.1f FIEs/s (%.1f%% success) | Total: %d PDs, %d FIEs",
+		pdsPerSec, fiesPerSec, successRate, sent, received)
 }
 
-// handleAgent manages a connection with a single agent, sending directives and receiving FIEs.
+// handleAgent manages a connection with a single agent, sending PDs and receiving FIEs.
 func handleAgent(conn net.Conn, rate int) {
 	remoteAddr := conn.RemoteAddr().String()
 
@@ -172,7 +172,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 			return
 		}
 
-		directivesSent.Add(1)
+		pdsSent.Add(1)
 
 		var protocol string
 		switch pd.Protocol {
@@ -186,7 +186,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 			protocol = "UNKNOWN"
 		}
 
-		log.Printf("[%s] → Directive #%d (PD ID %d): %s %s TTL %d",
+		log.Printf("[%s] → PD #%d (PD ID %d): %s %s TTL %d",
 			remoteAddr,
 			pdCounter,
 			pd.ProbingDirectiveID,

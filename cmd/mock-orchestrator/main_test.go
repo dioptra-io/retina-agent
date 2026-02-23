@@ -269,28 +269,28 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 // ============================================================================
 
 func TestReportStats_WithData(t *testing.T) {
-	origSent := directivesSent.Load()
+	origSent := pdsSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
-		directivesSent.Store(origSent)
+		pdsSent.Store(origSent)
 		fiesReceived.Store(origReceived)
 	}()
 
-	directivesSent.Store(100)
+	pdsSent.Store(100)
 	fiesReceived.Store(75)
 
 	reportStats()
 }
 
 func TestReportStats_EarlyReturn(t *testing.T) {
-	origSent := directivesSent.Load()
+	origSent := pdsSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
-		directivesSent.Store(origSent)
+		pdsSent.Store(origSent)
 		fiesReceived.Store(origReceived)
 	}()
 
-	directivesSent.Store(0)
+	pdsSent.Store(0)
 	fiesReceived.Store(0)
 
 	reportStats()
@@ -341,8 +341,8 @@ func TestReceiveFIEs_DecodeError(t *testing.T) {
 func TestSendPDs_AllProtocolCases(t *testing.T) {
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
-	origSent := directivesSent.Load()
-	defer directivesSent.Store(origSent)
+	origSent := pdsSent.Load()
+	defer pdsSent.Store(origSent)
 
 	// Send 10 PDs to cover all protocol cases
 	const numPDs = 10
@@ -351,7 +351,7 @@ func TestSendPDs_AllProtocolCases(t *testing.T) {
 		if err := encoder.Encode(pd); err != nil {
 			t.Fatalf("Failed to encode PD %d: %v", i, err)
 		}
-		directivesSent.Add(1)
+		pdsSent.Add(1)
 
 		// Exercise protocol switch
 		var protocol string
@@ -368,7 +368,7 @@ func TestSendPDs_AllProtocolCases(t *testing.T) {
 		_ = protocol
 	}
 
-	if directivesSent.Load() < origSent+numPDs {
+	if pdsSent.Load() < origSent+numPDs {
 		t.Errorf("Expected at least %d PDs sent", numPDs)
 	}
 
