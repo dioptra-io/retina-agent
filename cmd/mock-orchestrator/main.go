@@ -133,6 +133,16 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 
 		fiesReceived.Add(1)
 
+		if fie.NearInfo == nil || fie.FarInfo == nil {
+			log.Printf("[%s] ✓ FIE for PD %d: %s → %s | (no probe response received)",
+				remoteAddr,
+				fie.ProbingDirectiveID,
+				fie.Agent.AgentID,
+				fie.DestinationAddress,
+			)
+			continue
+		}
+
 		nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
 		farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
 

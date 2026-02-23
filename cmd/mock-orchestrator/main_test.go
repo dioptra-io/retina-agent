@@ -126,13 +126,13 @@ func createTestFIE(pdID uint64) api.ForwardingInfoElement {
 		Agent:              api.Agent{AgentID: "test-agent"},
 		ProbingDirectiveID: pdID,
 		DestinationAddress: net.ParseIP("8.8.8.8"),
-		NearInfo: api.Info{
+		NearInfo: &api.Info{
 			ProbeTTL:          10,
 			ReplyAddress:      net.ParseIP("10.0.0.1"),
 			SentTimestamp:     now,
 			ReceivedTimestamp: now.Add(10 * time.Millisecond),
 		},
-		FarInfo: api.Info{
+		FarInfo: &api.Info{
 			ProbeTTL:          11,
 			ReplyAddress:      net.ParseIP("10.0.0.2"),
 			SentTimestamp:     now,
@@ -302,6 +302,33 @@ func TestReportStats_EarlyReturn(t *testing.T) {
 
 func TestReceiveFIEs_Success(t *testing.T) {
 	fie := createTestFIE(123)
+
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	if err := encoder.Encode(fie); err != nil {
+		t.Fatalf("Failed to encode FIE: %v", err)
+	}
+
+	decoder := json.NewDecoder(&buf)
+	origReceived := fiesReceived.Load()
+	defer fiesReceived.Store(origReceived)
+
+	receiveFIEs(decoder, "test-addr")
+
+	if fiesReceived.Load() != origReceived+1 {
+		t.Error("fiesReceived counter not incremented")
+	}
+}
+
+func TestReceiveFIEs_NilInfo(t *testing.T) {
+	// FIE with nil NearInfo and FarInfo (no probe response received)
+	fie := api.ForwardingInfoElement{
+		Agent:              api.Agent{AgentID: "test-agent"},
+		ProbingDirectiveID: 42,
+		DestinationAddress: net.ParseIP("8.8.8.8"),
+		NearInfo:           nil,
+		FarInfo:            nil,
+	}
 
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)

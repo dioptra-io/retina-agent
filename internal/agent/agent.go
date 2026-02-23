@@ -299,12 +299,19 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return fmt.Errorf("failed to encode FIE: %w", err)
 			}
 
-			log.Printf("Agent %s: → FIE for PD %d, dest %s | Near(TTL%d) | Far(TTL%d)",
-				a.config.AgentID,
-				fie.ProbingDirectiveID,
-				fie.DestinationAddress,
-				fie.NearInfo.ProbeTTL,
-				fie.FarInfo.ProbeTTL)
+			if fie.NearInfo == nil || fie.FarInfo == nil {
+				log.Printf("Agent %s: → FIE for PD %d, dest %s | (no probe response received)",
+					a.config.AgentID,
+					fie.ProbingDirectiveID,
+					fie.DestinationAddress)
+			} else {
+				log.Printf("Agent %s: → FIE for PD %d, dest %s | Near(TTL%d) | Far(TTL%d)",
+					a.config.AgentID,
+					fie.ProbingDirectiveID,
+					fie.DestinationAddress,
+					fie.NearInfo.ProbeTTL,
+					fie.FarInfo.ProbeTTL)
+			}
 		}
 	}
 }
@@ -417,8 +424,8 @@ func validatePD(pd *api.ProbingDirective) error {
 }
 
 // probeResultToInfo converts a ProbeResult into an Info structure for FIE generation.
-func probeResultToInfo(result *ProbeResult, ttl uint8) api.Info {
-	return api.Info{
+func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
+	return &api.Info{
 		ProbeTTL:          ttl,
 		ReplyAddress:      result.ReplyAddress,
 		SentTimestamp:     result.SentTime,
