@@ -106,6 +106,7 @@ func TestMockProber_Timestamps(t *testing.T) {
 
 	if successResult == nil {
 		t.Skip("No successful probe in 50 attempts (very unlikely)")
+		return
 	}
 
 	// Verify timestamp ordering

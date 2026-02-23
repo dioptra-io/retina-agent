@@ -316,8 +316,9 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 	}
 }
 
-// processPD executes near and far probes in parallel and sends an FIE if both succeed.
-// Failed probes are logged; timed-out probes are silently skipped (expected behavior).
+// processPD executes near and far probes in parallel and sends an FIE regardless of timeouts.
+// Failed probes are logged and cause the FIE to be dropped.
+// Timed-out probes result in a nil NearInfo or FarInfo in the FIE.
 func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
 	nearTTL := pd.NearTTL
 	farTTL := pd.NearTTL + 1
@@ -349,20 +350,26 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		return
 	}
 
-	// Skip if either timed out (expected, no logging needed).
-	if nearRes.result.TimedOut || farRes.result.TimedOut {
-		return
+	// Build NearInfo and FarInfo - nil if probe timed out (no response received).
+	var nearInfo *api.Info
+	if !nearRes.result.TimedOut {
+		nearInfo = probeResultToInfo(nearRes.result, nearTTL)
 	}
 
-	// Build and send FIE.
+	var farInfo *api.Info
+	if !farRes.result.TimedOut {
+		farInfo = probeResultToInfo(farRes.result, farTTL)
+	}
+
+	// Build and send FIE (NearInfo/FarInfo nil when no response received).
 	fie := &api.ForwardingInfoElement{
 		Agent:               api.Agent{AgentID: a.config.AgentID},
 		ProbingDirectiveID:  pd.ProbingDirectiveID,
 		IPVersion:           pd.IPVersion,
 		Protocol:            pd.Protocol,
 		DestinationAddress:  pd.DestinationAddress,
-		NearInfo:            probeResultToInfo(nearRes.result, nearTTL),
-		FarInfo:             probeResultToInfo(farRes.result, farTTL),
+		NearInfo:            nearInfo,
+		FarInfo:             farInfo,
 		ProductionTimestamp: time.Now().UTC(),
 	}
 

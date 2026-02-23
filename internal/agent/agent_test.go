@@ -188,7 +188,11 @@ func TestRun_WithLocalServer(t *testing.T) {
 			return
 		}
 
-		t.Logf("✓ Received FIE with TTL %d", fie.NearInfo.ProbeTTL)
+		if fie.NearInfo != nil {
+			t.Logf("✓ Received FIE with TTL %d", fie.NearInfo.ProbeTTL)
+		} else {
+			t.Log("✓ Received FIE (near probe timed out)")
+		}
 		gotFIE <- true
 
 		// Keep connection open a bit
@@ -448,14 +452,8 @@ func TestRun_WithMockConnection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	// Try to call the agent's run method directly
-	// If agent has a run(ctx, conn) method, we can test it
-	// Otherwise, this test verifies our components work together
-
 	done := make(chan error, 1)
 	go func() {
-		// Assuming agent has readerLoop, writerLoop, processorLoop
-		// We'll test them running together
 		pds := make(chan *api.ProbingDirective, 10)
 		fies := make(chan *api.ForwardingInfoElement, 10)
 
@@ -496,8 +494,9 @@ func TestRun_WithMockConnection(t *testing.T) {
 	if err := decoder.Decode(&fie); err != nil {
 		t.Logf("Note: Could not read FIE (expected if goroutines exit early): %v", err)
 	} else {
-		// Verify FIE has correct data
-		if fie.NearInfo.ProbeTTL != 10 {
+		if fie.NearInfo == nil {
+			t.Error("NearInfo should be set when near probe succeeded")
+		} else if fie.NearInfo.ProbeTTL != 10 {
 			t.Errorf("FIE NearInfo.ProbeTTL = %d, want 10", fie.NearInfo.ProbeTTL)
 		}
 		t.Logf("Successfully completed full pipeline test")
@@ -590,7 +589,8 @@ func TestHandleDecodeError_NetworkError(t *testing.T) {
 		t.Errorf("error count should remain 0, got: %d", newCount)
 	}
 	if handledErr == nil {
-		t.Fatal("should return wrapped error on network error")
+		t.Error("should return wrapped error on network error")
+		return
 	}
 	if !strings.Contains(handledErr.Error(), "connection lost while reading") {
 		t.Errorf("error should mention connection lost, got: %v", handledErr)
@@ -642,7 +642,8 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 		t.Errorf("error count should be 3, got: %d", newCount)
 	}
 	if handledErr == nil {
-		t.Fatal("should return error after threshold")
+		t.Error("should return error after threshold")
+		return
 	}
 	if !strings.Contains(handledErr.Error(), "too many consecutive decode errors") {
 		t.Errorf("error should mention too many errors, got: %v", handledErr)
@@ -889,7 +890,8 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 	select {
 	case pd := <-pds:
 		if pd == nil {
-			t.Fatal("received nil PD")
+			t.Errorf("received nil PD")
+			return
 		}
 		if pd.NearTTL != 10 {
 			t.Errorf("expected valid PD with TTL 10, got: %d", pd.NearTTL)
@@ -941,7 +943,8 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	select {
 	case pd := <-pds:
 		if pd == nil {
-			t.Fatal("received nil PD from channel")
+			t.Errorf("received nil PD from channel")
+			return
 		}
 		if pd.NearTTL != 5 || pd.AgentID != "test" {
 			t.Errorf("readerLoop got %+v, want TTL=5 AgentID=test", pd)
@@ -1037,8 +1040,6 @@ func TestWriterLoop_EncodeError(t *testing.T) {
 
 	a := &agent{config: DefaultConfig()}
 
-	// Create an FIE with a field that will cause encoding issues
-	// Use a channel that will be written to
 	written := make(chan string, 1)
 
 	conn := &stubConn{
@@ -1087,7 +1088,8 @@ func TestWriterLoop_Success(t *testing.T) {
 	select {
 	case data := <-written:
 		if len(data) == 0 {
-			t.Fatal("writerLoop wrote empty data")
+			t.Error("writerLoop wrote empty data")
+			return
 		}
 		var decoded api.ForwardingInfoElement
 		if err := json.Unmarshal(data, &decoded); err != nil {
@@ -1155,7 +1157,12 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	select {
 	case fie := <-fies:
 		if fie == nil {
-			t.Fatal("received nil FIE from channel")
+			t.Errorf("received nil FIE from channel")
+			return
+		}
+		if fie.NearInfo == nil {
+			t.Errorf("NearInfo should be set when near probe succeeded")
+			return
 		}
 		if fie.NearInfo.ProbeTTL != 5 {
 			t.Errorf("processorLoop FIE TTL = %d, want 5", fie.NearInfo.ProbeTTL)
@@ -1196,7 +1203,12 @@ func TestProcessPD_Success(t *testing.T) {
 	select {
 	case fie := <-fies:
 		if fie == nil {
-			t.Fatal("received nil FIE from channel")
+			t.Errorf("received nil FIE from channel")
+			return
+		}
+		if fie.NearInfo == nil || fie.FarInfo == nil {
+			t.Errorf("NearInfo and FarInfo should be set when both probes succeed")
+			return
 		}
 		if fie.NearInfo.ProbeTTL != 5 || fie.FarInfo.ProbeTTL != 6 {
 			t.Errorf("processPD TTLs = %d/%d, want 5/6",
@@ -1230,7 +1242,6 @@ func TestProcessPD_NearProbeError(t *testing.T) {
 
 	a.processPD(context.Background(), pd, fies)
 
-	// Wait for goroutines to complete (they should exit with error)
 	select {
 	case <-fies:
 		t.Error("processPD should not send FIE on near probe error")
@@ -1259,7 +1270,6 @@ func TestProcessPD_FarProbeError(t *testing.T) {
 
 	a.processPD(context.Background(), pd, fies)
 
-	// Wait for goroutines to complete (they should exit with error)
 	select {
 	case <-fies:
 		t.Error("processPD should not send FIE on far probe error")
@@ -1268,61 +1278,74 @@ func TestProcessPD_FarProbeError(t *testing.T) {
 	}
 }
 
-func TestProcessPD_NearTimeout(t *testing.T) {
+//nolint:funlen // Table-driven test with two subtests each requiring prober setup and assertions
+func TestProcessPD_Timeout(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 5 {
-					return &ProbeResult{TimedOut: true}, nil
-				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
+	tests := []struct {
+		name            string
+		timedOutTTL     uint8
+		wantNearInfoNil bool
+		wantFarInfoNil  bool
+	}{
+		{
+			name:            "near timeout",
+			timedOutTTL:     5,
+			wantNearInfoNil: true,
+			wantFarInfoNil:  false,
+		},
+		{
+			name:            "far timeout",
+			timedOutTTL:     6,
+			wantNearInfoNil: false,
+			wantFarInfoNil:  true,
 		},
 	}
 
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	a.processPD(context.Background(), pd, fies)
+			a := &agent{
+				config: &Config{AgentID: "test"},
+				prober: &stubProber{
+					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+						if ttl == tt.timedOutTTL {
+							return &ProbeResult{TimedOut: true}, nil
+						}
+						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+					},
+				},
+			}
 
-	// Wait for goroutines to complete
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE on near timeout")
-	case <-time.After(100 * time.Millisecond):
-		// Expected - no FIE sent when probe times out
-	}
-}
+			pd := &api.ProbingDirective{NearTTL: 5}
+			fies := make(chan *api.ForwardingInfoElement, 1)
 
-func TestProcessPD_FarTimeout(t *testing.T) {
-	t.Parallel()
+			a.processPD(context.Background(), pd, fies)
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 6 {
-					return &ProbeResult{TimedOut: true}, nil
+			select {
+			case fie := <-fies:
+				if fie == nil {
+					t.Errorf("processPD should send FIE even when probe times out")
+					return
 				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
-		},
-	}
-
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
-
-	a.processPD(context.Background(), pd, fies)
-
-	// Wait for goroutines to complete
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE on far timeout")
-	case <-time.After(100 * time.Millisecond):
-		// Expected - no FIE sent when probe times out
+				if tt.wantNearInfoNil && fie.NearInfo != nil {
+					t.Error("NearInfo should be nil when near probe timed out")
+				}
+				if !tt.wantNearInfoNil && fie.NearInfo == nil {
+					t.Error("NearInfo should be set when near probe succeeded")
+				}
+				if tt.wantFarInfoNil && fie.FarInfo != nil {
+					t.Error("FarInfo should be nil when far probe timed out")
+				}
+				if !tt.wantFarInfoNil && fie.FarInfo == nil {
+					t.Error("FarInfo should be set when far probe succeeded")
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Error("processPD did not send FIE")
+			}
+		})
 	}
 }
 
@@ -1528,6 +1551,10 @@ func TestProbeResultToInfo(t *testing.T) {
 	}
 
 	info := probeResultToInfo(res, 64)
+	if info == nil {
+		t.Errorf("probeResultToInfo returned nil")
+		return
+	}
 
 	if info.ProbeTTL != 64 {
 		t.Errorf("probeResultToInfo TTL = %d, want 64", info.ProbeTTL)
@@ -1733,7 +1760,8 @@ func TestAuthenticate_Rejected(t *testing.T) {
 
 			err := a.authenticate(conn)
 			if err == nil {
-				t.Fatal("authenticate() should fail when rejected")
+				t.Error("authenticate() should fail when rejected")
+				return
 			}
 			if !strings.Contains(err.Error(), tt.expectedErr) {
 				t.Errorf("error should contain %q, got: %v", tt.expectedErr, err)
@@ -1779,7 +1807,8 @@ func TestAuthenticate_ReadError(t *testing.T) {
 
 			err := a.authenticate(conn)
 			if err == nil {
-				t.Fatal("authenticate() should fail on read error")
+				t.Error("authenticate() should fail on read error")
+				return
 			}
 			if !strings.Contains(err.Error(), tt.expectedErr) {
 				t.Errorf("error should contain %q, got: %v", tt.expectedErr, err)
@@ -1803,7 +1832,8 @@ func TestAuthenticate_WriteError(t *testing.T) {
 
 	err := a.authenticate(conn)
 	if err == nil {
-		t.Fatal("authenticate() should fail on write error")
+		t.Error("authenticate() should fail on write error")
+		return
 	}
 	if !strings.Contains(err.Error(), "failed to send auth request") {
 		t.Errorf("error should mention send failure, got: %v", err)
@@ -1827,7 +1857,8 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 
 	err := a.authenticate(conn)
 	if err == nil {
-		t.Fatal("authenticate() should fail on malformed response")
+		t.Error("authenticate() should fail on malformed response")
+		return
 	}
 	if !strings.Contains(err.Error(), "failed to receive auth response") {
 		t.Errorf("error should mention receive failure, got: %v", err)
@@ -1884,7 +1915,8 @@ func TestAuthenticate_SetWriteDeadlineError(t *testing.T) {
 
 	err := a.authenticate(conn)
 	if err == nil {
-		t.Fatal("authenticate() should fail on SetWriteDeadline error")
+		t.Error("authenticate() should fail on SetWriteDeadline error")
+		return
 	}
 	if !strings.Contains(err.Error(), "failed to set write deadline") {
 		t.Errorf("error should mention write deadline, got: %v", err)
@@ -1916,7 +1948,8 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 
 	err := a.authenticate(conn)
 	if err == nil {
-		t.Fatal("authenticate() should fail on SetReadDeadline error")
+		t.Error("authenticate() should fail on SetReadDeadline error")
+		return
 	}
 	if !strings.Contains(err.Error(), "failed to set read deadline") {
 		t.Errorf("error should mention read deadline, got: %v", err)
@@ -1983,7 +2016,8 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 	err = Run(ctx, cfg)
 
 	if err == nil {
-		t.Fatal("Run() should fail when authentication is rejected")
+		t.Error("Run() should fail when authentication is rejected")
+		return
 	}
 	if !strings.Contains(err.Error(), "authentication failed") {
 		t.Errorf("error should mention authentication failure, got: %v", err)

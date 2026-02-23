@@ -733,10 +733,12 @@ func TestProbeEndToEnd(t *testing.T) {
 	select {
 	case result := <-resultCh:
 		if result == nil {
-			t.Fatal("result is nil")
+			t.Errorf("result is nil")
+			return
 		}
 		if result.ReplyAddress == nil {
-			t.Fatal("reply address is nil")
+			t.Errorf("reply address is nil")
+			return
 		}
 		if result.ReplyAddress.String() != "10.0.0.2" {
 			t.Errorf("expected reply address 10.0.0.2, got %s", result.ReplyAddress.String())
@@ -848,7 +850,8 @@ func TestProbeTimeout(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result == nil {
-		t.Fatal("result is nil")
+		t.Errorf("result is nil")
+		return
 	}
 	if !result.TimedOut {
 		t.Error("expected probe to timeout")
@@ -1791,7 +1794,8 @@ done
 	}
 
 	if result == nil {
-		t.Fatal("result is nil")
+		t.Errorf("result is nil")
+		return
 	}
 
 	if result.TimedOut {
@@ -1890,7 +1894,8 @@ while read line; do sleep 1; done
 	}
 
 	if result == nil {
-		t.Fatal("result is nil")
+		t.Errorf("result is nil")
+		return
 	}
 
 	if !result.TimedOut {
