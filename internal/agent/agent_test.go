@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -46,6 +47,11 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
+
+// testLogger returns a logger that discards all output, keeping test output clean.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // ===== Flexible Stubs =====
 
@@ -102,9 +108,7 @@ func (c *stubConn) Close() error {
 func (c *stubConn) LocalAddr() net.Addr  { return &net.IPAddr{} }
 func (c *stubConn) RemoteAddr() net.Addr { return &net.IPAddr{} }
 
-func (c *stubConn) SetDeadline(t time.Time) error {
-	return nil
-}
+func (c *stubConn) SetDeadline(t time.Time) error { return nil }
 
 func (c *stubConn) SetReadDeadline(t time.Time) error {
 	if c.readDeadlineFunc != nil {
@@ -138,7 +142,6 @@ func (e *mockNetError) Temporary() bool { return e.temporary }
 func TestRun_WithLocalServer(t *testing.T) {
 	// Note: Not parallel - full integration test with real network connections and timing dependencies
 
-	// Start a mock orchestrator server
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to start listener: %v", err)
@@ -148,10 +151,8 @@ func TestRun_WithLocalServer(t *testing.T) {
 	serverAddr := listener.Addr().String()
 	t.Logf("Mock orchestrator listening on %s", serverAddr)
 
-	// Channel to track if we received FIEs
 	gotFIE := make(chan bool, 1)
 
-	// Server goroutine
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -164,7 +165,6 @@ func TestRun_WithLocalServer(t *testing.T) {
 		encoder := json.NewEncoder(conn)
 		decoder := json.NewDecoder(conn)
 
-		// Send one directive
 		pd := &api.ProbingDirective{
 			AgentID:            "test-agent",
 			NearTTL:            10,
@@ -179,7 +179,6 @@ func TestRun_WithLocalServer(t *testing.T) {
 			return
 		}
 
-		// Receive FIE
 		t.Log("Waiting for FIE...")
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		var fie api.ForwardingInfoElement
@@ -195,14 +194,11 @@ func TestRun_WithLocalServer(t *testing.T) {
 		}
 		gotFIE <- true
 
-		// Keep connection open a bit
 		time.Sleep(200 * time.Millisecond)
 	}()
 
-	// Give server time to start listening
 	time.Sleep(50 * time.Millisecond)
 
-	// Run agent in background
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = serverAddr
 	cfg.ProberType = "mock"
@@ -214,12 +210,11 @@ func TestRun_WithLocalServer(t *testing.T) {
 	agentErr := make(chan error, 1)
 	go func() {
 		t.Log("Starting agent...")
-		err := Run(ctx, cfg)
+		err := Run(ctx, cfg, testLogger())
 		t.Logf("Agent exited: %v", err)
 		agentErr <- err
 	}()
 
-	// Wait for FIE or timeout
 	select {
 	case <-gotFIE:
 		t.Log("SUCCESS: Full pipeline worked!")
@@ -227,7 +222,6 @@ func TestRun_WithLocalServer(t *testing.T) {
 		t.Error("Timeout: Did not receive FIE")
 	}
 
-	// Cleanup
 	cancel()
 	<-agentErr
 }
@@ -235,8 +229,6 @@ func TestRun_WithLocalServer(t *testing.T) {
 func TestRun_ConnectionCloseError(t *testing.T) {
 	t.Parallel()
 
-	// This test attempts to trigger the connection close error log
-	// Note: It's difficult to reliably make conn.Close() fail in tests
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to start listener: %v", err)
@@ -246,14 +238,12 @@ func TestRun_ConnectionCloseError(t *testing.T) {
 	serverAddr := listener.Addr().String()
 	connClosed := make(chan net.Conn, 1)
 
-	// Server that gives us access to the connection
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		connClosed <- conn
-		// Keep it open briefly
 		time.Sleep(100 * time.Millisecond)
 		_ = conn.Close()
 	}()
@@ -267,19 +257,16 @@ func TestRun_ConnectionCloseError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg)
+		done <- Run(ctx, cfg, testLogger())
 	}()
 
-	// Get the server-side connection and close it abruptly
 	select {
 	case conn := <-connClosed:
-		// Force close from server side while agent is running
 		time.Sleep(50 * time.Millisecond)
-		_ = conn.Close() // This might put client connection in bad state
+		_ = conn.Close()
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// Wait for Run to finish
 	select {
 	case <-done:
 		t.Log("Run finished (connection close defer executed)")
@@ -290,7 +277,6 @@ func TestRun_ConnectionCloseError(t *testing.T) {
 func TestRun_ProberCloseError(t *testing.T) {
 	// Note: Cannot be parallel - modifies global createProber
 
-	// Test that prober.Close() errors are logged in the defer
 	origCreateProber := createProber
 	defer func() { createProber = origCreateProber }()
 
@@ -302,16 +288,14 @@ func TestRun_ProberCloseError(t *testing.T) {
 		}, nil
 	}
 
-	// Use invalid address so Run fails quickly after prober creation
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = "invalid-host:99999"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	err := Run(ctx, cfg)
+	err := Run(ctx, cfg, testLogger())
 
-	// Should fail to connect (and trigger prober.Close() defer with error)
 	if err == nil {
 		t.Error("Run should fail with invalid address")
 	}
@@ -321,11 +305,10 @@ func TestRun_ProberCloseError(t *testing.T) {
 func TestRun_ProberCreationError(t *testing.T) {
 	t.Parallel()
 
-	// Test with invalid prober type to trigger createProber error
 	cfg := DefaultConfig()
 	cfg.ProberType = "invalid-prober-type-xyz"
 
-	err := Run(context.Background(), cfg)
+	err := Run(context.Background(), cfg, testLogger())
 	if err == nil {
 		t.Error("Run(invalid prober) should fail")
 	}
@@ -337,9 +320,6 @@ func TestRun_ProberCreationError(t *testing.T) {
 func TestRun_GoroutineErrorPropagation(t *testing.T) {
 	t.Parallel()
 
-	// Test that errors from goroutines (not context errors) are properly returned
-	// We'll trigger a "too many consecutive decode errors" by sending bad data
-
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to start listener: %v", err)
@@ -348,7 +328,6 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 
 	serverAddr := listener.Addr().String()
 
-	// Server that sends invalid JSON to trigger decode errors
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -356,15 +335,12 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		// Send consecutive invalid JSON to trigger MaxConsecutiveDecodeErrors
 		for i := 0; i < 20; i++ {
-			// Send garbage that's not valid JSON
 			_, _ = conn.Write([]byte("invalid json line\n"))
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
-	// Run agent with low MaxConsecutiveDecodeErrors
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = serverAddr
 	cfg.ProberType = "mock"
@@ -373,12 +349,10 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err = Run(ctx, cfg)
-	// Should get a non-context error (decode error)
+	err = Run(ctx, cfg, testLogger())
 	if err == nil {
 		t.Error("Run should return error from goroutine")
 	}
-	// Should NOT be a context error
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Run returned context error, want goroutine error: %v", err)
 	}
@@ -389,12 +363,10 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 func TestRun_NilConfig(t *testing.T) {
 	t.Parallel()
 
-	// Run with nil config - should use defaults but fail to connect
-	err := Run(context.Background(), nil)
+	err := Run(context.Background(), nil, testLogger())
 	if err == nil {
 		t.Error("Run(nil config) should fail to connect")
 	}
-	// Should fail at connection stage
 	if !strings.Contains(err.Error(), "connect") && !strings.Contains(err.Error(), "dial") {
 		t.Logf("Run(nil config) error: %v", err)
 	}
@@ -404,9 +376,9 @@ func TestRun_InvalidOrchestratorAddr(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
-	cfg.OrchestratorAddr = "invalid:99999" // Invalid port
+	cfg.OrchestratorAddr = "invalid:99999"
 
-	err := Run(context.Background(), cfg)
+	err := Run(context.Background(), cfg, testLogger())
 	if err == nil {
 		t.Error("Run(invalid addr) should fail")
 	}
@@ -416,25 +388,21 @@ func TestRun_ContextCancelledBeforeConnect(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = "127.0.0.1:9999"
 
-	err := Run(ctx, cfg)
+	err := Run(ctx, cfg, testLogger())
 	if err == nil {
 		t.Error("Run(cancelled context) should fail")
 	}
 }
 
-// TestRun_WithMockConnection tests the agent's behavior with a mock connection
-// This tests the internal agent.run() method if it exists, or we skip if not accessible
-//
 //nolint:funlen // Integration test with full pipeline setup
 func TestRun_WithMockConnection(t *testing.T) {
 	// Note: Not parallel - tests full pipeline with coordinated goroutines
 
-	// Create agent directly
 	a := &agent{
 		config: &Config{
 			AgentID:                    "test-agent",
@@ -443,9 +411,9 @@ func TestRun_WithMockConnection(t *testing.T) {
 			WriteDeadline:              time.Second,
 		},
 		prober: &stubProber{},
+		logger: testLogger(),
 	}
 
-	// Use net.Pipe to simulate a connection
 	clientConn, serverConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
 
@@ -457,13 +425,11 @@ func TestRun_WithMockConnection(t *testing.T) {
 		pds := make(chan *api.ProbingDirective, 10)
 		fies := make(chan *api.ForwardingInfoElement, 10)
 
-		// Start the three loops
 		errCh := make(chan error, 3)
 		go func() { errCh <- a.readerLoop(ctx, serverConn, pds) }()
 		go func() { errCh <- a.processorLoop(ctx, pds, fies) }()
 		go func() { errCh <- a.writerLoop(ctx, serverConn, fies) }()
 
-		// Wait for first error or context
 		select {
 		case err := <-errCh:
 			done <- err
@@ -472,7 +438,6 @@ func TestRun_WithMockConnection(t *testing.T) {
 		}
 	}()
 
-	// Send a probing directive from client side
 	validPD := &api.ProbingDirective{
 		AgentID:            "test-agent",
 		NearTTL:            10,
@@ -486,7 +451,6 @@ func TestRun_WithMockConnection(t *testing.T) {
 		t.Fatalf("Failed to send directive: %v", err)
 	}
 
-	// Try to read back the FIE
 	decoder := json.NewDecoder(clientConn)
 	var fie api.ForwardingInfoElement
 
@@ -502,13 +466,10 @@ func TestRun_WithMockConnection(t *testing.T) {
 		t.Logf("Successfully completed full pipeline test")
 	}
 
-	// Close client to trigger shutdown
 	_ = clientConn.Close()
 
-	// Wait for goroutines to finish
 	select {
 	case err := <-done:
-		// Network error or context error is expected
 		if err != nil && !isNetworkError(err) && !errors.Is(err, context.DeadlineExceeded) {
 			t.Logf("Agent finished with: %v", err)
 		}
@@ -517,17 +478,14 @@ func TestRun_WithMockConnection(t *testing.T) {
 	}
 }
 
-// ===== readerLoop() Tests =====
-
 // ===== handleDecodeError() Tests =====
 
 func TestHandleDecodeError_Timeout(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-		},
+		config: &Config{AgentID: "test-agent"},
+		logger: testLogger(),
 	}
 
 	err := &mockNetError{timeout: true, err: "timeout"}
@@ -548,13 +506,12 @@ func TestHandleDecodeError_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-		},
+		config: &Config{AgentID: "test-agent"},
+		logger: testLogger(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	err := errors.New("some error")
 	shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, 0)
@@ -574,12 +531,11 @@ func TestHandleDecodeError_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-		},
+		config: &Config{AgentID: "test-agent"},
+		logger: testLogger(),
 	}
 
-	err := &mockNetError{timeout: false, err: "network error"} // Network error but not timeout
+	err := &mockNetError{timeout: false, err: "network error"}
 	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
 
 	if shouldContinue {
@@ -605,11 +561,11 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 			AgentID:                    "test-agent",
 			MaxConsecutiveDecodeErrors: 3,
 		},
+		logger: testLogger(),
 	}
 
 	err := errors.New("json: invalid character")
 
-	// First error - should continue
 	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
 	if !shouldContinue {
 		t.Error("should continue on first JSON error")
@@ -621,7 +577,6 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 		t.Errorf("should not return error yet, got: %v", handledErr)
 	}
 
-	// Second error - should continue
 	shouldContinue, newCount, handledErr = a.handleDecodeError(context.Background(), err, 1)
 	if !shouldContinue {
 		t.Error("should continue on second JSON error")
@@ -633,7 +588,6 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 		t.Errorf("should not return error yet, got: %v", handledErr)
 	}
 
-	// Third error - should stop (reached threshold)
 	shouldContinue, newCount, handledErr = a.handleDecodeError(context.Background(), err, 2)
 	if shouldContinue {
 		t.Error("should stop after reaching threshold")
@@ -656,13 +610,13 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 	a := &agent{
 		config: &Config{
 			AgentID:                    "test-agent",
-			MaxConsecutiveDecodeErrors: 0, // Disabled - never stop
+			MaxConsecutiveDecodeErrors: 0,
 		},
+		logger: testLogger(),
 	}
 
 	err := errors.New("json: invalid character")
 
-	// First error
 	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
 	if !shouldContinue {
 		t.Error("should continue when limit is disabled")
@@ -674,7 +628,6 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 		t.Errorf("should not return error, got: %v", handledErr)
 	}
 
-	// 100th error - should still continue (no limit)
 	shouldContinue, newCount, handledErr = a.handleDecodeError(context.Background(), err, 99)
 	if !shouldContinue {
 		t.Error("should continue even after many errors when limit is disabled")
@@ -687,19 +640,14 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 	}
 }
 
-// ===== readerLoop() Detailed Tests =====
-
-// Note: Read timeout logging is not tested as it's difficult to test reliably
-// without infinite loops. The timeout case is just informational logging.
+// ===== readerLoop() Tests =====
 
 func TestReaderLoop_DecodeErrorLog(t *testing.T) {
 	t.Parallel()
 
-	// Test that non-validation decode errors are logged
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	a.config.MaxConsecutiveDecodeErrors = 2
 
-	// Send malformed JSON (not an ErrInvalidDirective, just bad JSON)
 	data := bytes.NewBufferString("{ bad json\n{ more bad\n")
 
 	conn := &stubConn{
@@ -728,20 +676,17 @@ func TestReaderLoop_DecodeErrorLog(t *testing.T) {
 func TestReaderLoop_DecodeErrorWithUnlimitedRetries(t *testing.T) {
 	t.Parallel()
 
-	// Test the decode error log when MaxConsecutiveDecodeErrors = 0 (unlimited)
-	a := &agent{config: DefaultConfig()}
-	a.config.MaxConsecutiveDecodeErrors = 0 // Unlimited - triggers the else branch
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a.config.MaxConsecutiveDecodeErrors = 0
 
 	attempts := 0
 	conn := &stubConn{
 		readFunc: func(b []byte) (int, error) {
 			attempts++
-			// Keep sending invalid JSON (will loop until context timeout)
 			return copy(b, []byte("invalid json\n")), nil
 		},
 	}
 
-	// Use a short timeout to allow log to happen but prevent infinite loop
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -749,20 +694,15 @@ func TestReaderLoop_DecodeErrorWithUnlimitedRetries(t *testing.T) {
 
 	err := a.readerLoop(ctx, conn, pds)
 
-	// Should get context deadline exceeded
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Logf("readerLoop = %v (expected context.DeadlineExceeded)", err)
 	}
 
-	// Verify the log was triggered at least once
 	if attempts < 1 {
 		t.Error("Expected at least one decode attempt")
 	}
 	t.Log("✓ Decode error with unlimited retries was logged")
 }
-
-// Note: return ctx.Err() during decode errors is difficult to test reliably
-// It's already partially covered by TestReaderLoop_ContextCancelled
 
 func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 	t.Parallel()
@@ -772,7 +712,7 @@ func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 			return errors.New("deadline fail")
 		},
 	}
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
 	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
 	if err == nil || !strings.Contains(err.Error(), "failed to set read deadline") {
@@ -783,11 +723,10 @@ func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 func TestReaderLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// Conn that returns EOF to trigger decode error, then we check ctx
 	conn := &stubConn{}
 
 	err := a.readerLoop(ctx, conn, make(chan *api.ProbingDirective, 1))
@@ -799,8 +738,8 @@ func TestReaderLoop_ContextCancelled(t *testing.T) {
 func TestReaderLoop_NetworkError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
-	conn := &stubConn{} // Returns io.EOF by default
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	conn := &stubConn{}
 
 	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
 	if !isNetworkError(err) || !strings.Contains(err.Error(), "connection lost while reading") {
@@ -811,7 +750,7 @@ func TestReaderLoop_NetworkError(t *testing.T) {
 func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	a.config.MaxConsecutiveDecodeErrors = 2
 
 	data := bytes.NewBufferString("bad\nbad\n")
@@ -828,7 +767,6 @@ func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 		done <- err
 	}()
 
-	// readerLoop should exit with error after 2 consecutive decode errors
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "too many consecutive decode errors") {
@@ -843,9 +781,8 @@ func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 func TestReaderLoop_InvalidDirective(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
-	// Send directive with missing required field (no AgentID), then a valid one
 	invalidPD := &api.ProbingDirective{
 		NearTTL:            5,
 		DestinationAddress: []byte{1, 2, 3, 4},
@@ -863,7 +800,6 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 	validJSON, _ := json.Marshal(validPD)
 	validJSON = append(validJSON, '\n')
 
-	// Combine: invalid PD, then valid PD, then EOF
 	data := make([]byte, 0, len(invalidJSON)+len(validJSON))
 	data = append(data, invalidJSON...)
 	data = append(data, validJSON...)
@@ -886,7 +822,6 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 		done <- a.readerLoop(context.Background(), conn, pds)
 	}()
 
-	// Should receive valid PD (invalid one was skipped)
 	select {
 	case pd := <-pds:
 		if pd == nil {
@@ -900,7 +835,6 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 		t.Error("timeout waiting for valid PD (invalid should be skipped)")
 	}
 
-	// Wait for EOF error
 	select {
 	case err := <-done:
 		if !isNetworkError(err) {
@@ -914,7 +848,7 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
 	validPD := &api.ProbingDirective{
 		AgentID:            "test",
@@ -953,7 +887,6 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 		t.Error("readerLoop did not send directive")
 	}
 
-	// Wait for goroutine to finish (should hit EOF)
 	select {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
@@ -971,7 +904,7 @@ func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 			return errors.New("deadline fail")
 		},
 	}
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
 	fies := make(chan *api.ForwardingInfoElement, 1)
 	fies <- &api.ForwardingInfoElement{}
@@ -985,7 +918,7 @@ func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 func TestWriterLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	fies := make(chan *api.ForwardingInfoElement)
 	close(fies)
 
@@ -998,7 +931,7 @@ func TestWriterLoop_ChannelClosed(t *testing.T) {
 func TestWriterLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1011,7 +944,7 @@ func TestWriterLoop_ContextCancelled(t *testing.T) {
 func TestWriterLoop_NetworkError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
 	conn := &stubConn{
 		writeFunc: func(b []byte) (int, error) {
@@ -1030,22 +963,16 @@ func TestWriterLoop_NetworkError(t *testing.T) {
 	}
 }
 
-// Note: Write timeouts are not handled the same as read timeouts because:
-// - Read timeout: No data consumed yet, safe to continue loop
-// - Write timeout: FIE already consumed from channel, cannot retry without complex buffering
-// Write timeouts are treated as network errors and trigger reconnection.
-
 func TestWriterLoop_EncodeError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 
 	written := make(chan string, 1)
 
 	conn := &stubConn{
 		writeFunc: func(b []byte) (int, error) {
 			written <- string(b)
-			// Simulate non-network error (e.g., buffer full, not a network issue)
 			return 0, errors.New("encode error")
 		},
 	}
@@ -1062,7 +989,7 @@ func TestWriterLoop_EncodeError(t *testing.T) {
 func TestWriterLoop_Success(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig()}
+	a := &agent{config: DefaultConfig(), logger: testLogger()}
 	a.config.AgentID = "test-agent"
 
 	written := make(chan []byte, 1)
@@ -1105,7 +1032,7 @@ func TestWriterLoop_Success(t *testing.T) {
 func TestProcessorLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), prober: &stubProber{}}
+	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger()}
 	pds := make(chan *api.ProbingDirective)
 	close(pds)
 
@@ -1118,7 +1045,7 @@ func TestProcessorLoop_ChannelClosed(t *testing.T) {
 func TestProcessorLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), prober: &stubProber{}}
+	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1134,6 +1061,7 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	a := &agent{
 		config: &Config{AgentID: "test"},
 		prober: &stubProber{},
+		logger: testLogger(),
 	}
 
 	pds := make(chan *api.ProbingDirective, 1)
@@ -1146,14 +1074,12 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	}
 	pds <- pd
 
-	// Don't close pds yet - let processorLoop run and processPD complete
 	done := make(chan struct{})
 	go func() {
 		_ = a.processorLoop(context.Background(), pds, fies)
 		close(done)
 	}()
 
-	// Wait for the FIE to arrive (processPD runs in goroutine)
 	select {
 	case fie := <-fies:
 		if fie == nil {
@@ -1171,10 +1097,8 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 		t.Error("processorLoop did not produce FIE")
 	}
 
-	// Now close pds to let processorLoop exit
 	close(pds)
 
-	// Wait for goroutine to finish
 	select {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
@@ -1190,6 +1114,7 @@ func TestProcessPD_Success(t *testing.T) {
 	a := &agent{
 		config: &Config{AgentID: "test"},
 		prober: &stubProber{},
+		logger: testLogger(),
 	}
 
 	pd := &api.ProbingDirective{
@@ -1235,6 +1160,7 @@ func TestProcessPD_NearProbeError(t *testing.T) {
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},
 		},
+		logger: testLogger(),
 	}
 
 	pd := &api.ProbingDirective{NearTTL: 5}
@@ -1246,7 +1172,6 @@ func TestProcessPD_NearProbeError(t *testing.T) {
 	case <-fies:
 		t.Error("processPD should not send FIE on near probe error")
 	case <-time.After(100 * time.Millisecond):
-		// Expected - no FIE sent
 	}
 }
 
@@ -1263,6 +1188,7 @@ func TestProcessPD_FarProbeError(t *testing.T) {
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},
 		},
+		logger: testLogger(),
 	}
 
 	pd := &api.ProbingDirective{NearTTL: 5}
@@ -1274,7 +1200,6 @@ func TestProcessPD_FarProbeError(t *testing.T) {
 	case <-fies:
 		t.Error("processPD should not send FIE on far probe error")
 	case <-time.After(100 * time.Millisecond):
-		// Expected - no FIE sent
 	}
 }
 
@@ -1288,18 +1213,8 @@ func TestProcessPD_Timeout(t *testing.T) {
 		wantNearInfoNil bool
 		wantFarInfoNil  bool
 	}{
-		{
-			name:            "near timeout",
-			timedOutTTL:     5,
-			wantNearInfoNil: true,
-			wantFarInfoNil:  false,
-		},
-		{
-			name:            "far timeout",
-			timedOutTTL:     6,
-			wantNearInfoNil: false,
-			wantFarInfoNil:  true,
-		},
+		{name: "near timeout", timedOutTTL: 5, wantNearInfoNil: true, wantFarInfoNil: false},
+		{name: "far timeout", timedOutTTL: 6, wantNearInfoNil: false, wantFarInfoNil: true},
 	}
 
 	for _, tt := range tests {
@@ -1317,6 +1232,7 @@ func TestProcessPD_Timeout(t *testing.T) {
 						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 					},
 				},
+				logger: testLogger(),
 			}
 
 			pd := &api.ProbingDirective{NearTTL: 5}
@@ -1355,6 +1271,7 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	a := &agent{
 		config: &Config{AgentID: "test"},
 		prober: &stubProber{},
+		logger: testLogger(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1365,12 +1282,9 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 
 	a.processPD(ctx, pd, fies)
 
-	// Should not block or panic, and should not send FIE
 	select {
 	case <-fies:
-		// It's OK if it sends or doesn't send since ctx is cancelled
 	case <-time.After(50 * time.Millisecond):
-		// Also OK
 	}
 }
 
@@ -1391,11 +1305,9 @@ func TestCreateProber_Mock(t *testing.T) {
 func TestCreateProber_CaracalError(t *testing.T) {
 	// Note: Cannot be parallel - modifies global NewCaracalProber
 
-	// Mock NewCaracalProber to test error handling without needing caracal binary
 	origNewCaracalProber := NewCaracalProber
 	defer func() { NewCaracalProber = origNewCaracalProber }()
 
-	// Return an error (simulates caracal not available)
 	expectedErr := errors.New("caracal binary not found")
 	NewCaracalProber = func(cfg *Config) (*CaracalProber, error) {
 		return nil, expectedErr
@@ -1405,7 +1317,6 @@ func TestCreateProber_CaracalError(t *testing.T) {
 	if err != expectedErr {
 		t.Errorf("createProber(caracal) error = %v, want %v", err, expectedErr)
 	}
-	// Note: Don't check if prober is nil - typed nil interface behavior in Go
 	t.Log("✓ Caracal error path covered")
 }
 
@@ -1433,21 +1344,9 @@ func TestValidatePD_AllBranches(t *testing.T) {
 		pd      *api.ProbingDirective
 		wantErr bool
 	}{
-		{
-			name:    "nil",
-			pd:      nil,
-			wantErr: true,
-		},
-		{
-			name:    "empty-agent",
-			pd:      &api.ProbingDirective{},
-			wantErr: true,
-		},
-		{
-			name:    "nil-dest",
-			pd:      &api.ProbingDirective{AgentID: "a", NearTTL: 1},
-			wantErr: true,
-		},
+		{name: "nil", pd: nil, wantErr: true},
+		{name: "empty-agent", pd: &api.ProbingDirective{}, wantErr: true},
+		{name: "nil-dest", pd: &api.ProbingDirective{AgentID: "a", NearTTL: 1}, wantErr: true},
 		{
 			name: "zero-ttl",
 			pd: &api.ProbingDirective{
@@ -1507,7 +1406,7 @@ func TestValidatePD_AllBranches(t *testing.T) {
 				NearTTL:            1,
 				DestinationAddress: []byte{1},
 				Protocol:           api.UDP,
-				NextHeader:         api.NextHeader{}, // No UDP header
+				NextHeader:         api.NextHeader{},
 			},
 			wantErr: true,
 		},
@@ -1517,7 +1416,7 @@ func TestValidatePD_AllBranches(t *testing.T) {
 				AgentID:            "a",
 				NearTTL:            1,
 				DestinationAddress: []byte{1},
-				Protocol:           99, // Invalid protocol number
+				Protocol:           99,
 			},
 			wantErr: true,
 		},
@@ -1604,8 +1503,6 @@ func TestIsNetworkError_AllCases(t *testing.T) {
 // MOCK CONNECTION FOR AUTHENTICATION TESTING
 // ============================================================================
 
-// mockConn implements net.Conn for testing authentication.
-// This is separate from stubConn to provide authentication-specific helpers.
 type mockConn struct {
 	readBuf             *bytes.Buffer
 	writeBuf            *bytes.Buffer
@@ -1660,12 +1557,10 @@ func (m *mockConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// queueAuthResponse queues an AuthResponse to be read by the agent.
 func (m *mockConn) queueAuthResponse(resp *api.AuthResponse) error {
 	return json.NewEncoder(m.readBuf).Encode(resp)
 }
 
-// getAuthRequest decodes the AuthRequest sent by the agent.
 func (m *mockConn) getAuthRequest() (*api.AuthRequest, error) {
 	var req api.AuthRequest
 	if err := json.NewDecoder(m.writeBuf).Decode(&req); err != nil {
@@ -1683,7 +1578,6 @@ func TestAuthenticate_Success(t *testing.T) {
 
 	conn := newMockConn()
 
-	// Queue successful response
 	if err := conn.queueAuthResponse(&api.AuthResponse{
 		Authenticated: true,
 		Message:       "OK",
@@ -1692,18 +1586,14 @@ func TestAuthenticate_Success(t *testing.T) {
 	}
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "test-secret-1234567890",
-		},
+		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger: testLogger(),
 	}
 
-	// Authenticate should succeed
 	if err := a.authenticate(conn); err != nil {
 		t.Errorf("authenticate() should succeed, got error: %v", err)
 	}
 
-	// Verify AuthRequest was sent with correct fields
 	req, err := conn.getAuthRequest()
 	if err != nil {
 		t.Fatalf("failed to decode auth request: %v", err)
@@ -1725,18 +1615,13 @@ func TestAuthenticate_Rejected(t *testing.T) {
 		expectedErr string
 	}{
 		{
-			name: "rejected with message",
-			response: api.AuthResponse{
-				Authenticated: false,
-				Message:       "Invalid secret",
-			},
+			name:        "rejected with message",
+			response:    api.AuthResponse{Authenticated: false, Message: "Invalid secret"},
 			expectedErr: "Invalid secret",
 		},
 		{
-			name: "rejected without message",
-			response: api.AuthResponse{
-				Authenticated: false,
-			},
+			name:        "rejected without message",
+			response:    api.AuthResponse{Authenticated: false},
 			expectedErr: "authentication rejected",
 		},
 	}
@@ -1752,10 +1637,8 @@ func TestAuthenticate_Rejected(t *testing.T) {
 			}
 
 			a := &agent{
-				config: &Config{
-					AgentID: "test-agent",
-					Secret:  "wrong-secret",
-				},
+				config: &Config{AgentID: "test-agent", Secret: "wrong-secret"},
+				logger: testLogger(),
 			}
 
 			err := a.authenticate(conn)
@@ -1778,16 +1661,8 @@ func TestAuthenticate_ReadError(t *testing.T) {
 		readErr     error
 		expectedErr string
 	}{
-		{
-			name:        "network error",
-			readErr:     io.EOF,
-			expectedErr: "failed to receive auth response",
-		},
-		{
-			name:        "unexpected EOF",
-			readErr:     io.ErrUnexpectedEOF,
-			expectedErr: "failed to receive auth response",
-		},
+		{name: "network error", readErr: io.EOF, expectedErr: "failed to receive auth response"},
+		{name: "unexpected EOF", readErr: io.ErrUnexpectedEOF, expectedErr: "failed to receive auth response"},
 	}
 
 	for _, tt := range tests {
@@ -1799,10 +1674,8 @@ func TestAuthenticate_ReadError(t *testing.T) {
 			conn.readErr = tt.readErr
 
 			a := &agent{
-				config: &Config{
-					AgentID: "test-agent",
-					Secret:  "test-secret-1234567890",
-				},
+				config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+				logger: testLogger(),
 			}
 
 			err := a.authenticate(conn)
@@ -1824,10 +1697,8 @@ func TestAuthenticate_WriteError(t *testing.T) {
 	conn.writeErr = errors.New("connection broken")
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "test-secret-1234567890",
-		},
+		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger: testLogger(),
 	}
 
 	err := a.authenticate(conn)
@@ -1844,15 +1715,11 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 	t.Parallel()
 
 	conn := newMockConn()
-
-	// Write malformed JSON
 	conn.readBuf.WriteString("{invalid json")
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "test-secret-1234567890",
-		},
+		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger: testLogger(),
 	}
 
 	err := a.authenticate(conn)
@@ -1868,8 +1735,6 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 func TestAuthenticate_EmptySecret(t *testing.T) {
 	t.Parallel()
 
-	// This tests that authenticate() works with empty secret
-	// (even though Run() won't call it if secret is empty)
 	conn := newMockConn()
 
 	if err := conn.queueAuthResponse(&api.AuthResponse{
@@ -1880,13 +1745,10 @@ func TestAuthenticate_EmptySecret(t *testing.T) {
 	}
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "", // Empty secret
-		},
+		config: &Config{AgentID: "test-agent", Secret: ""},
+		logger: testLogger(),
 	}
 
-	// Should still send empty secret
 	if err := a.authenticate(conn); err != nil {
 		t.Errorf("authenticate() should succeed, got error: %v", err)
 	}
@@ -1907,10 +1769,8 @@ func TestAuthenticate_SetWriteDeadlineError(t *testing.T) {
 	conn.setWriteDeadlineErr = errors.New("failed to set deadline")
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "test-secret-1234567890",
-		},
+		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger: testLogger(),
 	}
 
 	err := a.authenticate(conn)
@@ -1928,7 +1788,6 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 
 	conn := newMockConn()
 
-	// Need to queue response so we get past the write phase
 	if err := conn.queueAuthResponse(&api.AuthResponse{
 		Authenticated: true,
 		Message:       "OK",
@@ -1936,14 +1795,11 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 		t.Fatalf("failed to queue response: %v", err)
 	}
 
-	// Inject error for SetReadDeadline
 	conn.setReadDeadlineErr = errors.New("failed to set read deadline")
 
 	a := &agent{
-		config: &Config{
-			AgentID: "test-agent",
-			Secret:  "test-secret-1234567890",
-		},
+		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger: testLogger(),
 	}
 
 	err := a.authenticate(conn)
@@ -1957,39 +1813,29 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 }
 
 // ============================================================================
-// INTEGRATION TEST - Authentication in Run()
+// INTEGRATION TESTS - Authentication in Run()
 // ============================================================================
 
-// TestRun_AuthenticationFailure tests that Run() properly handles authentication errors.
-// This requires a mock orchestrator that rejects authentication.
 func TestRun_AuthenticationFailure(t *testing.T) {
 	// Note: Not parallel - full integration test with server interaction
 
-	// Create a test server that rejects authentication
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
 	}
-	defer func() {
-		_ = listener.Close()
-	}()
+	defer func() { _ = listener.Close() }()
 
-	// Accept one connection and reject auth
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer func() { _ = conn.Close() }()
 
-		// Read auth request (but ignore it)
 		decoder := json.NewDecoder(conn)
 		var authReq api.AuthRequest
 		_ = decoder.Decode(&authReq)
 
-		// Send rejection
 		encoder := json.NewEncoder(conn)
 		_ = encoder.Encode(&api.AuthResponse{
 			Authenticated: false,
@@ -2011,9 +1857,7 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 		CleanupInterval:  1 * time.Second,
 	}
 
-	// Run should fail with authentication error
-	ctx := context.Background()
-	err = Run(ctx, cfg)
+	err = Run(context.Background(), cfg, testLogger())
 
 	if err == nil {
 		t.Error("Run() should fail when authentication is rejected")
@@ -2031,39 +1875,31 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 func TestRun_AuthenticationSuccess(t *testing.T) {
 	// Note: Not parallel - full integration test with server interaction
 
-	// Create a test server that accepts authentication
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
 	}
-	defer func() {
-		_ = listener.Close()
-	}()
+	defer func() { _ = listener.Close() }()
 
 	serverAddr := listener.Addr().String()
 	authSuccess := make(chan bool, 1)
 
-	// Server that accepts auth and sends a PD
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer func() { _ = conn.Close() }()
 
 		decoder := json.NewDecoder(conn)
 		encoder := json.NewEncoder(conn)
 
-		// Read and accept auth request
 		var authReq api.AuthRequest
 		if err := decoder.Decode(&authReq); err != nil {
 			t.Logf("Failed to decode auth request: %v", err)
 			return
 		}
 
-		// Send successful auth response
 		if err := encoder.Encode(&api.AuthResponse{
 			Authenticated: true,
 			Message:       "Welcome",
@@ -2074,7 +1910,6 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 
 		authSuccess <- true
 
-		// Send one PD to keep the connection alive briefly
 		pd := &api.ProbingDirective{
 			ProbingDirectiveID: 1,
 			AgentID:            "test-agent",
@@ -2086,14 +1921,13 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		}
 		_ = encoder.Encode(pd)
 
-		// Wait briefly then close
 		time.Sleep(200 * time.Millisecond)
 	}()
 
 	cfg := &Config{
 		AgentID:          "test-agent",
 		OrchestratorAddr: serverAddr,
-		Secret:           "correct-secret-1234567890", // Authentication enabled
+		Secret:           "correct-secret-1234567890",
 		ProberType:       ProberTypeMock,
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
@@ -2104,16 +1938,14 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		CleanupInterval:  1 * time.Second,
 	}
 
-	// Run agent with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg)
+		done <- Run(ctx, cfg, testLogger())
 	}()
 
-	// Wait for authentication to succeed
 	select {
 	case <-authSuccess:
 		t.Log("✓ Authentication succeeded in Run()")
@@ -2121,10 +1953,8 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		t.Fatal("Authentication did not complete")
 	}
 
-	// Wait for Run to finish
 	select {
 	case err := <-done:
-		// Should exit with context timeout or clean shutdown
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			t.Logf("Run exited with: %v", err)
 		}
@@ -2137,33 +1967,26 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 func TestRun_NoAuthentication(t *testing.T) {
 	// Note: Not parallel - full integration test with server interaction
 
-	// Create a test server that expects no authentication
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
 	}
-	defer func() {
-		_ = listener.Close()
-	}()
+	defer func() { _ = listener.Close() }()
 
 	serverAddr := listener.Addr().String()
 	connected := make(chan bool, 1)
 
-	// Server that doesn't expect auth
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer func() { _ = conn.Close() }()
 
 		connected <- true
 
 		encoder := json.NewEncoder(conn)
 
-		// Send one PD
 		pd := &api.ProbingDirective{
 			ProbingDirectiveID: 1,
 			AgentID:            "test-agent",
@@ -2175,14 +1998,13 @@ func TestRun_NoAuthentication(t *testing.T) {
 		}
 		_ = encoder.Encode(pd)
 
-		// Wait briefly then close
 		time.Sleep(200 * time.Millisecond)
 	}()
 
 	cfg := &Config{
 		AgentID:          "test-agent",
 		OrchestratorAddr: serverAddr,
-		Secret:           "", // No authentication
+		Secret:           "",
 		ProberType:       ProberTypeMock,
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
@@ -2193,16 +2015,14 @@ func TestRun_NoAuthentication(t *testing.T) {
 		CleanupInterval:  1 * time.Second,
 	}
 
-	// Run agent with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg)
+		done <- Run(ctx, cfg, testLogger())
 	}()
 
-	// Wait for connection (no auth exchange)
 	select {
 	case <-connected:
 		t.Log("✓ Connected without authentication")
@@ -2210,10 +2030,8 @@ func TestRun_NoAuthentication(t *testing.T) {
 		t.Fatal("Did not connect")
 	}
 
-	// Wait for Run to finish
 	select {
 	case err := <-done:
-		// Should exit with context timeout or clean shutdown
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			t.Logf("Run exited with: %v", err)
 		}

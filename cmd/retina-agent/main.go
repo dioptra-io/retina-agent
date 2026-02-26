@@ -28,7 +28,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -63,6 +63,9 @@ var (
 
 	// Error handling
 	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
+
+	// Logging
+	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
 
 // agentRun is a variable for dependency injection in tests.
@@ -70,12 +73,13 @@ var agentRun = agent.Run
 
 func main() {
 	flag.Parse()
-	log.SetFlags(log.LstdFlags) // Add timestamps
+
+	logger := newLogger(*logLevel)
 
 	cfg := &agent.Config{
 		AgentID:                    *agentID,
 		OrchestratorAddr:           *orchestratorAddr,
-		Secret:                     os.Getenv("RETINA_SECRET"), // Read from environment variable
+		Secret:                     os.Getenv("RETINA_SECRET"),
 		ProberType:                 *proberType,
 		ProberPath:                 *proberPath,
 		WriteQueueSize:             *writeQueueSize,
@@ -90,13 +94,26 @@ func main() {
 	}
 
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Configuration error: %v", err)
+		logger.Error("configuration error", slog.Any("err", err))
+		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	runWithReconnect(ctx, cfg)
+	runWithReconnect(ctx, cfg, logger)
+}
+
+// newLogger creates a JSON logger writing to stdout at the given level.
+// Falls back to info if the level string is unrecognised.
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(level)); err != nil {
+		l = slog.LevelInfo
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: l,
+	}))
 }
 
 // runWithReconnect wraps agent.Run with exponential backoff reconnection.
@@ -104,26 +121,29 @@ func main() {
 // The backoff starts at 1 second and doubles on each failure, up to
 // MaxReconnectBackoff. On intentional shutdown (Ctrl+C), the function
 // returns immediately without retrying.
-func runWithReconnect(ctx context.Context, cfg *agent.Config) {
+func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logger) {
 	const (
 		initialBackoff = 1 * time.Second
 		backoffFactor  = 2
 	)
 
+	agentID := slog.String("agent_id", cfg.AgentID)
+
 	backoff := initialBackoff
 	for {
-		log.Printf("Agent %s: Connecting to %s", cfg.AgentID, cfg.OrchestratorAddr)
+		logger.Info("Connecting",
+			agentID,
+			slog.String("address", cfg.OrchestratorAddr))
 
-		err := agentRun(ctx, cfg)
+		err := agentRun(ctx, cfg, logger)
 
-		// Distinguish intentional shutdown from connection failure
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			log.Printf("Agent %s: Shutdown complete", cfg.AgentID)
+			logger.Info("Shutdown complete", agentID)
 			return
 		}
 
-		log.Printf("Agent %s: Connection lost: %v", cfg.AgentID, err)
-		log.Printf("Agent %s: Reconnecting in %v", cfg.AgentID, backoff)
+		logger.Error("Connection lost", agentID, slog.Any("err", err))
+		logger.Info("Reconnecting", agentID, slog.Duration("backoff", backoff))
 
 		select {
 		case <-time.After(backoff):
@@ -132,7 +152,7 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config) {
 				backoff = cfg.MaxReconnectBackoff
 			}
 		case <-ctx.Done():
-			log.Printf("Agent %s: Shutdown during reconnect backoff", cfg.AgentID)
+			logger.Info("Shutdown during reconnect backoff", agentID)
 			return
 		}
 	}

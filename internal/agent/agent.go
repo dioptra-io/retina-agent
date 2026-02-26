@@ -29,7 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 
@@ -43,6 +43,7 @@ var ErrInvalidDirective = errors.New("invalid probing directive")
 type agent struct {
 	config *Config
 	prober Prober
+	logger *slog.Logger
 }
 
 // probeResult wraps a probe result with its error for channel communication.
@@ -60,7 +61,7 @@ type probeResult struct {
 //
 // Returns nil on clean shutdown (context cancelled), or an error if the connection
 // is lost or another failure occurs.
-func Run(ctx context.Context, cfg *Config) error {
+func Run(ctx context.Context, cfg *Config, logger *slog.Logger) error {
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
@@ -71,13 +72,14 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	defer func() {
 		if err := prober.Close(); err != nil {
-			log.Printf("Failed to close prober: %v", err)
+			logger.Error("Failed to close prober", slog.Any("err", err))
 		}
 	}()
 
 	a := &agent{
 		config: cfg,
 		prober: prober,
+		logger: logger.With(slog.String("agent_id", cfg.AgentID)),
 	}
 
 	conn, err := net.Dial("tcp", a.config.OrchestratorAddr)
@@ -86,20 +88,21 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			log.Printf("Failed to close connection: %v", err)
+			a.logger.Error("Failed to close connection", slog.Any("err", err))
 		}
 	}()
 
-	log.Printf("Agent %s: Connected to orchestrator at %s", a.config.AgentID, a.config.OrchestratorAddr)
+	a.logger.Info("Connected to orchestrator",
+		slog.String("address", a.config.OrchestratorAddr))
 
 	// Authenticate if secret is configured
 	if a.config.Secret != "" {
 		if err := a.authenticate(conn); err != nil {
 			return fmt.Errorf("authentication failed: %w", err)
 		}
-		log.Printf("Agent %s: ✓ Authentication ENABLED - authenticated successfully", a.config.AgentID)
+		a.logger.Info("Authentication enabled — authenticated successfully")
 	} else {
-		log.Printf("Agent %s: ⚠️  Authentication DISABLED - running without authentication (not recommended for production)", a.config.AgentID)
+		a.logger.Warn("Authentication disabled — not recommended for production")
 	}
 
 	pds := make(chan *api.ProbingDirective, a.config.PDsBufferSize)
@@ -112,11 +115,11 @@ func Run(ctx context.Context, cfg *Config) error {
 	g.Go(func() error { return a.writerLoop(ctx, conn, fies) })
 
 	if err := g.Wait(); err != nil && err != ctx.Err() {
-		log.Printf("Agent %s: Connection terminated with error: %v", a.config.AgentID, err)
+		a.logger.Error("Connection terminated", slog.Any("err", err))
 		return err
 	}
 
-	log.Printf("Agent %s: Shut down gracefully", a.config.AgentID)
+	a.logger.Info("Shut down gracefully")
 	return nil
 }
 
@@ -127,13 +130,11 @@ func (a *agent) authenticate(conn net.Conn) error {
 	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)
 
-	// Send authentication request with agent ID and secret
 	authReq := &api.AuthRequest{
 		AgentID: a.config.AgentID,
 		Secret:  a.config.Secret,
 	}
 
-	// Set timeout for authentication exchange (5 seconds)
 	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
@@ -142,7 +143,6 @@ func (a *agent) authenticate(conn net.Conn) error {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
 
-	// Wait for orchestrator's authentication response
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf("failed to set read deadline: %w", err)
 	}
@@ -152,12 +152,10 @@ func (a *agent) authenticate(conn net.Conn) error {
 		return fmt.Errorf("failed to receive auth response: %w", err)
 	}
 
-	// Check if authentication succeeded
 	if !authResp.Authenticated {
 		return fmt.Errorf("authentication rejected: %s", authResp.Message)
 	}
 
-	// Clear deadlines for normal operation
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
@@ -193,16 +191,14 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		consecutiveDecodeErrors = 0
 
 		if err := validatePD(&pd); err != nil {
-			log.Printf("Agent %s: Invalid directive: %v", a.config.AgentID, err)
+			a.logger.Warn("Invalid directive", slog.Any("err", err))
 			continue
 		}
 
-		log.Printf("Agent %s: ← PD %d for %s (TTL %d → %d)",
-			a.config.AgentID,
-			pd.ProbingDirectiveID,
-			pd.DestinationAddress,
-			pd.NearTTL,
-			pd.NearTTL+1)
+		a.logger.Debug("← PD received",
+			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Int("near_ttl", int(pd.NearTTL)))
 
 		select {
 		case <-ctx.Done():
@@ -219,7 +215,7 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
 	// Check for read timeout (expected, just retry)
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		log.Printf("Agent %s: Read timeout, no data received", a.config.AgentID)
+		a.logger.Debug("Read timeout, no data received")
 		return true, consecutiveErrors, nil
 	}
 
@@ -233,19 +229,21 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 		return false, consecutiveErrors, fmt.Errorf("connection lost while reading: %w", err)
 	}
 
-	// Malformed JSON - log and potentially skip
+	// Malformed JSON — log and potentially skip
 	consecutiveErrors++
 
 	if a.config.MaxConsecutiveDecodeErrors > 0 {
-		log.Printf("Agent %s: Failed to decode directive (attempt %d/%d, skipping): %v",
-			a.config.AgentID, consecutiveErrors, a.config.MaxConsecutiveDecodeErrors, err)
+		a.logger.Warn("Failed to decode directive",
+			slog.Int("attempt", consecutiveErrors),
+			slog.Int("max", a.config.MaxConsecutiveDecodeErrors),
+			slog.Any("err", err))
 
 		if consecutiveErrors >= a.config.MaxConsecutiveDecodeErrors {
 			return false, consecutiveErrors, fmt.Errorf("too many consecutive decode errors (%d), protocol may be broken: %w",
 				consecutiveErrors, err)
 		}
 	} else {
-		log.Printf("Agent %s: Failed to decode directive (skipping): %v", a.config.AgentID, err)
+		a.logger.Warn("Failed to decode directive (skipping)", slog.Any("err", err))
 	}
 
 	return true, consecutiveErrors, nil
@@ -265,8 +263,6 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			if !ok {
 				return nil
 			}
-
-			// Launch a single goroutine that handles both probes.
 			go a.processPD(ctx, pd, fies)
 		}
 	}
@@ -300,17 +296,15 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 			}
 
 			if fie.NearInfo == nil || fie.FarInfo == nil {
-				log.Printf("Agent %s: → FIE for PD %d, dest %s | (no probe response received)",
-					a.config.AgentID,
-					fie.ProbingDirectiveID,
-					fie.DestinationAddress)
+				a.logger.Debug("→ FIE sent (no probe response)",
+					slog.Uint64("pd_id", fie.ProbingDirectiveID),
+					slog.String("dest", fie.DestinationAddress.String()))
 			} else {
-				log.Printf("Agent %s: → FIE for PD %d, dest %s | Near(TTL%d) | Far(TTL%d)",
-					a.config.AgentID,
-					fie.ProbingDirectiveID,
-					fie.DestinationAddress,
-					fie.NearInfo.ProbeTTL,
-					fie.FarInfo.ProbeTTL)
+				a.logger.Debug("→ FIE sent",
+					slog.Uint64("pd_id", fie.ProbingDirectiveID),
+					slog.String("dest", fie.DestinationAddress.String()),
+					slog.Int("near_ttl", int(fie.NearInfo.ProbeTTL)),
+					slog.Int("far_ttl", int(fie.FarInfo.ProbeTTL)))
 			}
 		}
 	}
@@ -330,27 +324,29 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		ch <- probeResult{result, err}
 	}
 
-	// Launch both probes in parallel.
 	go probe(nearTTL, nearCh)
 	go probe(farTTL, farCh)
 
-	// Wait for both results.
 	nearRes := <-nearCh
 	farRes := <-farCh
 
-	// Handle errors.
 	if nearRes.err != nil {
-		log.Printf("Agent %s: Near probe failed for PD %d, dest %s (TTL %d): %v",
-			a.config.AgentID, pd.ProbingDirectiveID, pd.DestinationAddress, nearTTL, nearRes.err)
+		a.logger.Error("Near probe failed",
+			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Int("ttl", int(nearTTL)),
+			slog.Any("err", nearRes.err))
 		return
 	}
 	if farRes.err != nil {
-		log.Printf("Agent %s: Far probe failed for PD %d, dest %s (TTL %d): %v",
-			a.config.AgentID, pd.ProbingDirectiveID, pd.DestinationAddress, farTTL, farRes.err)
+		a.logger.Error("Far probe failed",
+			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Int("ttl", int(farTTL)),
+			slog.Any("err", farRes.err))
 		return
 	}
 
-	// Build NearInfo and FarInfo - nil if probe timed out (no response received).
 	var nearInfo *api.Info
 	if !nearRes.result.TimedOut {
 		nearInfo = probeResultToInfo(nearRes.result, nearTTL)
@@ -361,7 +357,6 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		farInfo = probeResultToInfo(farRes.result, farTTL)
 	}
 
-	// Build and send FIE (NearInfo/FarInfo nil when no response received).
 	fie := &api.ForwardingInfoElement{
 		Agent:               api.Agent{AgentID: a.config.AgentID},
 		ProbingDirectiveID:  pd.ProbingDirectiveID,
@@ -442,9 +437,6 @@ func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
 
 // isNetworkError returns true if err indicates a network/connection failure
 // (EOF, timeout, connection reset) rather than a JSON decoding error.
-//
-// Network errors should trigger reconnection, while decoding errors should
-// be logged and skipped.
 func isNetworkError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true

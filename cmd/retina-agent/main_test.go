@@ -9,7 +9,8 @@
 // Coverage:
 // - runWithReconnect: 100% - All reconnection scenarios and shutdown paths
 // - Config validation: 100% - All validation rules
-// - main(): 0% (untested) - Standard practice for main functions with log.Fatalf
+// - newLogger: 100% - All log levels including invalid fallback
+// - main(): 0% (untested) - Standard practice for main functions with os.Exit
 //
 // ## Testing Strategy
 //
@@ -26,12 +27,19 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dioptra-io/retina-agent/internal/agent"
 )
+
+// testLogger returns a logger that discards all output, keeping test output clean.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // ============================================================================
 // TEST HELPERS
@@ -50,7 +58,7 @@ type mockAgentRun struct {
 	ctxToCancel context.CancelFunc // Context to cancel (if cancelOnN > 0)
 }
 
-func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config) error {
+func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config, logger *slog.Logger) error {
 	callNum := int(m.calls.Add(1))
 
 	// Simulate work
@@ -93,7 +101,7 @@ func testBackoffTiming(t *testing.T, cfg *agent.Config, mock *mockAgentRun,
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(context.Background(), cfg)
+		runWithReconnect(context.Background(), cfg, testLogger())
 		done <- true
 	}()
 
@@ -139,9 +147,6 @@ func validConfig() *agent.Config {
 func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that runWithReconnect exits immediately when context is
-	// already cancelled (e.g., Ctrl+C before first connection attempt)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
@@ -153,14 +158,13 @@ func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
 
 	mock := &mockAgentRun{returnErr: context.Canceled}
 
-	// Replace agentRun
 	oldRun := agentRun
 	agentRun = mock.run
 	defer func() { agentRun = oldRun }()
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg)
+		runWithReconnect(ctx, cfg, testLogger())
 		done <- true
 	}()
 
@@ -176,9 +180,6 @@ func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
 
 func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
-
-	// Test that runWithReconnect respects context cancellation during
-	// the exponential backoff wait period (doesn't wait for full backoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -196,14 +197,12 @@ func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg)
+		runWithReconnect(ctx, cfg, testLogger())
 		done <- true
 	}()
 
 	// Wait for first attempt to fail and enter backoff
 	time.Sleep(100 * time.Millisecond)
-
-	// Cancel during backoff
 	cancel()
 
 	select {
@@ -219,9 +218,6 @@ func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 func TestRunWithReconnect_ExponentialBackoff(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that backoff doubles on each failure: 1s → 2s → 4s
-	// Verifies timing is correct within reasonable tolerance
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
@@ -229,7 +225,7 @@ func TestRunWithReconnect_ExponentialBackoff(t *testing.T) {
 	}
 
 	mock := &mockAgentRun{
-		maxCalls:  4, // Fail 3 times, succeed on 4th
+		maxCalls:  4,
 		returnErr: errors.New("connection failed"),
 	}
 
@@ -240,17 +236,14 @@ func TestRunWithReconnect_ExponentialBackoff(t *testing.T) {
 func TestRunWithReconnect_BackoffCapping(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that backoff is capped at MaxReconnectBackoff
-	// Expected: 1s → 2s → 3s (capped) → 3s (capped)
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
-		MaxReconnectBackoff: 3 * time.Second, // Cap at 3s
+		MaxReconnectBackoff: 3 * time.Second,
 	}
 
 	mock := &mockAgentRun{
-		maxCalls:  5, // Fail 4 times, succeed on 5th
+		maxCalls:  5,
 		returnErr: errors.New("connection failed"),
 	}
 
@@ -261,9 +254,6 @@ func TestRunWithReconnect_BackoffCapping(t *testing.T) {
 func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that context cancellation during agent.Run() causes
-	// immediate exit without retry
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cfg := &agent.Config{
@@ -273,10 +263,10 @@ func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 	}
 
 	mock := &mockAgentRun{
-		delay:       200 * time.Millisecond, // Simulate long-running connection
+		delay:       200 * time.Millisecond,
 		returnErr:   errors.New("connection failed"),
 		ctxToCancel: cancel,
-		cancelOnN:   1, // Cancel during first call
+		cancelOnN:   1,
 	}
 
 	oldRun := agentRun
@@ -285,13 +275,12 @@ func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg)
+		runWithReconnect(ctx, cfg, testLogger())
 		done <- true
 	}()
 
 	select {
 	case <-done:
-		// Should exit immediately when context is cancelled
 	case <-time.After(1 * time.Second):
 		t.Fatal("runWithReconnect did not exit on context cancellation")
 	}
@@ -300,9 +289,6 @@ func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 func TestRunWithReconnect_NonContextError(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that non-context errors (network failures, etc.) trigger
-	// reconnection with backoff
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
@@ -310,7 +296,7 @@ func TestRunWithReconnect_NonContextError(t *testing.T) {
 	}
 
 	mock := &mockAgentRun{
-		maxCalls:  3, // Fail twice with network error, then exit
+		maxCalls:  3,
 		returnErr: errors.New("network error"),
 	}
 
@@ -320,7 +306,7 @@ func TestRunWithReconnect_NonContextError(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(context.Background(), cfg)
+		runWithReconnect(context.Background(), cfg, testLogger())
 		done <- true
 	}()
 
@@ -337,9 +323,6 @@ func TestRunWithReconnect_NonContextError(t *testing.T) {
 func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
 	// Note: Not parallel - modifies global agentRun variable
 
-	// Test that ctx.Err() is checked even when agent.Run returns
-	// a different error (covers the "|| ctx.Err() != nil" branch)
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cfg := &agent.Config{
@@ -351,7 +334,7 @@ func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
 	mock := &mockAgentRun{
 		returnErr:   errors.New("network error"),
 		ctxToCancel: cancel,
-		cancelOnN:   1, // Cancel during first call
+		cancelOnN:   1,
 	}
 
 	oldRun := agentRun
@@ -360,13 +343,12 @@ func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg)
+		runWithReconnect(ctx, cfg, testLogger())
 		done <- true
 	}()
 
 	select {
 	case <-done:
-		// Should exit because ctx.Err() != nil
 	case <-time.After(1 * time.Second):
 		t.Fatal("runWithReconnect did not respect ctx.Err()")
 	}
@@ -403,6 +385,44 @@ func TestConfig_Validation(t *testing.T) {
 			err := cfg.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// UNIT TESTS - Logging
+// ============================================================================
+func TestNewLogger_Levels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input     string
+		wantLevel slog.Level
+	}{
+		{"debug", slog.LevelDebug},
+		{"info", slog.LevelInfo},
+		{"warn", slog.LevelWarn},
+		{"error", slog.LevelError},
+		{"invalid", slog.LevelInfo}, // fallback to info
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.input, func(t *testing.T) {
+			t.Parallel()
+
+			logger := newLogger(tt.input)
+			if logger == nil {
+				t.Fatal("newLogger returned nil")
+			}
+			if !logger.Enabled(context.Background(), tt.wantLevel) {
+				t.Errorf("newLogger(%q): level %v should be enabled", tt.input, tt.wantLevel)
+			}
+			if tt.wantLevel > slog.LevelDebug {
+				if logger.Enabled(context.Background(), tt.wantLevel-1) {
+					t.Errorf("newLogger(%q): level below %v should not be enabled", tt.input, tt.wantLevel)
+				}
 			}
 		})
 	}
