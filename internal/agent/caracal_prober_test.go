@@ -24,7 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -219,6 +219,7 @@ func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadClose
 		config:     cfg,
 		cancel:     cancel,
 		g:          g,
+		logger:     testLogger(),
 	}
 
 	// Skip CSV header like production code does
@@ -802,14 +803,12 @@ func TestDuplicateProbe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	_, err = prober.Probe(ctx, pd, 64)
-	switch {
-	case err == nil:
-		t.Error("expected duplicate probe error, got nil")
-	case !strings.Contains(err.Error(), "duplicate probe rejected"):
-		t.Errorf("expected duplicate probe error, got: %v", err)
-	default:
-		t.Log("Successfully detected duplicate probe")
+	result, err := prober.Probe(ctx, pd, 64)
+	if err != nil {
+		t.Errorf("duplicate probe should return nil error, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("duplicate probe should return nil result, got: %v", result)
 	}
 }
 
@@ -928,6 +927,7 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 		config:     cfg,
 		cancel:     cancel_prober,
 		g:          g,
+		logger:     testLogger(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1591,6 +1591,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 		config:     cfg,
 		cancel:     cancel,
 		g:          g,
+		logger:     testLogger(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1613,21 +1614,18 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 
 func TestClosePipeErrorLogging(t *testing.T) {
 	// Cannot run in parallel - modifies log output
-
 	var buf bytes.Buffer
-	oldOutput := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(oldOutput)
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	errorCloser := &errorOnClose{err: fmt.Errorf("mock close failure")}
-	closePipe(errorCloser, "test-pipe")
+	closePipe(errorCloser, "test-pipe", logger)
 
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "Failed to close test-pipe") {
-		t.Errorf("Expected 'Failed to close test-pipe' in log, got: %s", logOutput)
+	output := buf.String()
+	if !strings.Contains(output, "Failed to close pipe") {
+		t.Errorf("Expected 'Failed to close pipe' in log, got: %s", output)
 	}
-	if !strings.Contains(logOutput, "mock close failure") {
-		t.Errorf("Expected 'mock close failure' in log, got: %s", logOutput)
+	if !strings.Contains(output, "mock close failure") {
+		t.Errorf("Expected 'mock close failure' in log, got: %s", output)
 	}
 }
 
@@ -1666,6 +1664,7 @@ func TestWriterLoopError(t *testing.T) {
 		config:     cfg,
 		cancel:     cancel,
 		g:          g,
+		logger:     testLogger(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1697,9 +1696,7 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 	// Cannot run in parallel - modifies log output
 
 	var buf bytes.Buffer
-	oldOutput := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(oldOutput)
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	cfg := &Config{
 		WriteQueueSize:  10,
@@ -1731,6 +1728,7 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 		config:     cfg,
 		cancel:     cancel,
 		g:          g,
+		logger:     logger,
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1741,12 +1739,12 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 
 	_ = prober.g.Wait()
 
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "Failed to close stdin") {
-		t.Errorf("Expected 'Failed to close stdin' in log, got: %s", logOutput)
+	output := buf.String()
+	if !strings.Contains(output, "Failed to close caracal stdin") {
+		t.Errorf("Expected 'Failed to close caracal stdin' in log, got: %s", output)
 	}
-	if !strings.Contains(logOutput, "stdin close error") {
-		t.Errorf("Expected 'stdin close error' in log, got: %s", logOutput)
+	if !strings.Contains(output, "stdin close error") {
+		t.Errorf("Expected 'stdin close error' in log, got: %s", output)
 	}
 }
 
@@ -1776,7 +1774,7 @@ done
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1818,7 +1816,7 @@ func TestSetupCaracalProcessFailure(t *testing.T) {
 		ProberArgs: []string{},
 	}
 
-	_, err := NewCaracalProber(cfg)
+	_, err := NewCaracalProber(cfg, testLogger())
 	if err == nil {
 		t.Error("expected error for nonexistent command")
 	}
@@ -1837,7 +1835,7 @@ func TestSetupCaracalProcessStartFailure(t *testing.T) {
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err == nil {
 		_ = prober.Close()
 		t.Skip("Command didn't fail as expected")
@@ -1853,9 +1851,9 @@ func TestClosePipeErrors(t *testing.T) {
 	_ = w.Close()
 	_ = r.Close()
 
-	closePipe(w, "test-write")
-	closePipe(r, "test-read")
-	closePipe(nil, "test-nil")
+	closePipe(w, "test-write", testLogger())
+	closePipe(r, "test-read", testLogger())
+	closePipe(nil, "test-nil", testLogger())
 }
 
 func TestProbeWithRealProcessTimeout(t *testing.T) {
@@ -1877,7 +1875,7 @@ while read line; do sleep 1; done
 		ProbeTimeout:    200 * time.Millisecond,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1925,7 +1923,7 @@ done
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1959,7 +1957,7 @@ func TestNewCaracalProberDefaultQueueSize(t *testing.T) {
 		ProbeTimeout:    1 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1977,9 +1975,7 @@ func TestCloseKillErrorLogging(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	oldOutput := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(oldOutput)
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	cfg := &Config{
 		ProberPath: "sh",
@@ -1993,7 +1989,7 @@ while read line; do timestamp=$(date +%s); echo "$timestamp,1,10.0.0.1,10.0.0.2,
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, logger)
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -2010,9 +2006,9 @@ while read line; do timestamp=$(date +%s); echo "$timestamp,1,10.0.0.1,10.0.0.2,
 
 	time.Sleep(50 * time.Millisecond)
 
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "Failed to kill caracal") && !strings.Contains(logOutput, "failed to kill caracal") {
-		t.Errorf("Expected kill error to be logged, got: %s", logOutput)
+	output := buf.String()
+	if !strings.Contains(output, "Failed to kill caracal") {
+		t.Errorf("Expected kill error to be logged, got: %s", output)
 	}
 }
 
@@ -2050,7 +2046,7 @@ done
 		ProbeTimeout:    1 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg)
+	prober, err := NewCaracalProber(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("failed to create prober with default path: %v", err)
 	}

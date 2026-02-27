@@ -113,7 +113,7 @@ func DefaultConfig() *Config {
 		// Orchestrator Connection
 		OrchestratorAddr:           "localhost:50050",
 		Secret:                     "", // Empty = no authentication
-		ReadDeadline:               60 * time.Second,
+		ReadDeadline:               10 * time.Second,
 		WriteDeadline:              5 * time.Second,
 		MaxReconnectBackoff:        5 * time.Minute,
 		MaxConsecutiveDecodeErrors: 3,

@@ -51,7 +51,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os/exec"
 	"strconv"
@@ -81,6 +81,7 @@ type CaracalProber struct {
 
 	// Configuration and lifecycle management
 	config *Config
+	logger *slog.Logger
 	cancel context.CancelFunc
 	g      *errgroup.Group
 }
@@ -109,13 +110,12 @@ type probeRequest struct {
 }
 
 // NewCaracalProber creates and starts a caracal prober.
-var NewCaracalProber = func(cfg *Config) (*CaracalProber, error) {
-	cmd, stdin, stdout, stderr, err := setupCaracalProcess(cfg)
+var NewCaracalProber = func(cfg *Config, logger *slog.Logger) (*CaracalProber, error) {
+	cmd, stdin, stdout, stderr, err := setupCaracalProcess(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create context and errgroup
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -133,6 +133,7 @@ var NewCaracalProber = func(cfg *Config) (*CaracalProber, error) {
 		inFlight:   make(map[probeKey]*inFlightProbe),
 		writeQueue: make(chan *probeRequest, queueSize),
 		config:     cfg,
+		logger:     logger,
 		cancel:     cancel,
 		g:          g,
 	}
@@ -140,13 +141,12 @@ var NewCaracalProber = func(cfg *Config) (*CaracalProber, error) {
 	// Skip CSV header
 	if _, err := p.stdout.Read(); err != nil {
 		if killErr := cmd.Process.Kill(); killErr != nil {
-			log.Printf("Failed to kill caracal: %v", killErr)
+			logger.Error("Failed to kill caracal", slog.Any("err", killErr))
 		}
 		cancel()
 		return nil, fmt.Errorf("failed to read CSV header: %w", err)
 	}
 
-	// Start all workers in errgroup
 	g.Go(func() error { return p.writerLoop(ctx) })
 	g.Go(func() error { return p.readerLoop(ctx) })
 	g.Go(func() error { return p.logStderr(ctx) })
@@ -160,63 +160,54 @@ var NewCaracalProber = func(cfg *Config) (*CaracalProber, error) {
 // Uses cfg.ProberPath to locate the caracal executable (defaults to searching PATH).
 // Custom caracal arguments are specified via cfg.ProberArgs.
 // Example: cfg.ProberArgs = []string{"--probing-rate", "100000", "--n-packets", "3"}
-func setupCaracalProcess(cfg *Config) (cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser, err error) {
-	// Use ProberPath as caracal executable path.
+func setupCaracalProcess(cfg *Config, logger *slog.Logger) (cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser, err error) {
 	caracalPath := cfg.ProberPath
 	if caracalPath == "" {
-		caracalPath = "caracal" // Default: search in PATH
+		caracalPath = "caracal"
 	}
 
-	// Use user-provided args
 	args := cfg.ProberArgs
 
 	cmd = exec.Command(caracalPath, args...) // #nosec G204 -- caracalPath is user-controlled by design (ProberPath config)
 
 	success := false
 
-	// Cleanup pipes if function fails.
 	defer func() {
 		if !success {
-			closePipe(stdin, "stdin")
-			closePipe(stdout, "stdout")
-			closePipe(stderr, "stderr")
+			closePipe(stdin, "stdin", logger)
+			closePipe(stdout, "stdout", logger)
+			closePipe(stderr, "stderr", logger)
 		}
 	}()
 
-	// Create pipes
 	stdin, err = cmd.StdinPipe()
 	if err != nil {
-		err = fmt.Errorf("failed to get stdin pipe: %w", err)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, fmt.Errorf("failed to get stdin pipe: %w", err)
 	}
 
 	stdout, err = cmd.StdoutPipe()
 	if err != nil {
-		err = fmt.Errorf("failed to get stdout pipe: %w", err)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
 	stderr, err = cmd.StderrPipe()
 	if err != nil {
-		err = fmt.Errorf("failed to get stderr pipe: %w", err)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
 
-	// Start caracal
 	if err = cmd.Start(); err != nil {
-		err = fmt.Errorf("failed to start caracal: %w", err)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, fmt.Errorf("failed to start caracal: %w", err)
 	}
 
 	success = true
 	return cmd, stdin, stdout, stderr, nil
 }
 
-// closePipe safely closes a pipe and logs errors.
-func closePipe(pipe io.Closer, name string) {
+// closePipe safely closes a pipe and logs any error.
+func closePipe(pipe io.Closer, name string, logger *slog.Logger) {
 	if pipe != nil {
 		if err := pipe.Close(); err != nil {
-			log.Printf("Failed to close %s: %v", name, err)
+			logger.Error("Failed to close pipe", slog.String("name", name), slog.Any("err", err))
 		}
 	}
 }
@@ -268,15 +259,15 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
 
-	// Build correlation key
 	key := buildProbeKeyFromDirective(pd, ttl, now.Unix())
 
-	// Check for duplicate and register probe
 	p.inFlightMu.Lock()
 	if _, exists := p.inFlight[key]; exists {
 		p.inFlightMu.Unlock()
-		return nil, fmt.Errorf("duplicate probe rejected for %s (TTL %d): probe already in-flight for this second",
-			pd.DestinationAddress.String(), ttl)
+		p.logger.Warn("Duplicate probe rejected",
+			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Int("ttl", int(ttl)))
+		return nil, nil
 	}
 	p.inFlight[key] = &inFlightProbe{
 		resultCh:   resultCh,
@@ -284,14 +275,12 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	}
 	p.inFlightMu.Unlock()
 
-	// Cleanup on return
 	defer func() {
 		p.inFlightMu.Lock()
 		delete(p.inFlight, key)
 		p.inFlightMu.Unlock()
 	}()
 
-	// Queue probe for writing
 	req := &probeRequest{pd: pd, ttl: ttl, resultCh: resultCh}
 	select {
 	case p.writeQueue <- req:
@@ -299,7 +288,6 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 		return nil, ctx.Err()
 	}
 
-	// Wait for result with timeout
 	timeout := time.NewTimer(p.config.ProbeTimeout)
 	defer timeout.Stop()
 
@@ -320,7 +308,7 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 func (p *CaracalProber) writerLoop(ctx context.Context) error {
 	defer func() {
 		if err := p.stdin.Close(); err != nil {
-			log.Printf("Failed to close stdin: %v", err)
+			p.logger.Error("Failed to close caracal stdin", slog.Any("err", err))
 		}
 	}()
 
@@ -340,7 +328,6 @@ func (p *CaracalProber) writerLoop(ctx context.Context) error {
 func (p *CaracalProber) encodeAndSendProbe(req *probeRequest) error {
 	pd := req.pd
 
-	// CSV format: dst_addr,src_port,dst_port,ttl,protocol
 	firstHalfWord, secondHalfWord := extractHalfWords(pd)
 
 	record := []string{
@@ -376,7 +363,7 @@ func (p *CaracalProber) readerLoop(ctx context.Context) error {
 		}
 
 		if err := p.handleResult(record); err != nil {
-			log.Printf("Failed to handle result: %v", err)
+			p.logger.Error("Failed to handle result", slog.Any("err", err))
 		}
 	}
 }
@@ -394,8 +381,8 @@ func (p *CaracalProber) handleResult(record []string) error {
 
 	result, err := parseProbeResult(record)
 	if err != nil {
-		log.Printf("Skipping probe result: %v", err)
-		return nil // Skip this result but continue processing others
+		p.logger.Warn("Skipping probe result", slog.Any("err", err))
+		return nil
 	}
 
 	key, err := buildProbeKey(record)
@@ -411,26 +398,21 @@ func (p *CaracalProber) handleResult(record []string) error {
 func parseProbeResult(record []string) (*ProbeResult, error) {
 	result := &ProbeResult{}
 
-	// Parse timestamps
 	if captureTS := record[0]; captureTS != "" {
 		if ts, err := strconv.ParseInt(captureTS, 10, 64); err == nil {
 			result.ReceivedTime = time.Unix(ts, 0)
 		}
 	}
 
-	// Parse RTT to calculate sent time.
 	if rttStr := record[15]; rttStr != "" {
 		if rtt, err := strconv.ParseInt(rttStr, 10, 64); err == nil {
-			// RTT in tenths of milliseconds = 100 microseconds
 			rttMicros := rtt * 100
 			result.SentTime = result.ReceivedTime.Add(-time.Duration(rttMicros) * time.Microsecond)
 		}
 	}
 
-	// Parse reply address (always present if caracal outputs the line).
 	result.ReplyAddress = net.ParseIP(record[8])
 
-	// Validate timestamps - missing timestamps indicate caracal malfunction.
 	if result.ReceivedTime.IsZero() || result.SentTime.IsZero() {
 		return nil, fmt.Errorf("missing timestamps (caracal malfunction)")
 	}
@@ -443,10 +425,9 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 func normalizeIPAddress(addr string) string {
 	ip := net.ParseIP(addr)
 	if ip == nil {
-		return addr // Return as-is if not parseable
+		return addr
 	}
 
-	// Convert IPv4-mapped IPv6 to IPv4
 	if ipv4 := ip.To4(); ipv4 != nil {
 		return ipv4.String()
 	}
@@ -463,7 +444,6 @@ func parseSentTime(record []string) (time.Time, error) {
 		}
 	}
 
-	// Validate received time exists
 	if receivedTime.IsZero() {
 		return time.Time{}, fmt.Errorf("missing received time for correlation")
 	}
@@ -485,7 +465,6 @@ func parseSentTime(record []string) (time.Time, error) {
 
 // buildProbeKey constructs a correlation key from the CSV record.
 func buildProbeKey(record []string) (probeKey, error) {
-	// Parse protocol from CSV
 	protocol, err := strconv.ParseUint(record[1], 10, 8)
 	if err != nil {
 		return probeKey{}, fmt.Errorf("invalid protocol: %s", record[1])
@@ -508,13 +487,11 @@ func buildProbeKey(record []string) (probeKey, error) {
 		return probeKey{}, fmt.Errorf("invalid second half word: %s", record[5])
 	}
 
-	// Parse timestamps for correlation
 	sentTime, err := parseSentTime(record)
 	if err != nil {
 		return probeKey{}, err
 	}
 
-	// Convert protocol number to api.Protocol type
 	var protoType api.Protocol
 	switch protocol {
 	case 1:
@@ -527,16 +504,14 @@ func buildProbeKey(record []string) (probeKey, error) {
 		return probeKey{}, fmt.Errorf("unsupported protocol: %d", protocol)
 	}
 
-	key := probeKey{
+	return probeKey{
 		dstAddr:           dstAddr,
 		firstHalfWord:     uint16(firstHalfWord),
 		secondHalfWord:    uint16(secondHalfWord),
 		ttl:               uint8(ttl),
 		protocol:          protoType,
 		correlationSecond: sentTime.Unix(),
-	}
-
-	return key, nil
+	}, nil
 }
 
 // matchAndDeliverResult attempts to match the result with an in-flight probe and deliver it.
@@ -565,9 +540,11 @@ func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 		}
 	}
 
-	// Log when we can't match the result (correlation failure).
-	log.Printf("No in-flight probe found for result: dst=%s ttl=%d protocol=%d time=%d",
-		key.dstAddr, key.ttl, key.protocol, sentTime)
+	p.logger.Warn("No in-flight probe found for result",
+		slog.String("dest", key.dstAddr),
+		slog.Int("ttl", int(key.ttl)),
+		slog.String("protocol", protocolToString(key.protocol)),
+		slog.Int64("sent_time", sentTime))
 }
 
 // cleanupLoop periodically removes stale probes.
@@ -604,7 +581,7 @@ func (p *CaracalProber) cleanupStaleProbes() {
 	p.inFlightMu.Unlock()
 }
 
-// logStderr logs caracal's stderr.
+// logStderr logs caracal's stderr output at DEBUG level.
 func (p *CaracalProber) logStderr(ctx context.Context) error {
 	scanner := bufio.NewScanner(p.stderr)
 	for scanner.Scan() {
@@ -613,10 +590,9 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		log.Printf("caracal: %s", scanner.Text())
+		p.logger.Info(scanner.Text(), slog.String("source", "caracal"))
 	}
 
-	// EOF is normal when caracal exits.
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("stderr scan error: %w", err)
 	}
@@ -625,16 +601,13 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 
 // Close stops caracal and cleans up.
 func (p *CaracalProber) Close() error {
-	// Cancel context (stops all goroutines)
 	p.cancel()
 
-	// Wait for all goroutines to finish
 	err := p.g.Wait()
 
-	// Kill caracal process if it exists
 	if p.cmd != nil && p.cmd.Process != nil {
 		if killErr := p.cmd.Process.Kill(); killErr != nil {
-			log.Printf("Failed to kill caracal: %v", killErr)
+			p.logger.Error("Failed to kill caracal", slog.Any("err", killErr))
 		}
 	}
 

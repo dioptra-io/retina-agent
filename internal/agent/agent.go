@@ -66,13 +66,13 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger) error {
 		cfg = DefaultConfig()
 	}
 
-	prober, err := createProber(cfg)
+	prober, err := createProber(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create prober: %w", err)
 	}
 	defer func() {
 		if err := prober.Close(); err != nil {
-			logger.Error("Failed to close prober", slog.Any("err", err))
+			logger.Debug("Failed to close prober", slog.Any("err", err))
 		}
 	}()
 
@@ -88,7 +88,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger) error {
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			a.logger.Error("Failed to close connection", slog.Any("err", err))
+			a.logger.Debug("Failed to close connection", slog.Any("err", err))
 		}
 	}()
 
@@ -215,6 +215,9 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
 	// Check for read timeout (expected, just retry)
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		if ctx.Err() != nil {
+			return false, consecutiveErrors, ctx.Err()
+		}
 		a.logger.Debug("Read timeout, no data received")
 		return true, consecutiveErrors, nil
 	}
@@ -233,7 +236,7 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 	consecutiveErrors++
 
 	if a.config.MaxConsecutiveDecodeErrors > 0 {
-		a.logger.Warn("Failed to decode directive",
+		a.logger.Error("Failed to decode directive",
 			slog.Int("attempt", consecutiveErrors),
 			slog.Int("max", a.config.MaxConsecutiveDecodeErrors),
 			slog.Any("err", err))
@@ -243,7 +246,7 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 				consecutiveErrors, err)
 		}
 	} else {
-		a.logger.Warn("Failed to decode directive (skipping)", slog.Any("err", err))
+		a.logger.Error("Failed to decode directive (skipping)", slog.Any("err", err))
 	}
 
 	return true, consecutiveErrors, nil
@@ -295,23 +298,18 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return fmt.Errorf("failed to encode FIE: %w", err)
 			}
 
-			if fie.NearInfo == nil || fie.FarInfo == nil {
-				a.logger.Debug("→ FIE sent (no probe response)",
-					slog.Uint64("pd_id", fie.ProbingDirectiveID),
-					slog.String("dest", fie.DestinationAddress.String()))
-			} else {
-				a.logger.Debug("→ FIE sent",
-					slog.Uint64("pd_id", fie.ProbingDirectiveID),
-					slog.String("dest", fie.DestinationAddress.String()),
-					slog.Int("near_ttl", int(fie.NearInfo.ProbeTTL)),
-					slog.Int("far_ttl", int(fie.FarInfo.ProbeTTL)))
-			}
+			a.logger.Debug("→ FIE sent",
+				slog.Uint64("pd_id", fie.ProbingDirectiveID),
+				slog.String("dest", fie.DestinationAddress.String()),
+				slog.Bool("near_timeout", fie.NearInfo == nil),
+				slog.Bool("far_timeout", fie.FarInfo == nil))
 		}
 	}
 }
 
 // processPD executes near and far probes in parallel and sends an FIE regardless of timeouts.
 // Failed probes are logged and cause the FIE to be dropped.
+// Duplicate probes (already in-flight for this second) return nil result and are silently skipped.
 // Timed-out probes result in a nil NearInfo or FarInfo in the FIE.
 func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
 	nearTTL := pd.NearTTL
@@ -338,6 +336,10 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			slog.Any("err", nearRes.err))
 		return
 	}
+	if nearRes.result == nil {
+		return // prober returned nil: probe already in-flight for this destination/TTL/second
+	}
+
 	if farRes.err != nil {
 		a.logger.Error("Far probe failed",
 			slog.Uint64("pd_id", pd.ProbingDirectiveID),
@@ -346,18 +348,30 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			slog.Any("err", farRes.err))
 		return
 	}
+	if farRes.result == nil {
+		return // prober returned nil: probe already in-flight for this destination/TTL/second
+	}
 
+	select {
+	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL):
+	case <-ctx.Done():
+	}
+}
+
+// buildFIE constructs a ForwardingInfoElement from probe results.
+// Timed-out probes (TimedOut=true) result in a nil NearInfo or FarInfo.
+func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult, nearTTL, farTTL uint8) *api.ForwardingInfoElement {
 	var nearInfo *api.Info
-	if !nearRes.result.TimedOut {
-		nearInfo = probeResultToInfo(nearRes.result, nearTTL)
+	if !nearRes.TimedOut {
+		nearInfo = probeResultToInfo(nearRes, nearTTL)
 	}
 
 	var farInfo *api.Info
-	if !farRes.result.TimedOut {
-		farInfo = probeResultToInfo(farRes.result, farTTL)
+	if !farRes.TimedOut {
+		farInfo = probeResultToInfo(farRes, farTTL)
 	}
 
-	fie := &api.ForwardingInfoElement{
+	return &api.ForwardingInfoElement{
 		Agent:               api.Agent{AgentID: a.config.AgentID},
 		ProbingDirectiveID:  pd.ProbingDirectiveID,
 		IPVersion:           pd.IPVersion,
@@ -366,11 +380,6 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		NearInfo:            nearInfo,
 		FarInfo:             farInfo,
 		ProductionTimestamp: time.Now().UTC(),
-	}
-
-	select {
-	case fies <- fie:
-	case <-ctx.Done():
 	}
 }
 
@@ -382,12 +391,12 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 //  3. Update ProberType documentation in config.go
 //
 // This is a var (not func) to allow mocking in tests.
-var createProber = func(cfg *Config) (Prober, error) {
+var createProber = func(cfg *Config, logger *slog.Logger) (Prober, error) {
 	switch cfg.ProberType {
 	case "mock":
 		return NewMockProber(cfg), nil
 	case "caracal":
-		return NewCaracalProber(cfg)
+		return NewCaracalProber(cfg, logger)
 	default:
 		return nil, fmt.Errorf("unknown prober type: %q (valid: mock, caracal)", cfg.ProberType)
 	}
