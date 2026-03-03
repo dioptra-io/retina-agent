@@ -14,15 +14,14 @@
 // ## Uncovered Lines Explanation
 //
 // main() function (0% coverage):
-// - Lines 45-82: Infinite server loop cannot be tested in unit tests
+// - Infinite server loop cannot be tested in unit tests
 // - Would require integration test with actual TCP server and shutdown mechanism
 // - Refactoring for testability not justified for a mock test utility
 //
 // sendPDs() function (~94% coverage):
-// - Line 180 (default: protocol = "UNKNOWN"): Defensive code, unreachable
-// - generatePD() only creates valid protocols (ICMP, ICMPv6, UDP)
-// - Would require mocking generatePD to return invalid protocol
-
+// - default branch in protocol switch: defensive code, unreachable in practice
+// - generatePD() only ever produces valid protocols (ICMP, ICMPv6, UDP)
+// - Would require mocking generatePD to return an invalid protocol
 package main
 
 import (
