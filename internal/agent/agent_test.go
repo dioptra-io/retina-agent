@@ -45,12 +45,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 // testLogger returns a logger that discards all output, keeping test output clean.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// testMetrics returns a Metrics instance backed by a fresh registry for test isolation.
+func testMetrics() *Metrics {
+	return NewMetrics(prometheus.NewRegistry(), "test-agent")
 }
 
 // ===== Flexible Stubs =====
@@ -211,7 +218,7 @@ func TestRun_WithLocalServer(t *testing.T) {
 	agentErr := make(chan error, 1)
 	go func() {
 		t.Log("Starting agent...")
-		err := Run(ctx, cfg, testLogger())
+		err := Run(ctx, cfg, testLogger(), testMetrics())
 		t.Logf("Agent exited: %v", err)
 		agentErr <- err
 	}()
@@ -259,7 +266,7 @@ func TestRun_ConnectionCloseError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg, testLogger())
+		done <- Run(ctx, cfg, testLogger(), testMetrics())
 	}()
 
 	select {
@@ -296,7 +303,7 @@ func TestRun_ProberCloseError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	err := Run(ctx, cfg, testLogger())
+	err := Run(ctx, cfg, testLogger(), testMetrics())
 
 	if err == nil {
 		t.Error("Run should fail with invalid address")
@@ -310,7 +317,7 @@ func TestRun_ProberCreationError(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ProberType = "invalid-prober-type-xyz"
 
-	err := Run(context.Background(), cfg, testLogger())
+	err := Run(context.Background(), cfg, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("Run(invalid prober) should fail")
 	}
@@ -352,7 +359,7 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err = Run(ctx, cfg, testLogger())
+	err = Run(ctx, cfg, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("Run should return error from goroutine")
 	}
@@ -366,7 +373,7 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 func TestRun_NilConfig(t *testing.T) {
 	t.Parallel()
 
-	err := Run(context.Background(), nil, testLogger())
+	err := Run(context.Background(), nil, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("Run(nil config) should fail to connect")
 	}
@@ -381,7 +388,7 @@ func TestRun_InvalidOrchestratorAddr(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = "invalid:99999"
 
-	err := Run(context.Background(), cfg, testLogger())
+	err := Run(context.Background(), cfg, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("Run(invalid addr) should fail")
 	}
@@ -396,7 +403,7 @@ func TestRun_ContextCancelledBeforeConnect(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.OrchestratorAddr = "127.0.0.1:9999"
 
-	err := Run(ctx, cfg, testLogger())
+	err := Run(ctx, cfg, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("Run(cancelled context) should fail")
 	}
@@ -413,8 +420,9 @@ func TestRun_WithMockConnection(t *testing.T) {
 			ReadDeadline:               time.Second,
 			WriteDeadline:              time.Second,
 		},
-		prober: &stubProber{},
-		logger: testLogger(),
+		prober:  &stubProber{},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	clientConn, serverConn := net.Pipe()
@@ -487,8 +495,9 @@ func TestHandleDecodeError_Timeout(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := &mockNetError{timeout: true, err: "timeout"}
@@ -509,8 +518,9 @@ func TestHandleDecodeError_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -534,8 +544,9 @@ func TestHandleDecodeError_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := &mockNetError{timeout: false, err: "network error"}
@@ -564,7 +575,8 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 			AgentID:                    "test-agent",
 			MaxConsecutiveDecodeErrors: 3,
 		},
-		logger: testLogger(),
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := errors.New("json: invalid character")
@@ -615,7 +627,8 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 			AgentID:                    "test-agent",
 			MaxConsecutiveDecodeErrors: 0,
 		},
-		logger: testLogger(),
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := errors.New("json: invalid character")
@@ -648,7 +661,7 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 func TestReaderLoop_DecodeErrorLog(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	a.config.MaxConsecutiveDecodeErrors = 2
 
 	data := bytes.NewBufferString("{ bad json\n{ more bad\n")
@@ -679,7 +692,7 @@ func TestReaderLoop_DecodeErrorLog(t *testing.T) {
 func TestReaderLoop_DecodeErrorWithUnlimitedRetries(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	a.config.MaxConsecutiveDecodeErrors = 0
 
 	attempts := 0
@@ -715,7 +728,7 @@ func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 			return errors.New("deadline fail")
 		},
 	}
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
 	if err == nil || !strings.Contains(err.Error(), "failed to set read deadline") {
@@ -726,7 +739,7 @@ func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 func TestReaderLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -741,7 +754,7 @@ func TestReaderLoop_ContextCancelled(t *testing.T) {
 func TestReaderLoop_NetworkError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	conn := &stubConn{}
 
 	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
@@ -753,7 +766,7 @@ func TestReaderLoop_NetworkError(t *testing.T) {
 func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	a.config.MaxConsecutiveDecodeErrors = 2
 
 	data := bytes.NewBufferString("bad\nbad\n")
@@ -784,7 +797,7 @@ func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 func TestReaderLoop_InvalidDirective(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	invalidPD := &api.ProbingDirective{
 		NearTTL:            5,
@@ -851,7 +864,7 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	validPD := &api.ProbingDirective{
 		AgentID:            "test",
@@ -907,7 +920,7 @@ func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 			return errors.New("deadline fail")
 		},
 	}
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	fies := make(chan *api.ForwardingInfoElement, 1)
 	fies <- &api.ForwardingInfoElement{}
@@ -921,7 +934,7 @@ func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 func TestWriterLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	fies := make(chan *api.ForwardingInfoElement)
 	close(fies)
 
@@ -934,7 +947,7 @@ func TestWriterLoop_ChannelClosed(t *testing.T) {
 func TestWriterLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -947,7 +960,7 @@ func TestWriterLoop_ContextCancelled(t *testing.T) {
 func TestWriterLoop_NetworkError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	conn := &stubConn{
 		writeFunc: func(b []byte) (int, error) {
@@ -969,7 +982,7 @@ func TestWriterLoop_NetworkError(t *testing.T) {
 func TestWriterLoop_EncodeError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	written := make(chan string, 1)
 
@@ -992,7 +1005,7 @@ func TestWriterLoop_EncodeError(t *testing.T) {
 func TestWriterLoop_Success(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), logger: testLogger()}
+	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	a.config.AgentID = "test-agent"
 
 	written := make(chan []byte, 1)
@@ -1035,7 +1048,7 @@ func TestWriterLoop_Success(t *testing.T) {
 func TestProcessorLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger()}
+	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger(), metrics: testMetrics()}
 	pds := make(chan *api.ProbingDirective)
 	close(pds)
 
@@ -1048,7 +1061,7 @@ func TestProcessorLoop_ChannelClosed(t *testing.T) {
 func TestProcessorLoop_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger()}
+	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger(), metrics: testMetrics()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1062,9 +1075,10 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test"},
+		prober:  &stubProber{},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	pds := make(chan *api.ProbingDirective, 1)
@@ -1115,9 +1129,10 @@ func TestProcessPD_Success(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test"},
+		prober:  &stubProber{},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	pd := &api.ProbingDirective{
@@ -1163,7 +1178,8 @@ func TestProcessPD_NearProbeError(t *testing.T) {
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},
 		},
-		logger: testLogger(),
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	pd := &api.ProbingDirective{NearTTL: 5}
@@ -1191,7 +1207,8 @@ func TestProcessPD_FarProbeError(t *testing.T) {
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},
 		},
-		logger: testLogger(),
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	pd := &api.ProbingDirective{NearTTL: 5}
@@ -1235,7 +1252,8 @@ func TestProcessPD_Timeout(t *testing.T) {
 						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 					},
 				},
-				logger: testLogger(),
+				logger:  testLogger(),
+				metrics: testMetrics(),
 			}
 
 			pd := &api.ProbingDirective{NearTTL: 5}
@@ -1272,9 +1290,10 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test"},
+		prober:  &stubProber{},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1288,6 +1307,64 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	select {
 	case <-fies:
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestProcessPD_NilNearResult(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{AgentID: "test"},
+		prober: &stubProber{
+			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+				if ttl == 5 {
+					return nil, nil // probe already in-flight
+				}
+				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+			},
+		},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	pd := &api.ProbingDirective{NearTTL: 5}
+	fies := make(chan *api.ForwardingInfoElement, 1)
+
+	a.processPD(context.Background(), pd, fies)
+
+	select {
+	case <-fies:
+		t.Error("processPD should not send FIE when near result is nil")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestProcessPD_NilFarResult(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{AgentID: "test"},
+		prober: &stubProber{
+			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+				if ttl == 6 {
+					return nil, nil // probe already in-flight
+				}
+				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+			},
+		},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	pd := &api.ProbingDirective{NearTTL: 5}
+	fies := make(chan *api.ForwardingInfoElement, 1)
+
+	a.processPD(context.Background(), pd, fies)
+
+	select {
+	case <-fies:
+		t.Error("processPD should not send FIE when far result is nil")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -1502,6 +1579,39 @@ func TestIsNetworkError_AllCases(t *testing.T) {
 	}
 }
 
+// ===== classifyIP() Tests =====
+
+func TestClassifyIP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ip   string
+		want string
+	}{
+		{"loopback IPv4", "127.0.0.1", "loopback"},
+		{"loopback IPv6", "::1", "loopback"},
+		{"multicast IPv4", "224.0.0.1", "multicast"},
+		{"multicast IPv6", "ff02::1", "multicast"},
+		{"private 10.x", "10.0.0.1", "private"},
+		{"private 172.16.x", "172.16.0.1", "private"},
+		{"private 192.168.x", "192.168.1.1", "private"},
+		{"public", "8.8.8.8", "public"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := classifyIP(net.ParseIP(tt.ip))
+			if got != tt.want {
+				t.Errorf("classifyIP(%s) = %q, want %q", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // MOCK CONNECTION FOR AUTHENTICATION TESTING
 // ============================================================================
@@ -1589,8 +1699,9 @@ func TestAuthenticate_Success(t *testing.T) {
 	}
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	if err := a.authenticate(conn); err != nil {
@@ -1640,8 +1751,9 @@ func TestAuthenticate_Rejected(t *testing.T) {
 			}
 
 			a := &agent{
-				config: &Config{AgentID: "test-agent", Secret: "wrong-secret"},
-				logger: testLogger(),
+				config:  &Config{AgentID: "test-agent", Secret: "wrong-secret"},
+				logger:  testLogger(),
+				metrics: testMetrics(),
 			}
 
 			err := a.authenticate(conn)
@@ -1677,8 +1789,9 @@ func TestAuthenticate_ReadError(t *testing.T) {
 			conn.readErr = tt.readErr
 
 			a := &agent{
-				config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-				logger: testLogger(),
+				config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+				logger:  testLogger(),
+				metrics: testMetrics(),
 			}
 
 			err := a.authenticate(conn)
@@ -1700,8 +1813,9 @@ func TestAuthenticate_WriteError(t *testing.T) {
 	conn.writeErr = errors.New("connection broken")
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := a.authenticate(conn)
@@ -1721,8 +1835,9 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 	conn.readBuf.WriteString("{invalid json")
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := a.authenticate(conn)
@@ -1748,8 +1863,9 @@ func TestAuthenticate_EmptySecret(t *testing.T) {
 	}
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: ""},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: ""},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	if err := a.authenticate(conn); err != nil {
@@ -1772,8 +1888,9 @@ func TestAuthenticate_SetWriteDeadlineError(t *testing.T) {
 	conn.setWriteDeadlineErr = errors.New("failed to set deadline")
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := a.authenticate(conn)
@@ -1801,8 +1918,9 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 	conn.setReadDeadlineErr = errors.New("failed to set read deadline")
 
 	a := &agent{
-		config: &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
-		logger: testLogger(),
+		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
 	}
 
 	err := a.authenticate(conn)
@@ -1860,7 +1978,7 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 		CleanupInterval:  1 * time.Second,
 	}
 
-	err = Run(context.Background(), cfg, testLogger())
+	err = Run(context.Background(), cfg, testLogger(), testMetrics())
 
 	if err == nil {
 		t.Error("Run() should fail when authentication is rejected")
@@ -1946,7 +2064,7 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg, testLogger())
+		done <- Run(ctx, cfg, testLogger(), testMetrics())
 	}()
 
 	select {
@@ -2023,7 +2141,7 @@ func TestRun_NoAuthentication(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, cfg, testLogger())
+		done <- Run(ctx, cfg, testLogger(), testMetrics())
 	}()
 
 	select {

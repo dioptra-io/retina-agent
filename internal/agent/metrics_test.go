@@ -42,7 +42,7 @@ func TestNewMetrics(t *testing.T) {
 	if m.WriteErrorsTotal == nil {
 		t.Error("WriteErrorsTotal is nil")
 	}
-	if m.ActiveProbeGoroutines == nil {
+	if m.PDGoroutines == nil {
 		t.Error("ActiveProbeGoroutines is nil")
 	}
 	if m.CorrelationFailuresTotal == nil {

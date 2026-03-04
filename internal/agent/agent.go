@@ -41,9 +41,10 @@ import (
 var ErrInvalidDirective = errors.New("invalid probing directive")
 
 type agent struct {
-	config *Config
-	prober Prober
-	logger *slog.Logger
+	config  *Config
+	prober  Prober
+	logger  *slog.Logger
+	metrics *Metrics
 }
 
 // probeResult wraps a probe result with its error for channel communication.
@@ -61,7 +62,7 @@ type probeResult struct {
 //
 // Returns nil on clean shutdown (context cancelled), or an error if the connection
 // is lost or another failure occurs.
-func Run(ctx context.Context, cfg *Config, logger *slog.Logger) error {
+func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics) error {
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
@@ -77,9 +78,10 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger) error {
 	}()
 
 	a := &agent{
-		config: cfg,
-		prober: prober,
-		logger: logger.With(slog.String("agent_id", cfg.AgentID)),
+		config:  cfg,
+		prober:  prober,
+		logger:  logger.With(slog.String("agent_id", cfg.AgentID)),
+		metrics: metrics,
 	}
 
 	conn, err := net.Dial("tcp", a.config.OrchestratorAddr)
@@ -189,9 +191,11 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		}
 
 		consecutiveDecodeErrors = 0
+		a.metrics.PDsReceivedTotal.Inc()
 
 		if err := validatePD(&pd); err != nil {
 			a.logger.Warn("Invalid directive", slog.Any("err", err))
+			a.metrics.PDsInvalidTotal.Inc()
 			continue
 		}
 
@@ -204,6 +208,7 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		case <-ctx.Done():
 			return ctx.Err()
 		case pds <- &pd:
+			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
 		}
 	}
 }
@@ -234,6 +239,7 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 
 	// Malformed JSON — log and potentially skip
 	consecutiveErrors++
+	a.metrics.DecodeErrorsTotal.Inc()
 
 	if a.config.MaxConsecutiveDecodeErrors > 0 {
 		a.logger.Error("Failed to decode directive",
@@ -266,6 +272,8 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			if !ok {
 				return nil
 			}
+			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
+			a.metrics.PDGoroutines.Inc()
 			go a.processPD(ctx, pd, fies)
 		}
 	}
@@ -287,17 +295,21 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return nil
 			}
 
+			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(len(fies)))
+
 			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
 				return fmt.Errorf("failed to set write deadline: %w", err)
 			}
 
 			if err := encoder.Encode(fie); err != nil {
+				a.metrics.WriteErrorsTotal.Inc()
 				if isNetworkError(err) {
 					return fmt.Errorf("connection lost while writing: %w", err)
 				}
 				return fmt.Errorf("failed to encode FIE: %w", err)
 			}
 
+			a.metrics.FIEsSentTotal.Inc()
 			a.logger.Debug("→ FIE sent",
 				slog.Uint64("pd_id", fie.ProbingDirectiveID),
 				slog.String("dest", fie.DestinationAddress.String()),
@@ -312,6 +324,8 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 // Duplicate probes (already in-flight for this second) return nil result and are silently skipped.
 // Timed-out probes result in a nil NearInfo or FarInfo in the FIE.
 func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
+	defer a.metrics.PDGoroutines.Dec()
+
 	nearTTL := pd.NearTTL
 	farTTL := pd.NearTTL + 1
 	nearCh := make(chan probeResult, 1)
@@ -334,11 +348,13 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(nearTTL)),
 			slog.Any("err", nearRes.err))
+		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
 	}
 	if nearRes.result == nil {
-		return // prober returned nil: probe already in-flight for this destination/TTL/second
+		return // probe already in-flight for this destination/TTL/second
 	}
+	a.recordProbeOutcome(nearRes.result)
 
 	if farRes.err != nil {
 		a.logger.Error("Far probe failed",
@@ -346,16 +362,48 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(farTTL)),
 			slog.Any("err", farRes.err))
+		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
 	}
 	if farRes.result == nil {
-		return // prober returned nil: probe already in-flight for this destination/TTL/second
+		return // probe already in-flight for this destination/TTL/second
 	}
+	a.recordProbeOutcome(farRes.result)
 
 	select {
 	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL):
 	case <-ctx.Done():
 	}
+}
+
+// recordProbeOutcome increments probe outcome metrics and observes RTT for successful probes.
+// TODO: increment ICMPReplyTypeTotal once ProbeResult carries ICMP reply type.
+func (a *agent) recordProbeOutcome(result *ProbeResult) {
+	if result.TimedOut {
+		a.metrics.ProbesTotal.WithLabelValues("timeout").Inc()
+		return
+	}
+
+	a.metrics.ProbesTotal.WithLabelValues("success").Inc()
+	a.metrics.ProbeRTTSeconds.Observe(result.ReceivedTime.Sub(result.SentTime).Seconds())
+
+	if result.ReplyAddress != nil {
+		a.metrics.ReplyAddressTypeTotal.WithLabelValues(classifyIP(result.ReplyAddress)).Inc()
+	}
+}
+
+// classifyIP returns the address type of an IP for responsible probing metrics.
+func classifyIP(ip net.IP) string {
+	if ip.IsLoopback() {
+		return "loopback"
+	}
+	if ip.IsMulticast() {
+		return "multicast"
+	}
+	if ip.IsPrivate() {
+		return "private"
+	}
+	return "public"
 }
 
 // buildFIE constructs a ForwardingInfoElement from probe results.

@@ -45,7 +45,7 @@ type Metrics struct {
 	WriteErrorsTotal   prometheus.Counter
 
 	// Throughput / Resource
-	ActiveProbeGoroutines prometheus.Gauge
+	PDGoroutines prometheus.Gauge
 
 	// Caracal Pipeline
 	// Note: probes sent to network and packets received are available via caracal logs in Loki.
@@ -123,9 +123,9 @@ func NewMetrics(registry prometheus.Registerer, agentID string) *Metrics {
 		}),
 
 		// Throughput / Resource
-		ActiveProbeGoroutines: factory.NewGauge(prometheus.GaugeOpts{
-			Name:        "retina_agent_active_probe_goroutines",
-			Help:        "Current number of in-flight processPD goroutines. Abnormal growth indicates a slow prober.",
+		PDGoroutines: factory.NewGauge(prometheus.GaugeOpts{
+			Name:        "retina_agent_pd_goroutines",
+			Help:        "Current number of goroutines processing probing directives. Abnormal growth indicates a slow prober or fies channel backpressure.",
 			ConstLabels: constLabels,
 		}),
 

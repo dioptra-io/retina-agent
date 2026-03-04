@@ -27,11 +27,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/dioptra-io/retina-agent/internal/agent"
 )
@@ -39,6 +44,11 @@ import (
 // testLogger returns a logger that discards all output, keeping test output clean.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// testMetrics returns a Metrics instance backed by a fresh registry for test isolation.
+func testMetrics() *agent.Metrics {
+	return agent.NewMetrics(prometheus.NewRegistry(), "test-agent")
 }
 
 // ============================================================================
@@ -58,7 +68,7 @@ type mockAgentRun struct {
 	ctxToCancel context.CancelFunc // Context to cancel (if cancelOnN > 0)
 }
 
-func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config, logger *slog.Logger) error {
+func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config, logger *slog.Logger, metrics *agent.Metrics) error {
 	callNum := int(m.calls.Add(1))
 
 	// Simulate work
@@ -101,7 +111,7 @@ func testBackoffTiming(t *testing.T, cfg *agent.Config, mock *mockAgentRun,
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(context.Background(), cfg, testLogger())
+		runWithReconnect(context.Background(), cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -164,7 +174,7 @@ func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg, testLogger())
+		runWithReconnect(ctx, cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -197,7 +207,7 @@ func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg, testLogger())
+		runWithReconnect(ctx, cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -275,7 +285,7 @@ func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg, testLogger())
+		runWithReconnect(ctx, cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -306,7 +316,7 @@ func TestRunWithReconnect_NonContextError(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(context.Background(), cfg, testLogger())
+		runWithReconnect(context.Background(), cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -343,7 +353,7 @@ func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		runWithReconnect(ctx, cfg, testLogger())
+		runWithReconnect(ctx, cfg, testLogger(), testMetrics())
 		done <- true
 	}()
 
@@ -426,4 +436,50 @@ func TestNewLogger_Levels(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ============================================================================
+// UNIT TESTS - Metrics Server
+// ============================================================================
+
+func TestStartMetricsServer(t *testing.T) {
+	t.Parallel()
+
+	// Find a free port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+
+	registry := prometheus.NewRegistry()
+	startMetricsServer(testLogger(), registry, addr)
+
+	// Retry briefly since the server starts in a goroutine
+	var resp *http.Response
+	for i := 0; i < 10; i++ {
+		resp, err = http.Get(fmt.Sprintf("http://%s/metrics", addr)) //nolint:noctx
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("failed to reach metrics server: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("metrics server returned %d, want 200", resp.StatusCode)
+	}
+}
+func TestStartMetricsServer_InvalidAddr(t *testing.T) {
+	t.Parallel()
+
+	// Invalid address causes ListenAndServe to fail immediately,
+	// covering the error log branch inside the goroutine.
+	startMetricsServer(testLogger(), prometheus.NewRegistry(), "invalid-addr")
+
+	// Give the goroutine time to hit the error path
+	time.Sleep(50 * time.Millisecond)
 }

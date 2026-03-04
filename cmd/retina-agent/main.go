@@ -29,10 +29,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dioptra-io/retina-agent/internal/agent"
 )
@@ -66,6 +70,9 @@ var (
 
 	// Logging
 	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+
+	// Metrics
+	metricsAddr = flag.String("metrics-addr", ":9090", "Address to expose Prometheus metrics on")
 )
 
 // agentRun is a variable for dependency injection in tests.
@@ -98,10 +105,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	registry := prometheus.NewRegistry()
+	metrics := agent.NewMetrics(registry, *agentID)
+
+	startMetricsServer(logger, registry, *metricsAddr)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	runWithReconnect(ctx, cfg, logger)
+	runWithReconnect(ctx, cfg, logger, metrics)
 }
 
 // newLogger creates a JSON logger writing to stdout at the given level.
@@ -116,34 +128,48 @@ func newLogger(level string) *slog.Logger {
 	}))
 }
 
+// startMetricsServer starts an HTTP server exposing Prometheus metrics at /metrics.
+func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	go func() {
+		logger.Info("Starting metrics server", slog.String("addr", addr))
+		if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) { //nolint:gosec
+			logger.Error("Metrics server failed", slog.Any("err", err))
+		}
+	}()
+}
+
 // runWithReconnect wraps agent.Run with exponential backoff reconnection.
 //
 // The backoff starts at 1 second and doubles on each failure, up to
 // MaxReconnectBackoff. On intentional shutdown (Ctrl+C), the function
 // returns immediately without retrying.
-func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logger) {
+func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logger, metrics *agent.Metrics) {
 	const (
 		initialBackoff = 1 * time.Second
 		backoffFactor  = 2
 	)
 
-	agentID := slog.String("agent_id", cfg.AgentID)
+	agentIDAttr := slog.String("agent_id", cfg.AgentID)
 
 	backoff := initialBackoff
 	for {
 		logger.Info("Connecting",
-			agentID,
+			agentIDAttr,
 			slog.String("address", cfg.OrchestratorAddr))
 
-		err := agentRun(ctx, cfg, logger)
+		err := agentRun(ctx, cfg, logger, metrics)
 
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			logger.Info("Shutdown complete", agentID)
+			logger.Info("Shutdown complete", agentIDAttr)
 			return
 		}
 
-		logger.Error("Connection lost", agentID, slog.Any("err", err))
-		logger.Info("Reconnecting", agentID, slog.Duration("backoff", backoff))
+		metrics.ReconnectionsTotal.Inc()
+		logger.Error("Connection lost", agentIDAttr, slog.Any("err", err))
+		logger.Info("Reconnecting", agentIDAttr, slog.Duration("backoff", backoff))
 
 		select {
 		case <-time.After(backoff):
@@ -152,7 +178,7 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logge
 				backoff = cfg.MaxReconnectBackoff
 			}
 		case <-ctx.Done():
-			logger.Info("Shutdown during reconnect backoff", agentID)
+			logger.Info("Shutdown during reconnect backoff", agentIDAttr)
 			return
 		}
 	}
