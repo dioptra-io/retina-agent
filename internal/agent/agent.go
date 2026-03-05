@@ -67,7 +67,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		cfg = DefaultConfig()
 	}
 
-	prober, err := createProber(cfg, logger)
+	prober, err := createProber(cfg, logger, metrics)
 	if err != nil {
 		return fmt.Errorf("failed to create prober: %w", err)
 	}
@@ -439,12 +439,12 @@ func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult,
 //  3. Update ProberType documentation in config.go
 //
 // This is a var (not func) to allow mocking in tests.
-var createProber = func(cfg *Config, logger *slog.Logger) (Prober, error) {
+var createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Prober, error) {
 	switch cfg.ProberType {
 	case "mock":
 		return NewMockProber(cfg), nil
 	case "caracal":
-		return NewCaracalProber(cfg, logger)
+		return NewCaracalProber(cfg, logger, metrics)
 	default:
 		return nil, fmt.Errorf("unknown prober type: %q (valid: mock, caracal)", cfg.ProberType)
 	}

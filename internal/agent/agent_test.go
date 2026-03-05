@@ -289,7 +289,7 @@ func TestRun_ProberCloseError(t *testing.T) {
 	origCreateProber := createProber
 	defer func() { createProber = origCreateProber }()
 
-	createProber = func(cfg *Config, logger *slog.Logger) (Prober, error) {
+	createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Prober, error) {
 		return &stubProber{
 			closeFunc: func() error {
 				return errors.New("prober close failed")
@@ -1373,7 +1373,7 @@ func TestProcessPD_NilFarResult(t *testing.T) {
 func TestCreateProber_Mock(t *testing.T) {
 	t.Parallel()
 
-	p, err := createProber(&Config{ProberType: "mock"}, testLogger())
+	p, err := createProber(&Config{ProberType: "mock"}, testLogger(), testMetrics())
 	if err != nil {
 		t.Errorf("createProber(mock) error: %v", err)
 	}
@@ -1389,11 +1389,11 @@ func TestCreateProber_CaracalError(t *testing.T) {
 	defer func() { NewCaracalProber = origNewCaracalProber }()
 
 	expectedErr := errors.New("caracal binary not found")
-	NewCaracalProber = func(cfg *Config, logger *slog.Logger) (*CaracalProber, error) {
+	NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*CaracalProber, error) {
 		return nil, expectedErr
 	}
 
-	_, err := createProber(&Config{ProberType: "caracal"}, testLogger())
+	_, err := createProber(&Config{ProberType: "caracal"}, testLogger(), testMetrics())
 	if err != expectedErr {
 		t.Errorf("createProber(caracal) error = %v, want %v", err, expectedErr)
 	}
@@ -1403,7 +1403,7 @@ func TestCreateProber_CaracalError(t *testing.T) {
 func TestCreateProber_Unknown(t *testing.T) {
 	t.Parallel()
 
-	_, err := createProber(&Config{ProberType: "unknown"}, testLogger())
+	_, err := createProber(&Config{ProberType: "unknown"}, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("createProber(unknown) should error")
 	}

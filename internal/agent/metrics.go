@@ -57,7 +57,7 @@ type Metrics struct {
 
 	// Responsible Probing
 	ReplyAddressTypeTotal *prometheus.CounterVec
-	ICMPReplyTypeTotal    *prometheus.CounterVec
+	ICMPReplyTotal        *prometheus.CounterVec
 }
 
 // NewMetrics creates and registers all agent metrics with the given registry.
@@ -162,10 +162,10 @@ func NewMetrics(registry prometheus.Registerer, agentID string) *Metrics {
 			Help:        "Total number of probe replies by address type. A spike in private replies could indicate probes staying inside GCP's internal network.",
 			ConstLabels: constLabels,
 		}, []string{"type"}),
-		ICMPReplyTypeTotal: factory.NewCounterVec(prometheus.CounterOpts{
-			Name:        "retina_agent_icmp_reply_type_total",
-			Help:        "Total number of ICMP replies by type. A rising port_unreachable rate means we are hitting end systems rather than routers.",
+		ICMPReplyTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name:        "retina_agent_icmp_reply_total",
+			Help:        "Total number of ICMP replies by type and code. A rising port_unreachable rate means we are hitting end systems rather than routers.",
 			ConstLabels: constLabels,
-		}, []string{"type"}),
+		}, []string{"type", "code"}),
 	}
 }

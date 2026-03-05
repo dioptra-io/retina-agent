@@ -40,7 +40,7 @@
 //
 // Deduplication:
 //   - Only one probe per unique (destination, ports/fields, TTL, protocol, second)
-//   - If a duplicate is requested while a probe is in-flight, it returns an error
+//   - If a duplicate is requested while a probe is in-flight, it returns nil
 //   - This prevents sending redundant probes and ensures correlation works correctly
 //   - With proper directive randomization, duplicates should be rare
 package agent
@@ -80,10 +80,11 @@ type CaracalProber struct {
 	writeQueue chan *probeRequest
 
 	// Configuration and lifecycle management
-	config *Config
-	logger *slog.Logger
-	cancel context.CancelFunc
-	g      *errgroup.Group
+	config  *Config
+	logger  *slog.Logger
+	metrics *Metrics
+	cancel  context.CancelFunc
+	g       *errgroup.Group
 }
 
 // probeKey uniquely identifies a probe within a time window.
@@ -110,7 +111,7 @@ type probeRequest struct {
 }
 
 // NewCaracalProber creates and starts a caracal prober.
-var NewCaracalProber = func(cfg *Config, logger *slog.Logger) (*CaracalProber, error) {
+var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*CaracalProber, error) {
 	cmd, stdin, stdout, stderr, err := setupCaracalProcess(cfg, logger)
 	if err != nil {
 		return nil, err
@@ -134,6 +135,7 @@ var NewCaracalProber = func(cfg *Config, logger *slog.Logger) (*CaracalProber, e
 		writeQueue: make(chan *probeRequest, queueSize),
 		config:     cfg,
 		logger:     logger,
+		metrics:    metrics,
 		cancel:     cancel,
 		g:          g,
 	}
@@ -267,23 +269,27 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 		p.logger.Warn("Duplicate probe rejected",
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(ttl)))
+		p.metrics.DuplicateProbesTotal.Inc()
 		return nil, nil
 	}
 	p.inFlight[key] = &inFlightProbe{
 		resultCh:   resultCh,
 		queuedTime: now,
 	}
+	p.metrics.InFlightProbes.Inc()
 	p.inFlightMu.Unlock()
 
 	defer func() {
 		p.inFlightMu.Lock()
 		delete(p.inFlight, key)
 		p.inFlightMu.Unlock()
+		p.metrics.InFlightProbes.Dec()
 	}()
 
 	req := &probeRequest{pd: pd, ttl: ttl, resultCh: resultCh}
 	select {
 	case p.writeQueue <- req:
+		p.metrics.WriteQueueDepth.Set(float64(len(p.writeQueue)))
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -318,6 +324,7 @@ func (p *CaracalProber) writerLoop(ctx context.Context) error {
 			if err := p.encodeAndSendProbe(req); err != nil {
 				return fmt.Errorf("write error: %w", err)
 			}
+			p.metrics.WriteQueueDepth.Set(float64(len(p.writeQueue)))
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -390,6 +397,7 @@ func (p *CaracalProber) handleResult(record []string) error {
 		return err
 	}
 
+	p.metrics.ICMPReplyTotal.WithLabelValues(record[10], record[11]).Inc()
 	p.matchAndDeliverResult(key, result)
 	return nil
 }
@@ -540,6 +548,7 @@ func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 		}
 	}
 
+	p.metrics.CorrelationFailuresTotal.Inc()
 	p.logger.Warn("No in-flight probe found for result",
 		slog.String("dest", key.dstAddr),
 		slog.Int("ttl", int(key.ttl)),
@@ -572,13 +581,21 @@ func (p *CaracalProber) cleanupStaleProbes() {
 	now := time.Now()
 	cutoff := now.Add(-p.config.ProbeTimeout - 5*time.Second)
 
+	var cleaned int
+
 	p.inFlightMu.Lock()
 	for key, probe := range p.inFlight {
 		if probe.queuedTime.Before(cutoff) {
 			delete(p.inFlight, key)
+			cleaned++
 		}
 	}
 	p.inFlightMu.Unlock()
+
+	if cleaned > 0 {
+		p.metrics.StaleProbesCleanedTotal.Add(float64(cleaned))
+		p.metrics.InFlightProbes.Add(float64(-cleaned))
+	}
 }
 
 // logStderr logs caracal's stderr output at DEBUG level.

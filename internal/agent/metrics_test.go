@@ -63,8 +63,8 @@ func TestNewMetrics(t *testing.T) {
 	if m.ReplyAddressTypeTotal == nil {
 		t.Error("ReplyAddressTypeTotal is nil")
 	}
-	if m.ICMPReplyTypeTotal == nil {
-		t.Error("ICMPReplyTypeTotal is nil")
+	if m.ICMPReplyTotal == nil {
+		t.Error("ICMPReplyTotal is nil")
 	}
 }
 

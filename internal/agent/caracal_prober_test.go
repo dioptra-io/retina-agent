@@ -220,6 +220,7 @@ func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadClose
 		cancel:     cancel,
 		g:          g,
 		logger:     testLogger(),
+		metrics:    testMetrics(),
 	}
 
 	// Skip CSV header like production code does
@@ -614,6 +615,7 @@ func TestBuildProbeKeyFromDirective(t *testing.T) {
 		t.Errorf("expected correlationSecond=%d, got %d", timestamp, key.correlationSecond)
 	}
 }
+
 func TestParseSentTime(t *testing.T) {
 	t.Parallel()
 
@@ -928,6 +930,7 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 		cancel:     cancel_prober,
 		g:          g,
 		logger:     testLogger(),
+		metrics:    testMetrics(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1440,6 +1443,7 @@ func TestEncodeAndSendProbeCSVWriterInErrorState(t *testing.T) {
 	prober := &CaracalProber{
 		csvWriter: csvWriter,
 		stdin:     w,
+		metrics:   testMetrics(),
 	}
 
 	pd := makeProbe()
@@ -1592,6 +1596,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 		cancel:     cancel,
 		g:          g,
 		logger:     testLogger(),
+		metrics:    testMetrics(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1665,6 +1670,7 @@ func TestWriterLoopError(t *testing.T) {
 		cancel:     cancel,
 		g:          g,
 		logger:     testLogger(),
+		metrics:    testMetrics(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1729,6 +1735,7 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 		cancel:     cancel,
 		g:          g,
 		logger:     logger,
+		metrics:    testMetrics(),
 	}
 
 	_, _ = prober.stdout.Read()
@@ -1774,7 +1781,7 @@ done
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1816,7 +1823,7 @@ func TestSetupCaracalProcessFailure(t *testing.T) {
 		ProberArgs: []string{},
 	}
 
-	_, err := NewCaracalProber(cfg, testLogger())
+	_, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err == nil {
 		t.Error("expected error for nonexistent command")
 	}
@@ -1835,7 +1842,7 @@ func TestSetupCaracalProcessStartFailure(t *testing.T) {
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err == nil {
 		_ = prober.Close()
 		t.Skip("Command didn't fail as expected")
@@ -1875,7 +1882,7 @@ while read line; do sleep 1; done
 		ProbeTimeout:    200 * time.Millisecond,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1923,7 +1930,7 @@ done
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1957,7 +1964,7 @@ func TestNewCaracalProberDefaultQueueSize(t *testing.T) {
 		ProbeTimeout:    1 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -1989,7 +1996,7 @@ while read line; do timestamp=$(date +%s); echo "$timestamp,1,10.0.0.1,10.0.0.2,
 		ProbeTimeout:    2 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, logger)
+	prober, err := NewCaracalProber(cfg, logger, testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober: %v", err)
 	}
@@ -2046,7 +2053,7 @@ done
 		ProbeTimeout:    1 * time.Second,
 	}
 
-	prober, err := NewCaracalProber(cfg, testLogger())
+	prober, err := NewCaracalProber(cfg, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("failed to create prober with default path: %v", err)
 	}
