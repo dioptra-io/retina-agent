@@ -6,7 +6,7 @@
 // Current coverage by function:
 // - generatePD:    100% - All protocol variants, IP versions, and cycling logic
 // - reportStats:   100% - Both data and early return paths
-// - receiveFIEs:   100% - Success, EOF, and decode error paths
+// - receiveFIEs:   100% - Success, EOF, decode error, nil info, and partial info paths
 // - sendPDs:       ~94% - Missing UNKNOWN protocol (unreachable defensive code)
 // - handleAgent:   100% - All paths including defer error handling
 // - main:          0%   - Cannot test infinite server loop
@@ -323,8 +323,8 @@ func TestReceiveFIEs_Success(t *testing.T) {
 	}
 }
 
-func TestReceiveFIEs_NilInfo(t *testing.T) {
-	// FIE with nil NearInfo and FarInfo (no probe response received)
+func TestReceiveFIEs_BothNilInfo(t *testing.T) {
+	// FIE with both NearInfo and FarInfo nil — no probe response received at all.
 	fie := api.ForwardingInfoElement{
 		Agent:              api.Agent{AgentID: "test-agent"},
 		ProbingDirectiveID: 42,
@@ -334,16 +334,76 @@ func TestReceiveFIEs_NilInfo(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	encoder := json.NewEncoder(&buf)
-	if err := encoder.Encode(fie); err != nil {
+	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
 		t.Fatalf("Failed to encode FIE: %v", err)
 	}
 
-	decoder := json.NewDecoder(&buf)
 	origReceived := fiesReceived.Load()
 	defer fiesReceived.Store(origReceived)
 
-	receiveFIEs(decoder, "test-addr")
+	receiveFIEs(json.NewDecoder(&buf), "test-addr")
+
+	if fiesReceived.Load() != origReceived+1 {
+		t.Error("fiesReceived counter not incremented")
+	}
+}
+
+func TestReceiveFIEs_NearInfoNil(t *testing.T) {
+	// FIE with NearInfo nil — far hop responded but near hop did not.
+	now := time.Now()
+	fie := api.ForwardingInfoElement{
+		Agent:              api.Agent{AgentID: "test-agent"},
+		ProbingDirectiveID: 42,
+		DestinationAddress: net.ParseIP("8.8.8.8"),
+		NearInfo:           nil,
+		FarInfo: &api.Info{
+			ProbeTTL:          11,
+			ReplyAddress:      net.ParseIP("10.0.0.2"),
+			SentTimestamp:     now,
+			ReceivedTimestamp: now.Add(15 * time.Millisecond),
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
+		t.Fatalf("Failed to encode FIE: %v", err)
+	}
+
+	origReceived := fiesReceived.Load()
+	defer fiesReceived.Store(origReceived)
+
+	receiveFIEs(json.NewDecoder(&buf), "test-addr")
+
+	if fiesReceived.Load() != origReceived+1 {
+		t.Error("fiesReceived counter not incremented")
+	}
+}
+
+func TestReceiveFIEs_FarInfoNil(t *testing.T) {
+	// FIE with FarInfo nil — near hop responded but far hop did not.
+	now := time.Now()
+	fie := api.ForwardingInfoElement{
+		Agent:              api.Agent{AgentID: "test-agent"},
+		ProbingDirectiveID: 42,
+		DestinationAddress: net.ParseIP("8.8.8.8"),
+		NearInfo: &api.Info{
+			ProbeTTL:          10,
+			ReplyAddress:      net.ParseIP("10.0.0.1"),
+			SentTimestamp:     now,
+			ReceivedTimestamp: now.Add(10 * time.Millisecond),
+		},
+		FarInfo: nil,
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
+		t.Fatalf("Failed to encode FIE: %v", err)
+	}
+
+	origReceived := fiesReceived.Load()
+	defer fiesReceived.Store(origReceived)
+
+	receiveFIEs(json.NewDecoder(&buf), "test-addr")
 
 	if fiesReceived.Load() != origReceived+1 {
 		t.Error("fiesReceived counter not incremented")
@@ -589,11 +649,11 @@ func TestMain_FlagParsing(t *testing.T) {
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
 
-	os.Args = []string{"cmd", "-address", "localhost:9999", "-rate", "50"}
+	os.Args = []string{"cmd", "-address", "localhost:9999", "-probing-rate", "50"}
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	address := flag.String("address", "localhost:50050", "Listen address")
-	rate := flag.Int("rate", 10, "Directives per second")
+	rate := flag.Int("probing-rate", 10, "Probing directives per second")
 	flag.Parse()
 
 	if *address != "localhost:9999" {

@@ -8,12 +8,12 @@
 //
 // Usage:
 //
-//	mock-orchestrator [-address localhost:50050] [-rate 10]
+//	mock-orchestrator [-address localhost:50050] [-probing-rate 10]
 //
 // Flags:
 //
-//	-address  Listen address (default: localhost:50050)
-//	-rate     Directives per second (default: 10)
+//	-address       Listen address (default: localhost:50050)
+//	-probing-rate  Probing directives per second (default: 10)
 //
 // The mock generates diverse test traffic including:
 //   - IPv4 and IPv6 destinations
@@ -44,11 +44,11 @@ var (
 )
 
 func main() {
-	address := flag.String("address", "localhost:50050", "Listen address")
-	rate := flag.Int("rate", 10, "Directives per second")
+	addr := flag.String("address", "localhost:50050", "Listen address")
+	rate := flag.Int("probing-rate", 10, "Probing directives per second")
 	flag.Parse()
 
-	listener, err := net.Listen("tcp", *address)
+	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
@@ -58,9 +58,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("Mock orchestrator listening on %s (sending %d PDs/sec)", *address, *rate)
+	log.Printf("Mock orchestrator listening on %s (sending %d PDs/s)", *addr, *rate)
 
-	// Periodic stats reporting
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -72,7 +71,7 @@ func main() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
 
@@ -82,6 +81,7 @@ func main() {
 }
 
 // reportStats logs current throughput statistics.
+// The early return on sent == 0 avoids a division by zero before any PDs have been sent.
 func reportStats() {
 	sent := pdsSent.Load()
 	received := fiesReceived.Load()
@@ -100,6 +100,8 @@ func reportStats() {
 }
 
 // handleAgent manages a connection with a single agent, sending PDs and receiving FIEs.
+// receiveFIEs runs in a separate goroutine so that sending and receiving can proceed
+// concurrently on the same connection. sendPDs blocks until the connection closes.
 func handleAgent(conn net.Conn, rate int) {
 	remoteAddr := conn.RemoteAddr().String()
 
@@ -113,14 +115,10 @@ func handleAgent(conn net.Conn, rate int) {
 	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)
 
-	// Start goroutine to receive FIEs from agent
 	go receiveFIEs(decoder, remoteAddr)
-
-	// Send PDs to the agent at specified rate
 	sendPDs(encoder, remoteAddr, rate)
 }
 
-// receiveFIEs continuously receives and logs FIEs from the agent.
 func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 	for {
 		var fie api.ForwardingInfoElement
@@ -133,12 +131,24 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 
 		fiesReceived.Add(1)
 
-		if fie.NearInfo == nil || fie.FarInfo == nil {
+		if fie.NearInfo == nil && fie.FarInfo == nil {
 			log.Printf("[%s] ✓ FIE for PD %d: %s → %s | (no probe response received)",
 				remoteAddr,
 				fie.ProbingDirectiveID,
 				fie.Agent.AgentID,
 				fie.DestinationAddress,
+			)
+			continue
+		}
+
+		if fie.NearInfo == nil || fie.FarInfo == nil {
+			log.Printf("[%s] ✓ FIE for PD %d: %s → %s | (partial probe response: nearInfo=%v farInfo=%v)",
+				remoteAddr,
+				fie.ProbingDirectiveID,
+				fie.Agent.AgentID,
+				fie.DestinationAddress,
+				fie.NearInfo != nil,
+				fie.FarInfo != nil,
 			)
 			continue
 		}
@@ -161,7 +171,6 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 	}
 }
 
-// sendPDs continuously sends probing directives to the agent at the specified rate.
 func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 	ticker := time.NewTicker(time.Second / time.Duration(rate))
 	defer ticker.Stop()
@@ -172,17 +181,16 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		pdCounter++
 
 		if err := encoder.Encode(pd); err != nil {
-			// Handle graceful disconnection - connection closed by client
+			// Pipe errors indicate the agent disconnected cleanly; anything else is unexpected.
 			if strings.Contains(err.Error(), "closed pipe") ||
 				strings.Contains(err.Error(), "broken pipe") {
 				return
 			}
-			// Real error, log and exit
 			log.Printf("[%s] Send error: %v", remoteAddr, err)
 			return
 		}
 
-		pdsSent.Add(1)
+		pdsSent.Add(1) // pdsSent is incremented after a successful encode to avoid counting failed sends.
 
 		var protocol string
 		switch pd.Protocol {
@@ -208,9 +216,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 }
 
 // generatePD creates a deterministic probing directive for testing.
-// It cycles through various IPv4/IPv6 destinations and alternates between ICMP and UDP protocols.
 func generatePD(counter int) *api.ProbingDirective {
-	// List of common destinations to probe (IPv4 and IPv6)
 	destinations := []string{
 		// IPv4
 		"8.8.8.8",        // Google DNS
@@ -231,13 +237,12 @@ func generatePD(counter int) *api.ProbingDirective {
 	ttlOffset := counter % 16
 	ttl := uint8(5 + ttlOffset) // #nosec G115 -- ttlOffset is 0-15, safe for uint8
 
-	// Determine IP version
-	ipVersion := api.IPv4   // ← Start as IPv4
-	if dstIP.To4() == nil { // ← If IPv6, switch to IPv6 ✓ CORRECT!
+	ipVersion := api.IPv4
+	if dstIP.To4() == nil {
 		ipVersion = api.IPv6
 	}
 
-	// Build base directive with common fields
+	// ProbingDirectiveID is 1-indexed so that ID 0 is never used.
 	pd := &api.ProbingDirective{
 		ProbingDirectiveID: uint64(counter + 1), // #nosec G115 -- counter is test value, no overflow
 		AgentID:            "agent-1",
@@ -246,11 +251,9 @@ func generatePD(counter int) *api.ProbingDirective {
 		NearTTL:            ttl,
 	}
 
-	// Alternate between ICMP and UDP
 	useUDP := counter%2 == 0
 
 	if useUDP {
-		// UDP probe with deterministic ports
 		portOffset := counter % 100
 		pd.Protocol = api.UDP
 		pd.NextHeader = api.NextHeader{
@@ -260,7 +263,6 @@ func generatePD(counter int) *api.ProbingDirective {
 			},
 		}
 	} else {
-		// ICMP probe
 		if ipVersion == api.IPv6 {
 			pd.Protocol = api.ICMPv6
 			pd.NextHeader = api.NextHeader{
