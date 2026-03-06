@@ -36,42 +36,35 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dioptra-io/retina-agent/internal/agent"
 )
 
 var (
-	// Agent identity and connection
 	agentID          = flag.String("id", "agent-1", "Unique identifier for this agent")
 	orchestratorAddr = flag.String("address", "localhost:50050", "Orchestrator address (host:port)")
 
-	// Prober configuration
 	proberType = flag.String("prober-type", agent.ProberTypeCaracal,
 		fmt.Sprintf("Prober implementation (%s, %s)", agent.ProberTypeCaracal, agent.ProberTypeMock))
 	proberPath = flag.String("prober-path", "", "Path to prober executable (searches PATH if empty)")
 
-	// Prober tuning
 	writeQueueSize  = flag.Int("write-queue-size", 1000, "Prober write queue buffer size")
 	cleanupInterval = flag.Duration("cleanup-interval", 10*time.Second, "Prober stale probe cleanup interval")
 
-	// Buffer sizes
 	pdsBufferSize  = flag.Int("pds-buffer", 100, "Directives channel buffer size")
 	fiesBufferSize = flag.Int("fies-buffer", 100, "FIEs channel buffer size")
 
-	// Timeouts and deadlines
-	readDeadline        = flag.Duration("read-deadline", 60*time.Second, "Read timeout for orchestrator connection")
+	readDeadline        = flag.Duration("read-deadline", 10*time.Second, "Read timeout for orchestrator connection")
 	writeDeadline       = flag.Duration("write-deadline", 5*time.Second, "Write timeout for orchestrator connection")
 	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "Timeout for individual probe responses")
 	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", 5*time.Minute, "Maximum wait time between reconnection attempts")
 
-	// Error handling
 	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
 
-	// Logging
 	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
-	// Metrics
 	metricsAddr = flag.String("metrics-addr", ":9090", "Address to expose Prometheus metrics on")
 )
 
@@ -106,6 +99,8 @@ func main() {
 	}
 
 	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := agent.NewMetrics(registry, *agentID)
 
 	startMetricsServer(logger, registry, *metricsAddr)
@@ -135,7 +130,8 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 
 	go func() {
 		logger.Info("Starting metrics server", slog.String("addr", addr))
-		if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) { //nolint:gosec
+		//nolint:gosec // G114: metrics endpoint is internal-only; timeout omitted intentionally
+		if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Metrics server failed", slog.Any("err", err))
 		}
 	}()
