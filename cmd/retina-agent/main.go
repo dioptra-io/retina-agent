@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -68,6 +69,21 @@ var (
 	metricsAddr = flag.String("metrics-addr", ":9090", "Address to expose Prometheus metrics on")
 )
 
+// multiFlag allows a flag to be specified multiple times.
+type multiFlag []string
+
+func (f *multiFlag) String() string { return strings.Join(*f, ", ") }
+func (f *multiFlag) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
+
+var proberArgs multiFlag
+
+func init() {
+	flag.Var(&proberArgs, "prober-arg", "Additional argument to pass to the prober (repeatable)")
+}
+
 // agentRun is a variable for dependency injection in tests.
 var agentRun = agent.Run
 
@@ -82,6 +98,7 @@ func main() {
 		Secret:                     os.Getenv("RETINA_SECRET"),
 		ProberType:                 *proberType,
 		ProberPath:                 *proberPath,
+		ProberArgs:                 []string(proberArgs),
 		WriteQueueSize:             *writeQueueSize,
 		CleanupInterval:            *cleanupInterval,
 		PDsBufferSize:              *pdsBufferSize,

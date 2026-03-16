@@ -1,7 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package agent provides configuration for the retina network measurement agent.
 package agent
 
 import (
@@ -100,7 +99,7 @@ type Config struct {
 //   - WriteQueueSize: 1000 (balances memory vs. throughput)
 //   - CleanupInterval: 10s (removes stale probes periodically)
 //   - Buffer sizes: 100 (balances memory vs. throughput)
-//   - ReadDeadline: 60s (tolerates slow networks)
+//   - ReadDeadline: 10s (tolerates slow networks)
 //   - WriteDeadline: 5s (fail fast on write issues)
 //   - ProbeTimeout: 5s (standard timeout for network probes)
 //   - MaxReconnectBackoff: 5m (caps exponential backoff)

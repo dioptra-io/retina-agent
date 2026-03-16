@@ -62,9 +62,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// caracalRTTUnit is the duration of one RTT unit as reported by caracal (1/10 of a millisecond).
+// See: caracal documentation, field `rtt` is a 16-bit integer in units of 0.1ms.
+const caracalRTTUnit = 100 * time.Microsecond
+
 // CaracalProber implements high-throughput probing using caracal.
 // It uses a pipelined architecture for maximum throughput.
-type CaracalProber struct {
+type caracalProber struct {
 	// Caracal subprocess management
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
@@ -110,8 +114,9 @@ type probeRequest struct {
 	resultCh chan *ProbeResult
 }
 
-// NewCaracalProber creates and starts a caracal prober.
-var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*CaracalProber, error) {
+// NewCaracalProber is a package-level variable to allow overriding in tests.
+// Note: tests that override this cannot run in parallel.
+var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*caracalProber, error) {
 	cmd, stdin, stdout, stderr, err := setupCaracalProcess(cfg, logger)
 	if err != nil {
 		return nil, err
@@ -125,7 +130,7 @@ var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) 
 		queueSize = 1000
 	}
 
-	p := &CaracalProber{
+	p := &caracalProber{
 		cmd:        cmd,
 		stdin:      stdin,
 		csvWriter:  csv.NewWriter(stdin),
@@ -257,7 +262,7 @@ func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp i
 //  3. Waits for the result from the reader loop (or timeout)
 //
 // The actual probing happens asynchronously via writerLoop → caracal → network.
-func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
 
@@ -301,8 +306,10 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	case result := <-resultCh:
 		return result, nil
 	case <-timeout.C:
+		// SentTime is approximated as the queue time; actual send time
+		// may be later depending on writerLoop backpressure.
 		return &ProbeResult{
-			SentTime: time.Now().Add(-p.config.ProbeTimeout),
+			SentTime: now,
 			TimedOut: true,
 		}, nil
 	case <-ctx.Done():
@@ -311,7 +318,7 @@ func (p *CaracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 }
 
 // writerLoop continuously processes the write queue and sends probes to caracal.
-func (p *CaracalProber) writerLoop(ctx context.Context) error {
+func (p *caracalProber) writerLoop(ctx context.Context) error {
 	defer func() {
 		if err := p.stdin.Close(); err != nil {
 			p.logger.Error("Failed to close caracal stdin", slog.Any("err", err))
@@ -332,7 +339,7 @@ func (p *CaracalProber) writerLoop(ctx context.Context) error {
 }
 
 // encodeAndSendProbe formats a probe request as CSV and writes it to caracal's stdin.
-func (p *CaracalProber) encodeAndSendProbe(req *probeRequest) error {
+func (p *caracalProber) encodeAndSendProbe(req *probeRequest) error {
 	pd := req.pd
 
 	firstHalfWord, secondHalfWord := extractHalfWords(pd)
@@ -353,7 +360,7 @@ func (p *CaracalProber) encodeAndSendProbe(req *probeRequest) error {
 }
 
 // readerLoop continuously reads results from caracal's stdout.
-func (p *CaracalProber) readerLoop(ctx context.Context) error {
+func (p *caracalProber) readerLoop(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -376,7 +383,7 @@ func (p *CaracalProber) readerLoop(ctx context.Context) error {
 }
 
 // handleResult parses a result and sends it to the waiting goroutine.
-func (p *CaracalProber) handleResult(record []string) error {
+func (p *caracalProber) handleResult(record []string) error {
 	// CSV fields: capture_timestamp, probe_protocol, probe_src_addr, probe_dst_addr,
 	// probe_src_port, probe_dst_port, probe_ttl, quoted_ttl, reply_src_addr,
 	// reply_protocol, reply_icmp_type, reply_icmp_code, reply_ttl, reply_size,
@@ -392,7 +399,7 @@ func (p *CaracalProber) handleResult(record []string) error {
 		return nil
 	}
 
-	key, err := buildProbeKey(record)
+	key, err := buildProbeKey(record, result.SentTime)
 	if err != nil {
 		return err
 	}
@@ -414,8 +421,7 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 
 	if rttStr := record[15]; rttStr != "" {
 		if rtt, err := strconv.ParseInt(rttStr, 10, 64); err == nil {
-			rttMicros := rtt * 100
-			result.SentTime = result.ReceivedTime.Add(-time.Duration(rttMicros) * time.Microsecond)
+			result.SentTime = result.ReceivedTime.Add(-time.Duration(rtt) * caracalRTTUnit)
 		}
 	}
 
@@ -443,36 +449,8 @@ func normalizeIPAddress(addr string) string {
 	return ip.String()
 }
 
-// parseSentTime extracts the sent timestamp from a CSV record for correlation.
-func parseSentTime(record []string) (time.Time, error) {
-	var receivedTime time.Time
-	if captureTS := record[0]; captureTS != "" {
-		if ts, err := strconv.ParseInt(captureTS, 10, 64); err == nil {
-			receivedTime = time.Unix(ts, 0)
-		}
-	}
-
-	if receivedTime.IsZero() {
-		return time.Time{}, fmt.Errorf("missing received time for correlation")
-	}
-
-	var sentTime time.Time
-	if rttStr := record[15]; rttStr != "" {
-		if rtt, err := strconv.ParseInt(rttStr, 10, 64); err == nil {
-			rttMicros := rtt * 100
-			sentTime = receivedTime.Add(-time.Duration(rttMicros) * time.Microsecond)
-		}
-	}
-
-	if sentTime.IsZero() {
-		return time.Time{}, fmt.Errorf("missing sent time for correlation")
-	}
-
-	return sentTime, nil
-}
-
 // buildProbeKey constructs a correlation key from the CSV record.
-func buildProbeKey(record []string) (probeKey, error) {
+func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 	protocol, err := strconv.ParseUint(record[1], 10, 8)
 	if err != nil {
 		return probeKey{}, fmt.Errorf("invalid protocol: %s", record[1])
@@ -493,11 +471,6 @@ func buildProbeKey(record []string) (probeKey, error) {
 	secondHalfWord, err := strconv.ParseUint(record[5], 10, 16)
 	if err != nil {
 		return probeKey{}, fmt.Errorf("invalid second half word: %s", record[5])
-	}
-
-	sentTime, err := parseSentTime(record)
-	if err != nil {
-		return probeKey{}, err
 	}
 
 	var protoType api.Protocol
@@ -523,7 +496,7 @@ func buildProbeKey(record []string) (probeKey, error) {
 }
 
 // matchAndDeliverResult attempts to match the result with an in-flight probe and deliver it.
-func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
+func (p *caracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
 	// Try to match with up to 2 seconds tolerance for timing variations.
 	// The result has correlationSecond from caracal's timestamps (sent time).
 	// The in-flight map has correlationSecond from Go's system clock (queued time).
@@ -557,7 +530,7 @@ func (p *CaracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 }
 
 // cleanupLoop periodically removes stale probes.
-func (p *CaracalProber) cleanupLoop(ctx context.Context) error {
+func (p *caracalProber) cleanupLoop(ctx context.Context) error {
 	interval := p.config.CleanupInterval
 	if interval <= 0 {
 		interval = 10 * time.Second
@@ -577,7 +550,7 @@ func (p *CaracalProber) cleanupLoop(ctx context.Context) error {
 }
 
 // cleanupStaleProbes removes probes older than timeout.
-func (p *CaracalProber) cleanupStaleProbes() {
+func (p *caracalProber) cleanupStaleProbes() {
 	now := time.Now()
 	cutoff := now.Add(-p.config.ProbeTimeout - 5*time.Second)
 
@@ -599,7 +572,7 @@ func (p *CaracalProber) cleanupStaleProbes() {
 }
 
 // logStderr logs caracal's stderr output at DEBUG level.
-func (p *CaracalProber) logStderr(ctx context.Context) error {
+func (p *caracalProber) logStderr(ctx context.Context) error {
 	scanner := bufio.NewScanner(p.stderr)
 	for scanner.Scan() {
 		select {
@@ -607,7 +580,7 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		p.logger.Info(scanner.Text(), slog.String("source", "caracal"))
+		p.logger.Debug(scanner.Text(), slog.String("source", "caracal"))
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -616,19 +589,14 @@ func (p *CaracalProber) logStderr(ctx context.Context) error {
 	return nil
 }
 
-// Close stops caracal and cleans up.
-func (p *CaracalProber) Close() error {
+func (p *caracalProber) Close() error {
 	p.cancel()
-
-	err := p.g.Wait()
-
 	if p.cmd != nil && p.cmd.Process != nil {
 		if killErr := p.cmd.Process.Kill(); killErr != nil {
 			p.logger.Error("Failed to kill caracal", slog.Any("err", killErr))
 		}
 	}
-
-	return err
+	return p.g.Wait()
 }
 
 // protocolToString converts api.Protocol to caracal's protocol string.

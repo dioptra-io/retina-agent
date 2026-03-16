@@ -1389,7 +1389,7 @@ func TestCreateProber_CaracalError(t *testing.T) {
 	defer func() { NewCaracalProber = origNewCaracalProber }()
 
 	expectedErr := errors.New("caracal binary not found")
-	NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*CaracalProber, error) {
+	NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (*caracalProber, error) {
 		return nil, expectedErr
 	}
 
@@ -1433,6 +1433,17 @@ func TestValidatePD_AllBranches(t *testing.T) {
 				AgentID:            "a",
 				NearTTL:            0,
 				DestinationAddress: []byte{1},
+			},
+			wantErr: true,
+		},
+		{
+			name: "nearttl-255",
+			pd: &api.ProbingDirective{
+				AgentID:            "a",
+				NearTTL:            255,
+				DestinationAddress: []byte{1},
+				Protocol:           api.ICMP,
+				NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
 			},
 			wantErr: true,
 		},

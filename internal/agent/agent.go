@@ -438,7 +438,9 @@ func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult,
 //  2. Add a case to this switch
 //  3. Update ProberType documentation in config.go
 //
-// This is a var (not func) to allow mocking in tests.
+// This is a package-level variable (not a func) to allow overriding in tests.
+// Tests that override this cannot run in parallel.g in tests.
+// Note: tests that override this cannot run in parallel.
 var createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Prober, error) {
 	switch cfg.ProberType {
 	case "mock":
@@ -464,6 +466,9 @@ func validatePD(pd *api.ProbingDirective) error {
 	}
 	if pd.NearTTL == 0 {
 		return fmt.Errorf("%w: TTL cannot be zero", ErrInvalidDirective)
+	}
+	if pd.NearTTL == 255 {
+		return fmt.Errorf("NearTTL %d would produce overflow farTTL", pd.NearTTL)
 	}
 
 	switch pd.Protocol {

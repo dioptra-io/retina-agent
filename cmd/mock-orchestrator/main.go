@@ -26,11 +26,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
 	"net"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -40,8 +40,10 @@ import (
 var (
 	pdsSent      atomic.Int64
 	fiesReceived atomic.Int64
-	startTime    = time.Now()
 )
+
+// startTime is set once at program start and never written after that.
+var startTime = time.Now()
 
 func main() {
 	addr := flag.String("address", "localhost:50050", "Listen address")
@@ -182,8 +184,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 
 		if err := encoder.Encode(pd); err != nil {
 			// Pipe errors indicate the agent disconnected cleanly; anything else is unexpected.
-			if strings.Contains(err.Error(), "closed pipe") ||
-				strings.Contains(err.Error(), "broken pipe") {
+			if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Printf("[%s] Send error: %v", remoteAddr, err)

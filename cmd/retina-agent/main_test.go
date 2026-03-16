@@ -10,6 +10,7 @@
 // - runWithReconnect: 100% - All reconnection scenarios and shutdown paths
 // - Config validation: 100% - All validation rules
 // - newLogger: 100% - All log levels including invalid fallback
+// - multiFlag: 100% - Set and String methods
 // - main(): 0% (untested) - Standard practice for main functions with os.Exit
 //
 // ## Testing Strategy
@@ -403,6 +404,7 @@ func TestConfig_Validation(t *testing.T) {
 // ============================================================================
 // UNIT TESTS - Logging
 // ============================================================================
+
 func TestNewLogger_Levels(t *testing.T) {
 	t.Parallel()
 
@@ -473,6 +475,7 @@ func TestStartMetricsServer(t *testing.T) {
 		t.Errorf("metrics server returned %d, want 200", resp.StatusCode)
 	}
 }
+
 func TestStartMetricsServer_InvalidAddr(t *testing.T) {
 	t.Parallel()
 
@@ -482,4 +485,26 @@ func TestStartMetricsServer_InvalidAddr(t *testing.T) {
 
 	// Give the goroutine time to hit the error path
 	time.Sleep(50 * time.Millisecond)
+}
+
+// ============================================================================
+// UNIT TESTS - multiFlag
+// ============================================================================
+
+func TestMultiFlag(t *testing.T) {
+	t.Parallel()
+
+	var f multiFlag
+	if err := f.Set("--probing-rate"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := f.Set("100000"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(f) != 2 {
+		t.Errorf("expected 2 values, got %d", len(f))
+	}
+	if f.String() != "--probing-rate, 100000" {
+		t.Errorf("unexpected String(): %s", f.String())
+	}
 }

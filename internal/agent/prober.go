@@ -1,7 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package agent implements the network probing pipeline for retina-agent.
 package agent
 
 import (

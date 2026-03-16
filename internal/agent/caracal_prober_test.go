@@ -199,7 +199,7 @@ func makeProbe() *api.ProbingDirective {
 }
 
 // NewCaracalProberMock creates a CaracalProber with injected stdin/stdout/stderr for testing.
-func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) (*CaracalProber, error) {
+func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) (*caracalProber, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -208,7 +208,7 @@ func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadClose
 		queueSize = 1000
 	}
 
-	p := &CaracalProber{
+	p := &caracalProber{
 		cmd:        nil,
 		stdin:      stdin,
 		csvWriter:  csv.NewWriter(stdin),
@@ -561,8 +561,14 @@ func TestBuildProbeKey(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			key, err := buildProbeKey(tt.record)
-
+			result, parseErr := parseProbeResult(tt.record)
+			var key probeKey
+			var err error
+			if parseErr != nil {
+				err = parseErr
+			} else {
+				key, err = buildProbeKey(tt.record, result.SentTime)
+			}
 			if tt.expectError {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -657,20 +663,16 @@ func TestParseSentTime(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			sentTime, err := parseSentTime(tt.record)
-
+			result, err := parseProbeResult(tt.record)
 			if tt.expectError {
 				if err == nil {
 					t.Error("expected error, got nil")
-				}
-				if !sentTime.IsZero() {
-					t.Error("expected zero time on error")
 				}
 			} else {
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
-				if sentTime.IsZero() {
+				if result.SentTime.IsZero() {
 					t.Error("expected non-zero time")
 				}
 			}
@@ -918,7 +920,7 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 	ctx_prober, cancel_prober := context.WithCancel(context.Background())
 	g, gctx := errgroup.WithContext(ctx_prober)
 
-	prober := &CaracalProber{
+	prober := &caracalProber{
 		cmd:        nil,
 		stdin:      stdin,
 		csvWriter:  csv.NewWriter(stdin),
@@ -1440,7 +1442,7 @@ func TestEncodeAndSendProbeCSVWriterInErrorState(t *testing.T) {
 	_ = csvWriter.Write([]string{"test", "data"})
 	csvWriter.Flush()
 
-	prober := &CaracalProber{
+	prober := &caracalProber{
 		csvWriter: csvWriter,
 		stdin:     w,
 		metrics:   testMetrics(),
@@ -1584,7 +1586,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
-	prober := &CaracalProber{
+	prober := &caracalProber{
 		cmd:        nil,
 		stdin:      stdin,
 		csvWriter:  csv.NewWriter(stdin),
@@ -1658,7 +1660,7 @@ func TestWriterLoopError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
-	prober := &CaracalProber{
+	prober := &caracalProber{
 		cmd:        nil,
 		stdin:      w,
 		csvWriter:  csv.NewWriter(w),
@@ -1723,7 +1725,7 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
-	prober := &CaracalProber{
+	prober := &caracalProber{
 		cmd:        nil,
 		stdin:      stdinWriter,
 		csvWriter:  csv.NewWriter(stdinWriter),
