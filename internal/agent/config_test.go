@@ -102,7 +102,7 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.OrchestratorAddr == "" {
 		t.Error("OrchestratorAddr should not be empty")
 	}
-	if cfg.Secret != "" {
+	if cfg.SecretString != "" {
 		t.Error("Secret should be empty by default (no auth)")
 	}
 	if cfg.ReadDeadline <= 0 {
@@ -300,7 +300,7 @@ func TestValidate_Secret(t *testing.T) {
 			secret:  "",
 			wantErr: false,
 		},
-		{
+		{ // #nosec G101
 			name:    "valid strong secret",
 			secret:  "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
 			wantErr: false,
@@ -371,7 +371,7 @@ func TestValidate_Secret(t *testing.T) {
 			t.Parallel()
 
 			cfg := validConfig()
-			cfg.Secret = tt.secret
+			cfg.SecretString = tt.secret
 
 			err := cfg.Validate()
 			if tt.wantErr {

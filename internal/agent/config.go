@@ -30,10 +30,10 @@ type Config struct {
 	// OrchestratorAddr is the TCP address of the orchestrator (host:port).
 	OrchestratorAddr string
 
-	// Secret is the authentication credential shared between agent and orchestrator.
+	// SecretString is the authentication credential shared between agent and orchestrator.
 	// If empty, authentication is disabled.
 	// Both agent and orchestrator must know this value for authentication to succeed.
-	Secret string
+	SecretString string
 
 	// ReadDeadline is the timeout for receiving messages from orchestrator.
 	// Should be longer than expected message intervals.
@@ -111,7 +111,7 @@ func DefaultConfig() *Config {
 
 		// Orchestrator Connection
 		OrchestratorAddr:           "localhost:50050",
-		Secret:                     "", // Empty = no authentication
+		SecretString:               "", // Empty = no authentication
 		ReadDeadline:               10 * time.Second,
 		WriteDeadline:              5 * time.Second,
 		MaxReconnectBackoff:        5 * time.Minute,
@@ -187,21 +187,21 @@ func (c *Config) validateConnection() error {
 
 // validateSecret checks that the secret meets security requirements if provided.
 func (c *Config) validateSecret() error {
-	if c.Secret == "" {
+	if c.SecretString == "" {
 		return nil // Empty is valid (no authentication)
 	}
 
 	// Check for obviously weak/test secrets FIRST (even if they're short)
 	weakSecrets := []string{"test", "secret", "password", "123456", "abc123", "changeme"}
 	for _, weak := range weakSecrets {
-		if c.Secret == weak {
+		if c.SecretString == weak {
 			return fmt.Errorf("secret '%s' is a known weak/test value; use a strong randomly-generated secret", weak)
 		}
 	}
 
 	// Check minimum length (at least 16 characters for security)
-	if len(c.Secret) < 16 {
-		return fmt.Errorf("secret is too short (%d chars); use at least 16 characters for security (generate with: openssl rand -hex 32)", len(c.Secret))
+	if len(c.SecretString) < 16 {
+		return fmt.Errorf("secret is too short (%d chars); use at least 16 characters for security (generate with: openssl rand -hex 32)", len(c.SecretString))
 	}
 
 	return nil

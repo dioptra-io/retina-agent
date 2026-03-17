@@ -1710,7 +1710,7 @@ func TestAuthenticate_Success(t *testing.T) {
 	}
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1762,7 +1762,7 @@ func TestAuthenticate_Rejected(t *testing.T) {
 			}
 
 			a := &agent{
-				config:  &Config{AgentID: "test-agent", Secret: "wrong-secret"},
+				config:  &Config{AgentID: "test-agent", SecretString: "wrong-secret"},
 				logger:  testLogger(),
 				metrics: testMetrics(),
 			}
@@ -1800,7 +1800,7 @@ func TestAuthenticate_ReadError(t *testing.T) {
 			conn.readErr = tt.readErr
 
 			a := &agent{
-				config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+				config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 				logger:  testLogger(),
 				metrics: testMetrics(),
 			}
@@ -1824,7 +1824,7 @@ func TestAuthenticate_WriteError(t *testing.T) {
 	conn.writeErr = errors.New("connection broken")
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1846,7 +1846,7 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 	conn.readBuf.WriteString("{invalid json")
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1874,7 +1874,7 @@ func TestAuthenticate_EmptySecret(t *testing.T) {
 	}
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: ""},
+		config:  &Config{AgentID: "test-agent", SecretString: ""},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1899,7 +1899,7 @@ func TestAuthenticate_SetWriteDeadlineError(t *testing.T) {
 	conn.setWriteDeadlineErr = errors.New("failed to set deadline")
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1929,7 +1929,7 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 	conn.setReadDeadlineErr = errors.New("failed to set read deadline")
 
 	a := &agent{
-		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
+		config:  &Config{AgentID: "test-agent", SecretString: "test-secret-1234567890"},
 		logger:  testLogger(),
 		metrics: testMetrics(),
 	}
@@ -1978,7 +1978,7 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 	cfg := &Config{
 		AgentID:          "test-agent",
 		OrchestratorAddr: listener.Addr().String(),
-		Secret:           "wrong-secret-1234567890",
+		SecretString:     "wrong-secret-1234567890",
 		ProberType:       ProberTypeMock,
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
@@ -2059,7 +2059,7 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 	cfg := &Config{
 		AgentID:          "test-agent",
 		OrchestratorAddr: serverAddr,
-		Secret:           "correct-secret-1234567890",
+		SecretString:     "correct-secret-1234567890",
 		ProberType:       ProberTypeMock,
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
@@ -2136,7 +2136,7 @@ func TestRun_NoAuthentication(t *testing.T) {
 	cfg := &Config{
 		AgentID:          "test-agent",
 		OrchestratorAddr: serverAddr,
-		Secret:           "",
+		SecretString:     "",
 		ProberType:       ProberTypeMock,
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,

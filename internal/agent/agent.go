@@ -98,7 +98,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		slog.String("address", a.config.OrchestratorAddr))
 
 	// Authenticate if secret is configured
-	if a.config.Secret != "" {
+	if a.config.SecretString != "" {
 		if err := a.authenticate(conn); err != nil {
 			return fmt.Errorf("authentication failed: %w", err)
 		}
@@ -134,7 +134,7 @@ func (a *agent) authenticate(conn net.Conn) error {
 
 	authReq := &api.AuthRequest{
 		AgentID: a.config.AgentID,
-		Secret:  a.config.Secret,
+		Secret:  a.config.SecretString,
 	}
 
 	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {

@@ -95,7 +95,7 @@ func main() {
 	cfg := &agent.Config{
 		AgentID:                    *agentID,
 		OrchestratorAddr:           *orchestratorAddr,
-		Secret:                     os.Getenv("RETINA_SECRET"),
+		SecretString:               os.Getenv("RETINA_SECRET"),
 		ProberType:                 *proberType,
 		ProberPath:                 *proberPath,
 		ProberArgs:                 []string(proberArgs),
