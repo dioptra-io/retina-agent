@@ -1,13 +1,8 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// ## Test Coverage
-//
-// Current coverage: 100%
-//
-// MockProber is a simple test double with no external dependencies or
-// unreachable error paths. All code paths (successful probes, timeouts,
-// context cancellation, and concurrent access) are tested.
+// All code paths (successful probes, timeouts, context cancellation, and
+// concurrent access) are tested.
 
 package agent
 
@@ -24,7 +19,6 @@ import (
 // TEST HELPER FUNCTIONS
 // ============================================================================
 
-// makeProbingDirective creates a minimal ProbingDirective for testing.
 func makeProbingDirective(dest string, proto api.Protocol) *api.ProbingDirective {
 	return &api.ProbingDirective{
 		ProbingDirectiveID: 1,
@@ -52,9 +46,7 @@ func TestMockProber_SuccessfulProbe(t *testing.T) {
 		t.Fatalf("Probe failed: %v", err)
 	}
 
-	// Either timeout or success is valid
 	if result.TimedOut {
-		// Timeout case
 		if result.SentTime.IsZero() {
 			t.Error("SentTime should be set even for timeouts")
 		}
@@ -62,7 +54,6 @@ func TestMockProber_SuccessfulProbe(t *testing.T) {
 			t.Error("ReceivedTime should be zero for timeout")
 		}
 	} else {
-		// Success case
 		if result.ReplyAddress == nil {
 			t.Error("ReplyAddress should not be nil for successful probe")
 		}
@@ -91,7 +82,7 @@ func TestMockProber_Timestamps(t *testing.T) {
 	pd := makeProbingDirective("1.1.1.1", api.ICMP)
 	ctx := context.Background()
 
-	// Run multiple probes to eventually get a successful one
+	// Run multiple probes to eventually get a successful one.
 	var successResult *ProbeResult
 	for i := 0; i < 50; i++ {
 		result, err := prober.Probe(ctx, pd, 15)
@@ -109,7 +100,6 @@ func TestMockProber_Timestamps(t *testing.T) {
 		return
 	}
 
-	// Verify timestamp ordering
 	if successResult.SentTime.IsZero() {
 		t.Error("SentTime should not be zero")
 	}
@@ -121,7 +111,7 @@ func TestMockProber_Timestamps(t *testing.T) {
 			successResult.ReceivedTime, successResult.SentTime)
 	}
 
-	// RTT should be reasonable (10-100ms as per implementation)
+	// RTT should be in the 10-100ms range as per implementation.
 	rtt := successResult.ReceivedTime.Sub(successResult.SentTime)
 	if rtt < 10*time.Millisecond || rtt > 150*time.Millisecond {
 		t.Errorf("RTT %v outside expected range [10ms, 150ms]", rtt)
@@ -138,7 +128,7 @@ func TestMockProber_TimeoutBehavior(t *testing.T) {
 	pd := makeProbingDirective("8.8.8.8", api.UDP)
 	ctx := context.Background()
 
-	// Run many probes to verify timeout rate is approximately 10%
+	// Run many probes to verify the timeout rate is approximately 10%.
 	const numProbes = 200
 	timeouts := 0
 
@@ -149,7 +139,6 @@ func TestMockProber_TimeoutBehavior(t *testing.T) {
 		}
 		if result.TimedOut {
 			timeouts++
-			// Verify timeout has SentTime but no ReceivedTime
 			if result.SentTime.IsZero() {
 				t.Error("Timeout should have SentTime set")
 			}
@@ -160,7 +149,7 @@ func TestMockProber_TimeoutBehavior(t *testing.T) {
 	}
 
 	timeoutRate := float64(timeouts) / float64(numProbes)
-	// Allow range of 5%-20% (10% ± 50% tolerance for randomness)
+	// Allow 5%-20% (10% ± 50% tolerance for randomness).
 	if timeoutRate < 0.05 || timeoutRate > 0.20 {
 		t.Errorf("Timeout rate %.2f%% outside expected range [5%%, 20%%]", timeoutRate*100)
 	}
@@ -175,9 +164,8 @@ func TestMockProber_ContextCancellation(t *testing.T) {
 
 	pd := makeProbingDirective("8.8.8.8", api.UDP)
 
-	// Create context that we'll cancel immediately
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	result, err := prober.Probe(ctx, pd, 10)
 
@@ -198,7 +186,7 @@ func TestMockProber_ContextTimeout(t *testing.T) {
 
 	pd := makeProbingDirective("8.8.8.8", api.UDP)
 
-	// Create context with very short timeout (shorter than min delay of 10ms)
+	// 1ms is shorter than the minimum 10ms probe delay.
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
 
@@ -222,7 +210,6 @@ func TestMockProber_ConcurrentProbes(t *testing.T) {
 	pd := makeProbingDirective("8.8.8.8", api.UDP)
 	ctx := context.Background()
 
-	// Launch 10 concurrent probes
 	const numGoroutines = 10
 	done := make(chan error, numGoroutines)
 
@@ -237,7 +224,6 @@ func TestMockProber_ConcurrentProbes(t *testing.T) {
 				done <- nil
 				return
 			}
-			// Verify result makes sense
 			if !result.TimedOut {
 				if result.SentTime.IsZero() || result.ReceivedTime.IsZero() {
 					done <- nil
@@ -248,7 +234,6 @@ func TestMockProber_ConcurrentProbes(t *testing.T) {
 		}(i)
 	}
 
-	// Wait for all goroutines
 	for i := 0; i < numGoroutines; i++ {
 		if err := <-done; err != nil {
 			t.Errorf("Concurrent probe %d failed: %v", i, err)
@@ -340,7 +325,7 @@ func TestMockProber_Close(t *testing.T) {
 		t.Errorf("Close() returned error: %v", err)
 	}
 
-	// Close should be idempotent
+	// Close should be idempotent.
 	err = prober.Close()
 	if err != nil {
 		t.Errorf("Second Close() returned error: %v", err)
