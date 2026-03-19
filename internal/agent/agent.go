@@ -97,14 +97,13 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 	a.logger.Info("Connected to orchestrator",
 		slog.String("address", a.config.OrchestratorAddr))
 
-	// Authenticate if secret is configured
-	if a.config.Secret != "" {
-		if err := a.authenticate(conn); err != nil {
-			return fmt.Errorf("authentication failed: %w", err)
-		}
-		a.logger.Info("Authentication enabled — authenticated successfully")
-	} else {
+	if err := a.authenticate(conn); err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+	if a.config.Secret == "" {
 		a.logger.Warn("Authentication disabled — not recommended for production")
+	} else {
+		a.logger.Info("Authentication enabled — authenticated successfully")
 	}
 
 	pds := make(chan *api.ProbingDirective, a.config.PDsBufferSize)
