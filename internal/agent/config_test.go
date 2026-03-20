@@ -1,6 +1,8 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
+// This file achieves 100% coverage of config.go.
+
 //nolint:funlen // Test functions can be long for readability
 package agent
 
@@ -13,15 +15,13 @@ import (
 )
 
 // ============================================================================
-// TEST HELPER FUNCTIONS
+// TEST HELPERS
 // ============================================================================
 
-// validConfig returns a valid configuration for testing modifications.
 func validConfig() *Config {
 	return DefaultConfig()
 }
 
-// createTempProber creates a temporary executable file for testing ProberPath validation.
 func createTempProber(t *testing.T) string {
 	t.Helper()
 	tmpDir := t.TempDir()
@@ -33,7 +33,6 @@ func createTempProber(t *testing.T) string {
 	return proberPath
 }
 
-// testDurationField is a helper to test time.Duration config fields.
 func testDurationField(t *testing.T, fieldName string, setField func(*Config, time.Duration)) {
 	t.Helper()
 	t.Parallel()
@@ -93,12 +92,9 @@ func TestDefaultConfig(t *testing.T) {
 
 	cfg := DefaultConfig()
 
-	// Agent Identity
 	if cfg.AgentID == "" {
 		t.Error("AgentID should not be empty")
 	}
-
-	// Orchestrator Connection
 	if cfg.OrchestratorAddr == "" {
 		t.Error("OrchestratorAddr should not be empty")
 	}
@@ -114,8 +110,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxReconnectBackoff <= 0 {
 		t.Error("MaxReconnectBackoff should be positive")
 	}
-
-	// Prober Configuration
 	if cfg.ProberType != ProberTypeMock && cfg.ProberType != ProberTypeCaracal {
 		t.Errorf("ProberType should be mock or caracal, got: %s", cfg.ProberType)
 	}
@@ -128,16 +122,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ProbeTimeout <= 0 {
 		t.Error("ProbeTimeout should be positive")
 	}
-
-	// Pipeline Buffers
 	if cfg.PDsBufferSize <= 0 {
 		t.Error("PDsBufferSize should be positive")
 	}
 	if cfg.FIEsBufferSize <= 0 {
 		t.Error("FIEsBufferSize should be positive")
 	}
-
-	// Should validate successfully
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("DefaultConfig should validate successfully: %v", err)
 	}
@@ -642,6 +632,11 @@ func TestValidate_ProberPath(t *testing.T) {
 		{
 			name:    "relative non-existent path",
 			path:    "./nonexistent",
+			wantErr: true,
+		},
+		{
+			name:    "path is a directory",
+			path:    t.TempDir(),
 			wantErr: true,
 		},
 	}
