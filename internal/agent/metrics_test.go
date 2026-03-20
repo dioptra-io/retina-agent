@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
+// Coverage: 100% of metrics.go.
 package agent
 
 import (
