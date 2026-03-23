@@ -1574,7 +1574,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	g, ctx := errgroup.WithContext(ctx)
+	g, _ := errgroup.WithContext(ctx)
 
 	prober := &caracalProber{
 		cmd:        nil,
