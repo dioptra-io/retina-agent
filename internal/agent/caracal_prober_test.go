@@ -42,7 +42,6 @@ import (
 // TEST HELPER TYPES
 // ============================================================================
 
-// nopWriteCloser wraps bytes.Buffer to implement io.WriteCloser.
 type nopWriteCloser struct {
 	*bytes.Buffer
 }
@@ -83,7 +82,6 @@ func (d *dynamicReadCloser) Close() error {
 	return nil
 }
 
-// errorReader always returns an error on Read.
 type errorReader struct {
 	err error
 }
@@ -96,7 +94,6 @@ func (e *errorReader) Close() error {
 	return nil
 }
 
-// errorOnClose implements io.Closer and returns an error.
 type errorOnClose struct {
 	err error
 }
@@ -105,7 +102,6 @@ func (e *errorOnClose) Close() error {
 	return e.err
 }
 
-// writerWithCloseError writes successfully but fails on Close().
 type writerWithCloseError struct {
 	err error
 }
@@ -118,7 +114,6 @@ func (w *writerWithCloseError) Close() error {
 	return w.err
 }
 
-// slowReader simulates slow stderr reads.
 type slowReader struct {
 	mu    sync.Mutex
 	data  []string
@@ -157,7 +152,6 @@ func (s *slowReader) Close() error {
 	return nil
 }
 
-// flushErrorWriter fails after first successful write.
 type flushErrorWriter struct {
 	mu       sync.Mutex
 	writes   int
@@ -184,7 +178,6 @@ func (f *flushErrorWriter) Close() error {
 // TEST HELPER FUNCTIONS
 // ============================================================================
 
-// makeProbe creates a minimal ProbingDirective for testing.
 func makeProbe() *api.ProbingDirective {
 	return &api.ProbingDirective{
 		Protocol:           api.ICMP,
@@ -198,7 +191,6 @@ func makeProbe() *api.ProbingDirective {
 	}
 }
 
-// NewCaracalProberMock creates a CaracalProber with injected stdin/stdout/stderr for testing.
 func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) (*caracalProber, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
@@ -223,16 +215,14 @@ func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadClose
 		metrics:    testMetrics(),
 	}
 
-	// Skip CSV header like production code does
 	if _, err := p.stdout.Read(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to read CSV header: %w", err)
 	}
 
-	// Start goroutines
 	g.Go(func() error { return p.writerLoop(ctx) })
-	g.Go(func() error { return p.readerLoop(ctx) })
-	g.Go(func() error { return p.logStderr(ctx) })
+	g.Go(func() error { return p.readerLoop() })
+	g.Go(func() error { return p.logStderr() })
 	g.Go(func() error { return p.cleanupLoop(ctx) })
 
 	return p, nil
@@ -1602,7 +1592,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 	}
 
 	_, _ = prober.stdout.Read()
-	g.Go(func() error { return prober.logStderr(ctx) })
+	g.Go(func() error { return prober.logStderr() })
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()

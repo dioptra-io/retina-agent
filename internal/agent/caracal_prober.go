@@ -3,46 +3,17 @@
 
 // caracal_prober.go
 //
-// CaracalProber Architecture:
+// CaracalProber uses a pipelined architecture: caller goroutines queue probe
+// requests via writeQueue, writerLoop serializes them to caracal's stdin, and
+// readerLoop reads results from stdout and delivers them back to callers.
 //
-// This implements a high-throughput network prober using the caracal tool as a
-// subprocess. It uses a pipelined architecture with multiple goroutines for
-// non-blocking operation:
+// Correlation: each probe is keyed by (dst_addr, first_half_word, second_half_word,
+// ttl, protocol, unix_second). Results are matched with ±2 seconds tolerance to
+// handle queue delays and clock variations. Probes must be sent within ~2 seconds
+// of being queued or correlation may fail.
 //
-// 1. Caller goroutines (multiple):
-//   - Call Probe() to request a network probe
-//   - Queue probe request to writeQueue channel
-//   - Wait on a result channel for the probe result
-//
-// 2. writerLoop goroutine (one):
-//   - Continuously reads from writeQueue
-//   - Formats probe specs as CSV
-//   - Writes to caracal's stdin
-//
-// 3. readerLoop goroutine (one):
-//   - Continuously reads CSV results from caracal's stdout
-//   - Correlates results with in-flight probes using a shared map
-//   - Delivers results to waiting caller goroutines
-//
-// 4. cleanupLoop goroutine (one):
-//   - Periodically removes stale/timed-out probes from the in-flight map
-//
-// 5. logStderr goroutine (one):
-//   - Logs caracal's stderr output for debugging
-//
-// Correlation mechanism:
-//   - Each probe is identified by (dst_addr, first_half_word, second_half_word, ttl, protocol, correlation_second)
-//   - When Probe() is called, an entry is added to the in-flight map with this key
-//   - When a result arrives, the key is reconstructed from the result
-//   - A ±2 second time tolerance handles queue delays and clock variations
-//   - ASSUMPTION: Probes are sent within ~2 seconds of being queued
-//     (if writeQueue backpressure causes >2 second delay, correlation may fail)
-//
-// Deduplication:
-//   - Only one probe per unique (destination, ports/fields, TTL, protocol, second)
-//   - If a duplicate is requested while a probe is in-flight, it returns nil
-//   - This prevents sending redundant probes and ensures correlation works correctly
-//   - With proper directive randomization, duplicates should be rare
+// Deduplication: a duplicate probe (same key, already in-flight) is rejected and
+// returns nil. With proper directive randomization, duplicates should be rare.
 package agent
 
 import (
@@ -66,24 +37,19 @@ import (
 // See: caracal documentation, field `rtt` is a 16-bit integer in units of 0.1ms.
 const caracalRTTUnit = 100 * time.Microsecond
 
-// CaracalProber implements high-throughput probing using caracal.
-// It uses a pipelined architecture for maximum throughput.
 type caracalProber struct {
-	// Caracal subprocess management
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
 	csvWriter *csv.Writer
 	stdout    *csv.Reader
 	stderr    io.ReadCloser
 
-	// Probe correlation - maps in-flight probes to waiting goroutines
+	// inFlight maps queued probes to their result channels; also enforces deduplication.
 	inFlight   map[probeKey]*inFlightProbe
 	inFlightMu sync.RWMutex
 
-	// Non-blocking write pipeline
 	writeQueue chan *probeRequest
 
-	// Configuration and lifecycle management
 	config  *Config
 	logger  *slog.Logger
 	metrics *Metrics
@@ -97,17 +63,15 @@ type probeKey struct {
 	firstHalfWord     uint16 // FirstHalfWord for ICMP/ICMPv6, SourcePort for UDP
 	secondHalfWord    uint16 // SecondHalfWord for ICMP/ICMPv6, DestinationPort for UDP
 	ttl               uint8
-	protocol          api.Protocol // Protocol type (ICMP, ICMPv6, UDP)
-	correlationSecond int64        // Unix timestamp for correlation (1-second window)
+	protocol          api.Protocol
+	correlationSecond int64 // Unix timestamp truncated to seconds; matched with ±2s tolerance in readerLoop
 }
 
-// inFlightProbe tracks a probe waiting for a result.
 type inFlightProbe struct {
 	resultCh   chan *ProbeResult
 	queuedTime time.Time
 }
 
-// probeRequest represents a single probe to be sent to caracal.
 type probeRequest struct {
 	pd       *api.ProbingDirective
 	ttl      uint8
@@ -145,7 +109,6 @@ var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) 
 		g:          g,
 	}
 
-	// Skip CSV header
 	if _, err := p.stdout.Read(); err != nil {
 		if killErr := cmd.Process.Kill(); killErr != nil {
 			logger.Error("Failed to kill caracal", slog.Any("err", killErr))
@@ -155,8 +118,8 @@ var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) 
 	}
 
 	g.Go(func() error { return p.writerLoop(ctx) })
-	g.Go(func() error { return p.readerLoop(ctx) })
-	g.Go(func() error { return p.logStderr(ctx) })
+	g.Go(func() error { return p.readerLoop() })
+	g.Go(func() error { return p.logStderr() })
 	g.Go(func() error { return p.cleanupLoop(ctx) })
 
 	return p, nil
@@ -173,9 +136,7 @@ func setupCaracalProcess(cfg *Config, logger *slog.Logger) (cmd *exec.Cmd, stdin
 		caracalPath = "caracal"
 	}
 
-	args := cfg.ProberArgs
-
-	cmd = exec.Command(caracalPath, args...) // #nosec G204 -- caracalPath is user-controlled by design (ProberPath config)
+	cmd = exec.Command(caracalPath, cfg.ProberArgs...) // #nosec G204 -- caracalPath is user-controlled by design (ProberPath config)
 
 	success := false
 
@@ -210,7 +171,6 @@ func setupCaracalProcess(cfg *Config, logger *slog.Logger) (cmd *exec.Cmd, stdin
 	return cmd, stdin, stdout, stderr, nil
 }
 
-// closePipe safely closes a pipe and logs any error.
 func closePipe(pipe io.Closer, name string, logger *slog.Logger) {
 	if pipe != nil {
 		if err := pipe.Close(); err != nil {
@@ -219,7 +179,6 @@ func closePipe(pipe io.Closer, name string, logger *slog.Logger) {
 	}
 }
 
-// extractHalfWords returns the firstHalfWord and secondHalfWord from a directive.
 func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
 	switch pd.Protocol {
 	case api.ICMP:
@@ -241,7 +200,6 @@ func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
 	return 0, 0
 }
 
-// buildProbeKeyFromDirective creates a correlation key from a probe directive.
 func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp int64) probeKey {
 	firstHalf, secondHalf := extractHalfWords(pd)
 	return probeKey{
@@ -254,20 +212,20 @@ func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp i
 	}
 }
 
-// Probe queues a probe request and waits for the result.
+// Probe sends a single probe and blocks until a result arrives, the probe times
+// out, or ctx is cancelled. The actual send happens asynchronously via
+// writerLoop → caracal → network.
 //
-// This function does not directly send the probe - instead it:
-//  1. Registers the request in the in-flight map
-//  2. Queues it to the write queue (non-blocking)
-//  3. Waits for the result from the reader loop (or timeout)
-//
-// The actual probing happens asynchronously via writerLoop → caracal → network.
+// Returns nil, nil if an identical probe is already in-flight (deduplication).
+// Returns a ProbeResult with TimedOut=true on timeout; SentTime is approximated
+// as queue time and may differ from actual send time under backpressure.
+// Returns a non-nil error only if ctx is cancelled.
 func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
-
 	key := buildProbeKeyFromDirective(pd, ttl, now.Unix())
 
+	// Register in-flight entry, rejecting duplicates.
 	p.inFlightMu.Lock()
 	if _, exists := p.inFlight[key]; exists {
 		p.inFlightMu.Unlock()
@@ -277,28 +235,31 @@ func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 		p.metrics.DuplicateProbesTotal.Inc()
 		return nil, nil
 	}
-	p.inFlight[key] = &inFlightProbe{
-		resultCh:   resultCh,
-		queuedTime: now,
-	}
+	p.inFlight[key] = &inFlightProbe{resultCh: resultCh, queuedTime: now}
 	p.metrics.InFlightProbes.Inc()
 	p.inFlightMu.Unlock()
 
 	defer func() {
 		p.inFlightMu.Lock()
+		_, stillPresent := p.inFlight[key]
 		delete(p.inFlight, key)
 		p.inFlightMu.Unlock()
-		p.metrics.InFlightProbes.Dec()
+		// Only decrement if we are the ones removing the key;
+		// cleanupStaleProbes may have already removed and decremented it.
+		if stillPresent {
+			p.metrics.InFlightProbes.Dec()
+		}
 	}()
 
-	req := &probeRequest{pd: pd, ttl: ttl, resultCh: resultCh}
+	// Queue the probe for writerLoop to send.
 	select {
-	case p.writeQueue <- req:
+	case p.writeQueue <- &probeRequest{pd: pd, ttl: ttl, resultCh: resultCh}:
 		p.metrics.WriteQueueDepth.Set(float64(len(p.writeQueue)))
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 
+	// Wait for readerLoop to deliver the result.
 	timeout := time.NewTimer(p.config.ProbeTimeout)
 	defer timeout.Stop()
 
@@ -306,18 +267,14 @@ func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	case result := <-resultCh:
 		return result, nil
 	case <-timeout.C:
-		// SentTime is approximated as the queue time; actual send time
-		// may be later depending on writerLoop backpressure.
-		return &ProbeResult{
-			SentTime: now,
-			TimedOut: true,
-		}, nil
+		// SentTime is approximated as queue time; actual send time may be
+		// later under writerLoop backpressure.
+		return &ProbeResult{SentTime: now, TimedOut: true}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// writerLoop continuously processes the write queue and sends probes to caracal.
 func (p *caracalProber) writerLoop(ctx context.Context) error {
 	defer func() {
 		if err := p.stdin.Close(); err != nil {
@@ -338,7 +295,6 @@ func (p *caracalProber) writerLoop(ctx context.Context) error {
 	}
 }
 
-// encodeAndSendProbe formats a probe request as CSV and writes it to caracal's stdin.
 func (p *caracalProber) encodeAndSendProbe(req *probeRequest) error {
 	pd := req.pd
 
@@ -359,15 +315,10 @@ func (p *caracalProber) encodeAndSendProbe(req *probeRequest) error {
 	return p.csvWriter.Error()
 }
 
-// readerLoop continuously reads results from caracal's stdout.
-func (p *caracalProber) readerLoop(ctx context.Context) error {
+// Cancellation is handled by Close() killing the caracal process, which causes
+// stdout.Read() to return EOF.
+func (p *caracalProber) readerLoop() error {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
 		record, err := p.stdout.Read()
 		if err != nil {
 			if err == io.EOF {
@@ -382,7 +333,6 @@ func (p *caracalProber) readerLoop(ctx context.Context) error {
 	}
 }
 
-// handleResult parses a result and sends it to the waiting goroutine.
 func (p *caracalProber) handleResult(record []string) error {
 	// CSV fields: capture_timestamp, probe_protocol, probe_src_addr, probe_dst_addr,
 	// probe_src_port, probe_dst_port, probe_ttl, quoted_ttl, reply_src_addr,
@@ -409,7 +359,6 @@ func (p *caracalProber) handleResult(record []string) error {
 	return nil
 }
 
-// parseProbeResult extracts timestamps and reply information from a CSV record.
 func parseProbeResult(record []string) (*ProbeResult, error) {
 	result := &ProbeResult{}
 
@@ -450,6 +399,8 @@ func normalizeIPAddress(addr string) string {
 }
 
 // buildProbeKey constructs a correlation key from the CSV record.
+// Note: caracal accepts protocol as a string (e.g. "icmp") but reports it back
+// as a numeric IP protocol number (1=ICMP, 17=UDP, 58=ICMPv6).
 func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 	protocol, err := strconv.ParseUint(record[1], 10, 8)
 	if err != nil {
@@ -495,7 +446,6 @@ func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 	}, nil
 }
 
-// matchAndDeliverResult attempts to match the result with an in-flight probe and deliver it.
 func (p *caracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
 	// Try to match with up to 2 seconds tolerance for timing variations.
 	// The result has correlationSecond from caracal's timestamps (sent time).
@@ -529,7 +479,6 @@ func (p *caracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 		slog.Int64("sent_time", sentTime))
 }
 
-// cleanupLoop periodically removes stale probes.
 func (p *caracalProber) cleanupLoop(ctx context.Context) error {
 	interval := p.config.CleanupInterval
 	if interval <= 0 {
@@ -549,7 +498,6 @@ func (p *caracalProber) cleanupLoop(ctx context.Context) error {
 	}
 }
 
-// cleanupStaleProbes removes probes older than timeout.
 func (p *caracalProber) cleanupStaleProbes() {
 	now := time.Now()
 	cutoff := now.Add(-p.config.ProbeTimeout - 5*time.Second)
@@ -571,15 +519,11 @@ func (p *caracalProber) cleanupStaleProbes() {
 	}
 }
 
-// logStderr logs caracal's stderr output at DEBUG level.
-func (p *caracalProber) logStderr(ctx context.Context) error {
+// Cancellation is handled by Close() killing the caracal process, which causes
+// the scanner to stop.
+func (p *caracalProber) logStderr() error {
 	scanner := bufio.NewScanner(p.stderr)
 	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 		p.logger.Debug(scanner.Text(), slog.String("source", "caracal"))
 	}
 
