@@ -524,7 +524,7 @@ func (p *caracalProber) cleanupStaleProbes() {
 func (p *caracalProber) logStderr() error {
 	scanner := bufio.NewScanner(p.stderr)
 	for scanner.Scan() {
-		p.logger.Debug(scanner.Text(), slog.String("source", "caracal"))
+		p.logger.Info(scanner.Text(), slog.String("source", "caracal"))
 	}
 
 	if err := scanner.Err(); err != nil {
