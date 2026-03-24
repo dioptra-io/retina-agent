@@ -3,32 +3,17 @@
 
 // Package agent provides unit tests for the retina-agent network measurement system.
 //
-// Test Coverage Summary:
-// - Functions at 100%: authenticate, handleDecodeError, processorLoop, writerLoop,
-//   processPD, validatePD, probeResultToInfo, isNetworkError, createProber
-// - Functions at 94-95%: Run (94.3%), readerLoop (95.0%)
+// Intentionally uncovered (94-95% overall):
 //
-// Files not covered by unit tests:
-// - caracal_prober.go: The NewCaracalProber function is mocked in tests. Full caracal
-//   functionality requires the actual caracal binary and is tested via integration tests.
+//   - Run (94.3%): defer conn.Close() and defer prober.Close() error paths are
+//     unreachable in practice; Go returns nil on Close() of a cleanly established
+//     connection.
 //
-// Intentionally Uncovered Lines:
+//   - readerLoop (95.0%): the context cancellation branch inside the select is
+//     timing-dependent and is indirectly covered by TestReaderLoop_ContextCancelled.
 //
-// Run() - 5.7% uncovered:
-//   - conn.Close() error in defer: Nearly impossible to trigger as Close() on already-closed
-//     connections returns nil in Go. Would require corrupting connection state.
-//   - prober.Close() error in defer: Tested separately, but hard to trigger in Run() context.
-//
-// readerLoop() - 5.0% uncovered:
-//   - Read timeout logging (line ~221-223 in handleDecodeError): Already covered by
-//     TestHandleDecodeError_Timeout. The timeout is informational logging that retries.
-//   - Context cancellation during select (line ~208-209): The path exists but is timing-dependent.
-//     Context cancellation is fully tested via TestReaderLoop_ContextCancelled which cancels
-//     before the loop starts. Runtime cancellation during the select statement is a race condition.
-//
-// These uncovered lines are defensive edge cases that don't affect core business logic correctness.
-// The agent has comprehensive test coverage of all critical paths including authentication,
-// directive processing, probe execution, and error handling.
+//   - caracal_prober.go is excluded entirely; NewCaracalProber requires the caracal
+//     binary and is exercised by integration tests.
 
 package agent
 

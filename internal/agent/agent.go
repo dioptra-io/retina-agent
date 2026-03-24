@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -47,21 +48,12 @@ type agent struct {
 	metrics *Metrics
 }
 
-// probeResult wraps a probe result with its error for channel communication.
 type probeResult struct {
 	result *ProbeResult
 	err    error
 }
 
-// Run starts the agent and blocks until context is cancelled or an error occurs.
-//
-// The function establishes a TCP connection to the orchestrator and spawns three
-// goroutines (reader, processor, writer) that communicate via buffered channels.
-// All goroutines are coordinated by errgroup for proper error propagation and
-// graceful shutdown.
-//
-// Returns nil on clean shutdown (context cancelled), or an error if the connection
-// is lost or another failure occurs.
+// Run starts the agent and blocks until the context is cancelled or an error occurs.
 func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics) error {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -124,9 +116,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 	return nil
 }
 
-// authenticate sends authentication request and waits for orchestrator's response.
-// This must be called immediately after connection, before any other messages.
-// Returns error if authentication fails or times out.
+// authenticate must be called immediately after connecting, before any other messages.
 func (a *agent) authenticate(conn net.Conn) error {
 	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)
@@ -157,18 +147,18 @@ func (a *agent) authenticate(conn net.Conn) error {
 		return fmt.Errorf("authentication rejected: %s", authResp.Message)
 	}
 
+	// Intentionally ignore errors: if the connection is already broken,
+	// the next read/write operation will surface the failure.
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
 	return nil
 }
 
-// readerLoop receives and validates ProbingDirective messages from orchestrator via TCP.
-// Each message is a newline-delimited JSON object. Read timeouts are logged and retried.
-// Network errors trigger reconnection; malformed JSON is logged and skipped to handle
-// transient corruption. After MaxConsecutiveDecodeErrors consecutive failures, the
-// connection is terminated (set to 0 to disable this check). Invalid directives are
-// logged and skipped without terminating the connection.
+// readerLoop receives and validates ProbingDirective messages from the orchestrator.
+// After MaxConsecutiveDecodeErrors consecutive JSON failures the connection is
+// terminated (set to 0 to disable). Closing pds on return signals processorLoop
+// to drain in-flight goroutines and exit.
 func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
 	defer close(pds)
 	decoder := json.NewDecoder(conn)
@@ -212,23 +202,18 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 	}
 }
 
-// handleDecodeError processes JSON decode errors during directive reception.
-// Returns (shouldContinue, newErrorCount, wrappedError) where shouldContinue indicates
-// whether to retry reading, newErrorCount is the updated consecutive error count,
-// and wrappedError is the error to return if shouldContinue is false.
+// handleDecodeError classifies a JSON decode error and decides whether to retry.
+// Returns (shouldContinue, updatedErrorCount, errorToReturn).
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
-	// Check for read timeout (expected, just retry)
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		if ctx.Err() != nil {
-			return false, consecutiveErrors, ctx.Err()
-		}
-		a.logger.Debug("Read timeout, no data received")
-		return true, consecutiveErrors, nil
-	}
-
-	// Check for context cancellation (clean shutdown)
+	// Check for context cancellation first, regardless of error type.
 	if ctx.Err() != nil {
 		return false, consecutiveErrors, ctx.Err()
+	}
+
+	// Check for read timeout (expected, just retry).
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		a.logger.Debug("Read timeout, no data received")
+		return true, consecutiveErrors, nil
 	}
 
 	// Check for network errors (trigger reconnection)
@@ -257,11 +242,15 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 	return true, consecutiveErrors, nil
 }
 
-// processorLoop receives directives and dispatches them for processing.
-// For each directive, spawns a goroutine running processPD to execute probes.
-// Exits when the directive channel closes or context is cancelled.
+// processorLoop dispatches incoming directives to processPD goroutines.
+// A WaitGroup ensures all in-flight goroutines finish before fies is closed,
+// preventing a send-on-closed-channel panic.
 func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) error {
-	defer close(fies)
+	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		close(fies)
+	}()
 
 	for {
 		select {
@@ -273,15 +262,15 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			}
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
 			a.metrics.PDGoroutines.Inc()
-			go a.processPD(ctx, pd, fies)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.processPD(ctx, pd, fies)
+			}()
 		}
 	}
 }
 
-// writerLoop sends ForwardingInfoElement results to orchestrator via TCP.
-// Each result is encoded as a newline-delimited JSON object. Network errors
-// trigger reconnection; encoding errors indicate a bug and also terminate
-// the connection.
 func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
 	encoder := json.NewEncoder(conn)
 
@@ -318,10 +307,9 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 	}
 }
 
-// processPD executes near and far probes in parallel and sends an FIE regardless of timeouts.
-// Failed probes are logged and cause the FIE to be dropped.
-// Duplicate probes (already in-flight for this second) return nil result and are silently skipped.
-// Timed-out probes result in a nil NearInfo or FarInfo in the FIE.
+// processPD executes near and far probes in parallel and sends an FIE on success.
+// A nil probe result means the probe was already in-flight and the PD is silently dropped.
+// Timed-out probes produce a nil NearInfo or FarInfo in the FIE.
 func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
 	defer a.metrics.PDGoroutines.Dec()
 
@@ -375,7 +363,6 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	}
 }
 
-// recordProbeOutcome increments probe outcome metrics and observes RTT for successful probes.
 // TODO: increment ICMPReplyTypeTotal once ProbeResult carries ICMP reply type.
 func (a *agent) recordProbeOutcome(result *ProbeResult) {
 	if result.TimedOut {
@@ -391,7 +378,6 @@ func (a *agent) recordProbeOutcome(result *ProbeResult) {
 	}
 }
 
-// classifyIP returns the address type of an IP for responsible probing metrics.
 func classifyIP(ip net.IP) string {
 	if ip.IsLoopback() {
 		return "loopback"
@@ -405,8 +391,7 @@ func classifyIP(ip net.IP) string {
 	return "public"
 }
 
-// buildFIE constructs a ForwardingInfoElement from probe results.
-// Timed-out probes (TimedOut=true) result in a nil NearInfo or FarInfo.
+// buildFIE constructs a FIE from probe results. Timed-out probes produce a nil NearInfo or FarInfo.
 func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult, nearTTL, farTTL uint8) *api.ForwardingInfoElement {
 	var nearInfo *api.Info
 	if !nearRes.TimedOut {
@@ -437,9 +422,8 @@ func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult,
 //  2. Add a case to this switch
 //  3. Update ProberType documentation in config.go
 //
-// This is a package-level variable (not a func) to allow overriding in tests.
-// Tests that override this cannot run in parallel.g in tests.
-// Note: tests that override this cannot run in parallel.
+// This is a package-level variable to allow overriding in tests.
+// Tests that override this cannot run in parallel.
 var createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Prober, error) {
 	switch cfg.ProberType {
 	case "mock":
@@ -451,8 +435,6 @@ var createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Pro
 	}
 }
 
-// validatePD checks that a directive has all required fields and
-// protocol-specific headers.
 func validatePD(pd *api.ProbingDirective) error {
 	if pd == nil {
 		return fmt.Errorf("%w: directive is nil", ErrInvalidDirective)
@@ -467,7 +449,7 @@ func validatePD(pd *api.ProbingDirective) error {
 		return fmt.Errorf("%w: TTL cannot be zero", ErrInvalidDirective)
 	}
 	if pd.NearTTL == 255 {
-		return fmt.Errorf("NearTTL %d would produce overflow farTTL", pd.NearTTL)
+		return fmt.Errorf("%w: NearTTL 255 would overflow farTTL", ErrInvalidDirective)
 	}
 
 	switch pd.Protocol {
@@ -486,7 +468,6 @@ func validatePD(pd *api.ProbingDirective) error {
 	return nil
 }
 
-// probeResultToInfo converts a ProbeResult into an Info structure for FIE generation.
 func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
 	return &api.Info{
 		ProbeTTL:          ttl,
@@ -496,8 +477,7 @@ func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
 	}
 }
 
-// isNetworkError returns true if err indicates a network/connection failure
-// (EOF, timeout, connection reset) rather than a JSON decoding error.
+// isNetworkError returns true for connection failures, including EOF and unexpected EOF.
 func isNetworkError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
