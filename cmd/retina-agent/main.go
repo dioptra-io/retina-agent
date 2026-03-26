@@ -189,19 +189,19 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logge
 		backoffFactor  = 2
 	)
 
-	idAttr := slog.String("agent_id", cfg.AgentID)
+	agentIDAttr := slog.String("agent_id", cfg.AgentID)
 
 	backoff := initialBackoff
 	for {
 		logger.Info("Connecting",
-			idAttr,
+			agentIDAttr,
 			slog.String("address", cfg.OrchestratorAddr))
 
 		start := time.Now()
 		err := agentRun(ctx, cfg, logger, metrics)
 
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			logger.Info("Shutdown complete", idAttr)
+			logger.Info("Shutdown complete", agentIDAttr)
 			return
 		}
 
@@ -210,8 +210,8 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logge
 		}
 
 		metrics.ReconnectionsTotal.Inc()
-		logger.Error("Connection lost", idAttr, slog.Any("err", err))
-		logger.Info("Reconnecting", idAttr, slog.Duration("backoff", backoff))
+		logger.Error("Connection lost", agentIDAttr, slog.Any("err", err))
+		logger.Info("Reconnecting", agentIDAttr, slog.Duration("backoff", backoff))
 
 		select {
 		case <-time.After(backoff):
@@ -220,7 +220,7 @@ func runWithReconnect(ctx context.Context, cfg *agent.Config, logger *slog.Logge
 				backoff = cfg.MaxReconnectBackoff
 			}
 		case <-ctx.Done():
-			logger.Info("Shutdown during reconnect backoff", idAttr)
+			logger.Info("Shutdown during reconnect backoff", agentIDAttr)
 			return
 		}
 	}
