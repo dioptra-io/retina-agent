@@ -1,27 +1,16 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// ## Test Coverage
+// Tests for the retina-agent CLI, focusing on runWithReconnect reconnection
+// logic. Uses variable injection (agentRun) to avoid real network connections.
 //
-// Tests for the retina-agent command-line interface, focusing on the
-// runWithReconnect reconnection logic with exponential backoff.
+// Tests that modify agentRun are not parallel; each restores the original
+// value via defer.
 //
-// Coverage:
-// - runWithReconnect: 100% - All reconnection scenarios and shutdown paths
-// - Config validation: 100% - All validation rules
-// - newLogger: 100% - All log levels including invalid fallback
-// - multiFlag: 100% - Set and String methods
-// - main(): 0% (untested) - Standard practice for main functions with os.Exit
-//
-// ## Testing Strategy
-//
-// Uses variable injection (var agentRun = agent.Run) to replace the real
-// agent.Run with a mock during tests. This follows Go standard library
-// patterns (e.g., net/http tests) and allows comprehensive testing without
-// requiring actual network connections.
-//
-// Tests cannot be parallel because they modify the global agentRun variable.
-// Each test properly restores the original value via defer.
+// All functions reach 100% coverage except:
+//   - startMetricsServer: goroutine error path after Serve failure requires
+//     closing the listener mid-serve, which is inherently racy.
+//   - main(): standard practice for functions with os.Exit.
 
 package main
 
@@ -42,37 +31,28 @@ import (
 	"github.com/dioptra-io/retina-agent/internal/agent"
 )
 
-// testLogger returns a logger that discards all output, keeping test output clean.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// testMetrics returns a Metrics instance backed by a fresh registry for test isolation.
 func testMetrics() *agent.Metrics {
 	return agent.NewMetrics(prometheus.NewRegistry(), "test-agent")
 }
 
-// ============================================================================
-// TEST HELPERS
-// ============================================================================
-
 // mockAgentRun simulates agent.Run with configurable behavior.
-//
-// Allows testing reconnection logic without actual network operations.
 // Thread-safe call counting using atomic operations.
 type mockAgentRun struct {
-	calls       atomic.Int32       // Number of times run() was called
-	returnErr   error              // Error to return from run()
-	delay       time.Duration      // Simulate connection time
-	maxCalls    int                // Return context.Canceled after this many calls
-	cancelOnN   int                // Cancel context after N calls
-	ctxToCancel context.CancelFunc // Context to cancel (if cancelOnN > 0)
+	calls       atomic.Int32
+	returnErr   error
+	delay       time.Duration
+	maxCalls    int                // return context.Canceled after this many calls
+	cancelOnN   int                // cancel context after N calls
+	ctxToCancel context.CancelFunc // context to cancel (if cancelOnN > 0)
 }
 
 func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config, logger *slog.Logger, metrics *agent.Metrics) error {
 	callNum := int(m.calls.Add(1))
 
-	// Simulate work
 	if m.delay > 0 {
 		select {
 		case <-time.After(m.delay):
@@ -81,12 +61,10 @@ func (m *mockAgentRun) run(ctx context.Context, cfg *agent.Config, logger *slog.
 		}
 	}
 
-	// Cancel context if requested
 	if m.cancelOnN > 0 && callNum == m.cancelOnN && m.ctxToCancel != nil {
 		m.ctxToCancel()
 	}
 
-	// Stop after maxCalls
 	if m.maxCalls > 0 && callNum >= m.maxCalls {
 		return context.Canceled
 	}
@@ -98,8 +76,6 @@ func (m *mockAgentRun) getCalls() int {
 	return int(m.calls.Load())
 }
 
-// testBackoffTiming runs a backoff test with the given parameters.
-// Extracted to reduce duplication between backoff tests.
 func testBackoffTiming(t *testing.T, cfg *agent.Config, mock *mockAgentRun,
 	expectedCalls int, minDuration, maxDuration time.Duration) {
 	t.Helper()
@@ -119,11 +95,9 @@ func testBackoffTiming(t *testing.T, cfg *agent.Config, mock *mockAgentRun,
 	select {
 	case <-done:
 		elapsed := time.Since(start)
-
 		if elapsed < minDuration || elapsed > maxDuration {
 			t.Errorf("Expected backoff between %v and %v, got %v", minDuration, maxDuration, elapsed)
 		}
-
 		if mock.getCalls() != expectedCalls {
 			t.Errorf("Expected %d calls, got %d", expectedCalls, mock.getCalls())
 		}
@@ -132,8 +106,6 @@ func testBackoffTiming(t *testing.T, cfg *agent.Config, mock *mockAgentRun,
 	}
 }
 
-// validConfig returns a valid configuration for testing.
-// Used as a base that can be modified for specific test cases.
 func validConfig() *agent.Config {
 	return &agent.Config{
 		AgentID:                    "test-agent",
@@ -151,13 +123,9 @@ func validConfig() *agent.Config {
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - runWithReconnect
-// ============================================================================
+// -- runWithReconnect ---------------------------------------------------------
 
 func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
@@ -190,8 +158,6 @@ func TestRunWithReconnect_ImmediateShutdown(t *testing.T) {
 }
 
 func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cfg := &agent.Config{
@@ -212,7 +178,7 @@ func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 		done <- true
 	}()
 
-	// Wait for first attempt to fail and enter backoff
+	// Wait for first attempt to fail and enter backoff.
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 
@@ -227,8 +193,6 @@ func TestRunWithReconnect_ShutdownDuringBackoff(t *testing.T) {
 }
 
 func TestRunWithReconnect_ExponentialBackoff(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
@@ -245,8 +209,6 @@ func TestRunWithReconnect_ExponentialBackoff(t *testing.T) {
 }
 
 func TestRunWithReconnect_BackoffCapping(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
@@ -262,9 +224,26 @@ func TestRunWithReconnect_BackoffCapping(t *testing.T) {
 	testBackoffTiming(t, cfg, mock, 5, 8*time.Second, 11*time.Second)
 }
 
-func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
+func TestRunWithReconnect_BackoffReset(t *testing.T) {
+	cfg := &agent.Config{
+		AgentID:             "test-agent",
+		OrchestratorAddr:    "localhost:50050",
+		MaxReconnectBackoff: 1 * time.Minute,
+	}
 
+	mock := &mockAgentRun{
+		delay:     1100 * time.Millisecond,
+		maxCalls:  2,
+		returnErr: errors.New("connection dropped"),
+	}
+
+	// Each call takes 1.1s due to delay.
+	// With reset:    1.1s (run1) + 1s (backoff) + 1.1s (run2) ≈ 3.2s
+	// Without reset: 1.1s (run1) + 2s (backoff) + 1.1s (run2) ≈ 4.2s
+	testBackoffTiming(t, cfg, mock, 2, 3*time.Second, 4*time.Second)
+}
+
+func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cfg := &agent.Config{
@@ -298,8 +277,6 @@ func TestRunWithReconnect_ContextCancelledDuringRun(t *testing.T) {
 }
 
 func TestRunWithReconnect_NonContextError(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	cfg := &agent.Config{
 		AgentID:             "test-agent",
 		OrchestratorAddr:    "localhost:50050",
@@ -332,8 +309,6 @@ func TestRunWithReconnect_NonContextError(t *testing.T) {
 }
 
 func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
-	// Note: Not parallel - modifies global agentRun variable
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cfg := &agent.Config{
@@ -365,9 +340,7 @@ func TestRunWithReconnect_ContextErrorCheck(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - Configuration
-// ============================================================================
+// -- Config -------------------------------------------------------------------
 
 func TestConfig_Validation(t *testing.T) {
 	t.Parallel()
@@ -401,9 +374,7 @@ func TestConfig_Validation(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - Logging
-// ============================================================================
+// -- newLogger ----------------------------------------------------------------
 
 func TestNewLogger_Levels(t *testing.T) {
 	t.Parallel()
@@ -440,14 +411,11 @@ func TestNewLogger_Levels(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - Metrics Server
-// ============================================================================
+// -- startMetricsServer -------------------------------------------------------
 
 func TestStartMetricsServer(t *testing.T) {
 	t.Parallel()
 
-	// Find a free port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to find free port: %v", err)
@@ -456,16 +424,15 @@ func TestStartMetricsServer(t *testing.T) {
 	_ = listener.Close()
 
 	registry := prometheus.NewRegistry()
-	startMetricsServer(testLogger(), registry, addr)
-
-	// Retry briefly since the server starts in a goroutine
-	var resp *http.Response
-	for i := 0; i < 10; i++ {
-		resp, err = http.Get(fmt.Sprintf("http://%s/metrics", addr)) //nolint:noctx
-		if err == nil {
-			break
-		}
+	srv, err := startMetricsServer(testLogger(), registry, addr)
+	if err != nil {
+		t.Fatalf("startMetricsServer returned unexpected error: %v", err)
 	}
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	// Port is bound before startMetricsServer returns, so the server is
+	// reachable immediately — no retry loop needed.
+	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", addr)) //nolint:noctx
 	if err != nil {
 		t.Fatalf("failed to reach metrics server: %v", err)
 	}
@@ -479,17 +446,14 @@ func TestStartMetricsServer(t *testing.T) {
 func TestStartMetricsServer_InvalidAddr(t *testing.T) {
 	t.Parallel()
 
-	// Invalid address causes ListenAndServe to fail immediately,
-	// covering the error log branch inside the goroutine.
-	startMetricsServer(testLogger(), prometheus.NewRegistry(), "invalid-addr")
-
-	// Give the goroutine time to hit the error path
-	time.Sleep(50 * time.Millisecond)
+	// With eager net.Listen, an invalid address is rejected immediately.
+	_, err := startMetricsServer(testLogger(), prometheus.NewRegistry(), "invalid-addr")
+	if err == nil {
+		t.Error("startMetricsServer: expected error for invalid address, got nil")
+	}
 }
 
-// ============================================================================
-// UNIT TESTS - multiFlag
-// ============================================================================
+// -- multiFlag ----------------------------------------------------------------
 
 func TestMultiFlag(t *testing.T) {
 	t.Parallel()
