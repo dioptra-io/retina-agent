@@ -1,6 +1,6 @@
 # Retina Agent
 
-Network probing agent for the Retina distributed measurement system.
+Retina Agent executes coordinated network probes to infer forwarding behavior across distributed vantage points, producing forwarding information elements (FIEs) for topology analysis.
 
 ## Overview
 
@@ -18,12 +18,12 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 └──────┬──────┘
        │ TCP (JSON over newline-delimited stream)
        │
-┌──────▼──────────────────────────┐
-│         Retina Agent            │
-│                                 │
-│  ┌────────┐  ┌──────────┐  ┌──────┐│
-│  │ Reader │─▶│Processor │─▶│Writer││
-│  └────────┘  └─────┬────┘  └──────┘│
+┌──────▼──────────────────────────────┐
+│         Retina Agent                │
+│                                     │
+│  ┌────────┐  ┌──────────┐  ┌──────┐ │
+│  │ Reader │─▶│Processor │─▶│Writer│ │
+│  └────────┘  └─────┬────┘  └──────┘ │
 │                    │                │
 │              ┌─────▼─────┐          │
 │              │  Prober   │          │
@@ -34,11 +34,11 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 
 **Three-stage pipeline:**
 1. **Reader**: Receives `ProbingDirective` messages from orchestrator
-2. **Processor**: Executes two probes per directive (near TTL, far TTL) in parallel, sends FIE when both complete
+2. **Processor**: Executes two probes per directive (near TTL, far TTL) in parallel, sends FIE once both complete or time out
 3. **Writer**: Sends `ForwardingInfoElement` results back to orchestrator
 
 **Key features:**
-- Non-blocking probe execution (thousands of concurrent probes)
+- Non-blocking probe execution (thousands of concurrent probes, bounded by `--write-queue-size` and OS limits)
 - Automatic reconnection with exponential backoff
 - Graceful shutdown on SIGINT/SIGTERM
 
@@ -46,7 +46,7 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.24.4
 - For production: [caracal](https://github.com/dioptra-io/caracal) and raw socket privileges
 
 ### Installation
@@ -61,15 +61,6 @@ go build -o retina-agent ./cmd/retina-agent
 ./retina-agent --id agent-1 --address localhost:50050 --prober-type mock
 ```
 
-**Example output:**
-```
-2026/01/21 17:02:54 Agent agent-1: Connected to orchestrator at localhost:50050
-2026/01/21 17:02:54 Agent agent-1: ← Directive for 8.8.8.8 (TTL 10 → 11)
-2026/01/21 17:02:54 Agent agent-1: → FIE for 8.8.8.8 | Near(TTL10) | Far(TTL11)
-2026/01/21 17:02:55 Agent agent-1: ← Directive for 1.1.1.1 (TTL 15 → 16)
-2026/01/21 17:02:55 Agent agent-1: → FIE for 1.1.1.1 | Near(TTL15) | Far(TTL16)
-```
-
 ## Testing End-to-End
 
 Use the mock orchestrator to test the complete pipeline:
@@ -81,8 +72,6 @@ go run test/mock_orchestrator.go
 ./retina-agent --id agent-1 --address localhost:50050 --prober-type mock
 ```
 
-You should see directives flowing in and FIEs flowing out in both terminals.
-
 ## Configuration
 
 ### Main Flags
@@ -93,78 +82,49 @@ You should see directives flowing in and FIEs flowing out in both terminals.
 | `--address` | `localhost:50050` | Orchestrator address (host:port) |
 | `--prober-type` | `caracal` | Prober: `caracal` or `mock` |
 | `--prober-path` | (searches PATH) | Path to prober executable |
-| `--probe-timeout` | `5s` | Timeout for probe responses |
-| `--directives-buffer` | `100` | Directives channel buffer |
-| `--fies-buffer` | `100` | FIEs channel buffer |
-| `--max-consecutive-decode-errors` | `3` | Max decode errors before reconnecting |
+| `--prober-arg` | | Additional argument to pass to the prober (repeatable) |
+| `--write-queue-size` | `1000` | Prober write queue buffer size |
+| `--cleanup-interval` | `10s` | Prober stale probe cleanup interval |
+| `--pds-buffer` | `100` | Directives channel buffer size |
+| `--fies-buffer` | `100` | FIEs channel buffer size |
+| `--read-deadline` | `10s` | Read timeout for orchestrator connection |
+| `--write-deadline` | `5s` | Write timeout for orchestrator connection |
+| `--probe-timeout` | `5s` | Timeout for individual probe responses |
+| `--max-reconnect-backoff` | `5m` | Maximum wait time between reconnection attempts |
+| `--max-consecutive-decode-errors` | `3` | Max consecutive decode errors before reconnecting (0 to disable) |
+| `--log-level` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `--metrics-addr` | `:9312` | Address to expose Prometheus metrics on |
 
 See `--help` for all options.
 
-### Advanced Configuration
-
-**Caracal-specific arguments** can be set programmatically via `Config.ProberArgs`:
-```go
-cfg.ProberArgs = []string{"--n-packets", "3", "--interface", "eth0"}
-```
-Not exposed as CLI flag for MVP - modify code if needed.
-
 ## How It Works
 
-### Directive Processing
+### Processing Model
 
 For each `ProbingDirective`:
 
 1. **Launch two probes concurrently**:
    - Near probe: TTL = `directive.NearTTL`
    - Far probe: TTL = `directive.NearTTL + 1`
-2. **Correlate results** by destination, protocol, header fields, TTL, and timestamp
-3. **If both succeed**: Build and send FIE
-4. **If either times out**: Discard (no FIE)
+2. **Correlate results** by destination, protocol, header fields, TTL, and send timestamp
+3. **Always send a FIE**: if a probe times out, the corresponding `NearInfo` or `FarInfo` field is nil
 
-### Caracal Prober Architecture
+### Caracal Integration
 
 The caracal prober uses a high-throughput pipeline:
 - Multiple goroutines queue probe requests (non-blocking)
 - Single writer goroutine sends to caracal stdin (CSV format)
 - Single reader goroutine receives from caracal stdout (CSV format)
 - Results correlated back to waiting goroutines via shared map
-- Supports thousands of concurrent probes without blocking
 
 ### Error Handling
 
 - **Network errors**: Trigger reconnection with exponential backoff
-- **Decode errors**: Log and skip (reconnect after 3 consecutive)
-- **Probe timeouts**: Expected behavior, no FIE created
+- **Decode errors**: Log and skip (reconnect after `--max-consecutive-decode-errors` consecutive)
+- **Probe timeouts**: Expected behavior, FIE sent with nil NearInfo/FarInfo
 - **Context cancellation**: Clean shutdown
 
 ## Development
-
-### Project Structure
-```
-retina-agent/
-├── cmd/retina-agent/     # Main entry point
-├── internal/agent/
-│   ├── agent.go          # Core pipeline logic
-│   ├── config.go         # Configuration
-│   ├── prober.go         # Prober interface
-│   ├── caracal_prober.go # Caracal implementation
-│   ├── mock_prober.go    # Mock for testing
-│   └── agent_test.go     # Tests
-└── test/
-    └── mock_orchestrator.go  # For end-to-end testing
-```
-
-### Running Tests
-```bash
-# All tests
-go test ./...
-
-# Specific test
-go test -v ./internal/agent -run TestAgentPipeline
-
-# With race detection
-go test -race ./...
-```
 
 ### Adding a New Prober
 
@@ -187,52 +147,9 @@ case "myprober":
 ./retina-agent --prober-type myprober
 ```
 
-## Troubleshooting
+## Observability
 
-### Agent keeps reconnecting
-
-**Cause**: Orchestrator is unreachable.
-
-**Check**: `nc -zv orchestrator.example.com 50050`
-
-### No FIEs produced
-
-**Cause**: Probes timing out (expected with mock prober's 10% timeout rate).
-
-**Check logs**: You should see directives received (←) but some won't produce FIEs (→).
-
-### "unknown prober type"
-
-**Fix**: Use `--prober-type mock` or `--prober-type caracal`
-
-### "permission denied" (caracal)
-
-**Fix**: Run as root or grant capabilities:
-```bash
-sudo setcap cap_net_raw+ep /path/to/caracal
-```
-
-## Design Decisions
-
-### Why two probes per directive?
-
-Each FIE contains consecutive hop information (near and far TTL) needed for topology analysis.
-
-### Why both must succeed?
-
-Partial FIEs complicate downstream processing. Clean failure (no FIE) is simpler than partial success.
-
-### Why non-blocking probes?
-
-Sequential probing is too slow. Each directive spawns a goroutine that launches both probes in parallel and waits for results. This allows processing thousands of directives concurrently without blocking the main pipeline.
-
-### Why interface for Prober?
-
-Allows testing with mock prober and easy addition of new implementations without changing agent code.
-
-### Why separate TTL parameter?
-
-Passing TTL separately (rather than embedding in the directive) allows probing multiple hops with the same directive without duplicating the directive structure. This keeps the API simple and flexible.
+Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering pipeline throughput (directives received, FIEs sent), probe outcomes (success/timeout/error rates, RTT distribution), connectivity (reconnections, decode errors), and caracal internals (queue depth, in-flight probes, correlation failures). See `internal/agent/metrics.go` for the full list.
 
 ## License
 
