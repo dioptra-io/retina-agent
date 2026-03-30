@@ -506,7 +506,9 @@ func TestHandleAgent_CloseError(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	conn.mockConn.Close() // triggers io.ErrClosedPipe on Write, causing sendPDs to exit
+	if err := conn.mockConn.Close(); err != nil { // triggers io.ErrClosedPipe on Write, causing sendPDs to exit
+		t.Errorf("Failed to close connection: %v", err)
+	}
 
 	select {
 	case <-done:
