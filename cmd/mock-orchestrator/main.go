@@ -3,9 +3,6 @@
 
 // Command mock-orchestrator simulates a network measurement orchestrator for testing retina-agent.
 //
-// It listens for agent connections, sends deterministic probing directives (PDs) at a configurable rate,
-// and logs received forwarding information elements (FIEs).
-//
 // Usage:
 //
 //	mock-orchestrator [-address localhost:50050] [-probing-rate 10]
@@ -14,14 +11,6 @@
 //
 //	-address       Listen address (default: localhost:50050)
 //	-probing-rate  Probing directives per second (default: 10)
-//
-// The mock generates diverse test traffic including:
-//   - IPv4 and IPv6 destinations
-//   - Alternating ICMP and UDP protocols
-//   - Cycling TTL values (5-20)
-//   - Popular public DNS resolvers as probe targets
-//
-// Directives are deterministic (based on counter) for reproducible testing.
 package main
 
 import (
@@ -82,7 +71,6 @@ func main() {
 	}
 }
 
-// reportStats logs current throughput statistics.
 // The early return on sent == 0 avoids a division by zero before any PDs have been sent.
 func reportStats() {
 	sent := pdsSent.Load()
@@ -101,7 +89,6 @@ func reportStats() {
 		pdsPerSec, fiesPerSec, successRate, sent, received)
 }
 
-// handleAgent manages a connection with a single agent, sending PDs and receiving FIEs.
 // receiveFIEs runs in a separate goroutine so that sending and receiving can proceed
 // concurrently on the same connection. sendPDs blocks until the connection closes.
 func handleAgent(conn net.Conn, rate int) {
@@ -191,7 +178,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 			return
 		}
 
-		pdsSent.Add(1) // pdsSent is incremented after a successful encode to avoid counting failed sends.
+		pdsSent.Add(1) // incremented after a successful encode to avoid counting failed sends.
 
 		var protocol string
 		switch pd.Protocol {
@@ -202,7 +189,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		case api.UDP:
 			protocol = "UDP"
 		default:
-			protocol = "UNKNOWN"
+			protocol = "UNKNOWN" // unreachable: generatePD only produces ICMP, ICMPv6, or UDP
 		}
 
 		log.Printf("[%s] → PD #%d (PD ID %d): %s %s TTL %d",
@@ -216,7 +203,6 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 	}
 }
 
-// generatePD creates a deterministic probing directive for testing.
 func generatePD(counter int) *api.ProbingDirective {
 	destinations := []string{
 		// IPv4
@@ -252,6 +238,7 @@ func generatePD(counter int) *api.ProbingDirective {
 		NearTTL:            ttl,
 	}
 
+	// Even counters use UDP (with port fields); odd counters use ICMP/ICMPv6 (no port fields).
 	useUDP := counter%2 == 0
 
 	if useUDP {

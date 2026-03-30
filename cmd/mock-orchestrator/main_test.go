@@ -28,10 +28,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -40,9 +38,7 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
-// ============================================================================
-// MOCK TYPES FOR TESTING
-// ============================================================================
+// -- mock types ---------------------------------------------------------------
 
 // mockConn implements net.Conn for testing connection handling.
 type mockConn struct {
@@ -114,9 +110,24 @@ func (e *errorWriteConn) Write(b []byte) (n int, err error) {
 	return 0, e.writeErr
 }
 
-// ============================================================================
-// TEST HELPERS
-// ============================================================================
+// limitedWriteConn allows up to limit writes before returning io.ErrClosedPipe.
+type limitedWriteConn struct {
+	*mockConn
+	limit int
+	count int
+}
+
+func (l *limitedWriteConn) Write(b []byte) (n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.count >= l.limit {
+		return 0, io.ErrClosedPipe
+	}
+	l.count++
+	return l.writeBuf.Write(b)
+}
+
+// -- test helpers -------------------------------------------------------------
 
 // createTestFIE creates a ForwardingInfoElement for testing.
 func createTestFIE(pdID uint64) api.ForwardingInfoElement {
@@ -149,17 +160,7 @@ func encodeFIE(t *testing.T, conn *mockConn, fie api.ForwardingInfoElement) {
 	}
 }
 
-// verifyPDField checks a PD field value.
-func verifyPDField(t *testing.T, name string, got, want interface{}) {
-	t.Helper()
-	if got != want {
-		t.Errorf("%s = %v, want %v", name, got, want)
-	}
-}
-
-// ============================================================================
-// UNIT TESTS - generatePD
-// ============================================================================
+// -- generatePD ---------------------------------------------------------------
 
 func TestGeneratePD_ProtocolVariants(t *testing.T) {
 	t.Parallel()
@@ -189,13 +190,19 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 				return
 			}
 
-			verifyPDField(t, "NearTTL", pd.NearTTL, tt.wantTTL)
+			if pd.NearTTL != tt.wantTTL {
+				t.Errorf("NearTTL = %v, want %v", pd.NearTTL, tt.wantTTL)
+			}
 
 			isIPv4 := pd.DestinationAddress.To4() != nil
-			verifyPDField(t, "IPv4", isIPv4, tt.wantIPv4)
-			verifyPDField(t, "Protocol", pd.Protocol, tt.wantProtocol)
+			if isIPv4 != tt.wantIPv4 {
+				t.Errorf("IPv4 = %v, want %v", isIPv4, tt.wantIPv4)
+			}
 
-			// Verify protocol-specific headers
+			if pd.Protocol != tt.wantProtocol {
+				t.Errorf("Protocol = %v, want %v", pd.Protocol, tt.wantProtocol)
+			}
+
 			switch pd.Protocol {
 			case api.ICMP:
 				if pd.NextHeader.ICMPNextHeader == nil {
@@ -211,7 +218,6 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 				}
 			}
 
-			// Verify required fields
 			if pd.AgentID == "" || pd.DestinationAddress == nil || pd.ProbingDirectiveID == 0 {
 				t.Error("Missing required fields")
 			}
@@ -265,11 +271,11 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - reportStats
-// ============================================================================
+// -- reportStats --------------------------------------------------------------
 
 func TestReportStats_WithData(t *testing.T) {
+	t.Parallel()
+
 	origSent := pdsSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
@@ -281,10 +287,11 @@ func TestReportStats_WithData(t *testing.T) {
 	fiesReceived.Store(75)
 
 	reportStats()
-	t.Log("reportStats ran with data")
 }
 
 func TestReportStats_EarlyReturn(t *testing.T) {
+	t.Parallel()
+
 	origSent := pdsSent.Load()
 	origReceived := fiesReceived.Load()
 	defer func() {
@@ -296,12 +303,9 @@ func TestReportStats_EarlyReturn(t *testing.T) {
 	fiesReceived.Store(0)
 
 	reportStats()
-	t.Log("reportStats returned early with zero sent")
 }
 
-// ============================================================================
-// UNIT TESTS - receiveFIEs
-// ============================================================================
+// -- receiveFIEs --------------------------------------------------------------
 
 func TestReceiveFIEs_Success(t *testing.T) {
 	fie := createTestFIE(123)
@@ -424,87 +428,39 @@ func TestReceiveFIEs_DecodeError(t *testing.T) {
 	receiveFIEs(decoder, "test-addr")
 }
 
-// ============================================================================
-// UNIT TESTS - sendPDs
-// ============================================================================
+// -- sendPDs ------------------------------------------------------------------
 
-func TestSendPDs_AllProtocolCases(t *testing.T) {
-	var buf bytes.Buffer
-	encoder := json.NewEncoder(&buf)
+func TestSendPDs_SendsPDsUntilWriteError(t *testing.T) {
+	t.Parallel()
+
+	conn := &limitedWriteConn{mockConn: newMockConn(), limit: 5}
+	encoder := json.NewEncoder(conn)
 	origSent := pdsSent.Load()
 	defer pdsSent.Store(origSent)
 
-	// Send 10 PDs to cover all protocol cases
-	const numPDs = 10
-	for i := 0; i < numPDs; i++ {
-		pd := generatePD(i)
-		if err := encoder.Encode(pd); err != nil {
-			t.Fatalf("Failed to encode PD %d: %v", i, err)
-		}
-		pdsSent.Add(1)
+	sendPDs(encoder, "test-addr", 1000)
 
-		// Exercise protocol switch
-		var protocol string
-		switch pd.Protocol {
-		case api.ICMP:
-			protocol = "ICMP"
-		case api.ICMPv6:
-			protocol = "ICMPv6"
-		case api.UDP:
-			protocol = "UDP"
-		default:
-			protocol = "UNKNOWN"
-		}
-		_ = protocol
-	}
-
-	if pdsSent.Load() < origSent+numPDs {
-		t.Errorf("Expected at least %d PDs sent", numPDs)
-	}
-
-	// Verify all protocol types
-	decoder := json.NewDecoder(&buf)
-	protocols := make(map[api.Protocol]bool)
-
-	for {
-		var pd api.ProbingDirective
-		if err := decoder.Decode(&pd); err != nil {
-			break
-		}
-		protocols[pd.Protocol] = true
-	}
-
-	for _, want := range []api.Protocol{api.ICMP, api.ICMPv6, api.UDP} {
-		if !protocols[want] {
-			t.Errorf("Did not generate protocol %v", want)
-		}
+	if got := pdsSent.Load() - origSent; got != 5 {
+		t.Errorf("pdsSent = %d, want 5", got)
 	}
 }
 
-func TestSendPDs_UnknownProtocol(t *testing.T) {
-	// Test default case in protocol switch (unreachable defensive code)
-	invalidProtocol := api.Protocol(99)
+func TestSendPDs_ExitsOnNetworkError(t *testing.T) {
+	t.Parallel()
 
-	var protocol string
-	switch invalidProtocol {
-	case api.ICMP:
-		protocol = "ICMP"
-	case api.ICMPv6:
-		protocol = "ICMPv6"
-	case api.UDP:
-		protocol = "UDP"
-	default:
-		protocol = "UNKNOWN"
-	}
+	conn := &errorWriteConn{mockConn: newMockConn(), writeErr: errors.New("network error")}
+	encoder := json.NewEncoder(conn)
+	origSent := pdsSent.Load()
+	defer pdsSent.Store(origSent)
 
-	if protocol != "UNKNOWN" {
-		t.Errorf("Expected UNKNOWN for invalid protocol, got %s", protocol)
+	sendPDs(encoder, "test-addr", 1000)
+
+	if pdsSent.Load() != origSent {
+		t.Error("pdsSent incremented despite write error")
 	}
 }
 
-// ============================================================================
-// INTEGRATION TESTS - handleAgent
-// ============================================================================
+// -- handleAgent --------------------------------------------------------------
 
 func TestHandleAgent_BasicFlow(t *testing.T) {
 	t.Parallel()
@@ -527,7 +483,6 @@ func TestHandleAgent_BasicFlow(t *testing.T) {
 
 	select {
 	case <-done:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for handleAgent")
 	}
@@ -551,14 +506,10 @@ func TestHandleAgent_CloseError(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-
-	if err := conn.Close(); err == nil {
-		t.Error("Expected error from Close()")
-	}
+	conn.mockConn.Close() // triggers io.ErrClosedPipe on Write, causing sendPDs to exit
 
 	select {
 	case <-done:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for handleAgent")
 	}
@@ -569,7 +520,6 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	conn := newMockConn()
 
-	// Pre-populate with FIEs
 	for i := 0; i < 10; i++ {
 		pdID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
 		fie := createTestFIE(pdID)
@@ -590,12 +540,10 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	select {
 	case <-done:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for handleAgent")
 	}
 
-	// Verify ICMPv6 was generated
 	decoder := json.NewDecoder(conn.writeBuf)
 	foundICMPv6 := false
 
@@ -618,10 +566,9 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 func TestHandleAgent_WriteError(t *testing.T) {
 	t.Parallel()
 
-	customErr := errors.New("network timeout")
 	conn := &errorWriteConn{
 		mockConn: newMockConn(),
-		writeErr: customErr,
+		writeErr: errors.New("network timeout"),
 	}
 
 	fie := createTestFIE(1)
@@ -635,38 +582,15 @@ func TestHandleAgent_WriteError(t *testing.T) {
 
 	select {
 	case <-done:
-		// Success - should exit quickly due to write error
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for handleAgent to handle write error")
 	}
 }
 
-// ============================================================================
-// PARTIAL TESTS - main function
-// ============================================================================
-
-func TestMain_FlagParsing(t *testing.T) {
-	oldArgs := os.Args
-	defer func() { os.Args = oldArgs }()
-
-	os.Args = []string{"cmd", "-address", "localhost:9999", "-probing-rate", "50"}
-	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-
-	address := flag.String("address", "localhost:50050", "Listen address")
-	rate := flag.Int("probing-rate", 10, "Probing directives per second")
-	flag.Parse()
-
-	if *address != "localhost:9999" {
-		t.Errorf("address = %s, want localhost:9999", *address)
-	}
-	if *rate != 50 {
-		t.Errorf("rate = %d, want 50", *rate)
-	}
-}
+// -- main ---------------------------------------------------------------------
 
 func TestMain_ListenerSetup(t *testing.T) {
-	testAddr := "localhost:0"
-	listener, err := net.Listen("tcp", testAddr)
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Failed to listen: %v", err)
 	}
@@ -685,8 +609,7 @@ func TestMain_ListenerSetup(t *testing.T) {
 		connectDone <- true
 	}()
 
-	addr := listener.Addr().String()
-	testConn, err := net.Dial("tcp", addr)
+	testConn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
@@ -694,7 +617,6 @@ func TestMain_ListenerSetup(t *testing.T) {
 
 	select {
 	case <-connectDone:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for connection")
 	}
