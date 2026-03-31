@@ -45,7 +45,7 @@ func testMetrics() *Metrics {
 	return NewMetrics(prometheus.NewRegistry(), "test-agent")
 }
 
-// ===== Flexible Stubs =====
+// -- stubs --------------------------------------------------------------------
 
 type stubProber struct {
 	probeFunc func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
@@ -116,7 +116,7 @@ func (c *stubConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// ===== Mock Network Error =====
+// -- mockNetError -------------------------------------------------------------
 
 type mockNetError struct {
 	timeout   bool
@@ -128,7 +128,7 @@ func (e *mockNetError) Error() string   { return e.err }
 func (e *mockNetError) Timeout() bool   { return e.timeout }
 func (e *mockNetError) Temporary() bool { return e.temporary }
 
-// ===== Run() Tests =====
+// -- Run() --------------------------------------------------------------------
 
 //nolint:funlen // Integration test requires setup and teardown
 func TestRun_WithLocalServer(t *testing.T) {
@@ -474,7 +474,7 @@ func TestRun_WithMockConnection(t *testing.T) {
 	}
 }
 
-// ===== handleDecodeError() Tests =====
+// -- handleDecodeError() ------------------------------------------------------
 
 func TestHandleDecodeError_Timeout(t *testing.T) {
 	t.Parallel()
@@ -641,7 +641,7 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 	}
 }
 
-// ===== readerLoop() Tests =====
+// -- readerLoop() -------------------------------------------------------------
 
 func TestReaderLoop_DecodeErrorLog(t *testing.T) {
 	t.Parallel()
@@ -895,7 +895,7 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	}
 }
 
-// ===== writerLoop() Tests =====
+// -- writerLoop() -------------------------------------------------------------
 
 func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 	t.Parallel()
@@ -1028,7 +1028,7 @@ func TestWriterLoop_Success(t *testing.T) {
 	}
 }
 
-// ===== processorLoop() Tests =====
+// -- processorLoop() ----------------------------------------------------------
 
 func TestProcessorLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
@@ -1108,7 +1108,7 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	}
 }
 
-// ===== processPD() Tests =====
+// -- processPD() --------------------------------------------------------------
 
 func TestProcessPD_Success(t *testing.T) {
 	t.Parallel()
@@ -1353,7 +1353,7 @@ func TestProcessPD_NilFarResult(t *testing.T) {
 	}
 }
 
-// ===== createProber() Tests =====
+// -- createProber() -----------------------------------------------------------
 
 func TestCreateProber_Mock(t *testing.T) {
 	t.Parallel()
@@ -1398,7 +1398,7 @@ func TestCreateProber_Unknown(t *testing.T) {
 	}
 }
 
-// ===== validatePD() Tests =====
+// -- validatePD() -------------------------------------------------------------
 
 //nolint:funlen // Table-driven test with many validation cases
 func TestValidatePD_AllBranches(t *testing.T) {
@@ -1511,7 +1511,7 @@ func TestValidatePD_AllBranches(t *testing.T) {
 	}
 }
 
-// ===== probeResultToInfo() Tests =====
+// -- probeResultToInfo() ------------------------------------------------------
 
 func TestProbeResultToInfo(t *testing.T) {
 	t.Parallel()
@@ -1545,7 +1545,7 @@ func TestProbeResultToInfo(t *testing.T) {
 	}
 }
 
-// ===== isNetworkError() Tests =====
+// -- isNetworkError() ---------------------------------------------------------
 
 func TestIsNetworkError_AllCases(t *testing.T) {
 	t.Parallel()
@@ -1575,7 +1575,7 @@ func TestIsNetworkError_AllCases(t *testing.T) {
 	}
 }
 
-// ===== classifyIP() Tests =====
+// -- classifyIP() -------------------------------------------------------------
 
 func TestClassifyIP(t *testing.T) {
 	t.Parallel()
@@ -1608,9 +1608,7 @@ func TestClassifyIP(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// MOCK CONNECTION FOR AUTHENTICATION TESTING
-// ============================================================================
+// -- mockConn (for authentication tests) --------------------------------------
 
 type mockConn struct {
 	readBuf             *bytes.Buffer
@@ -1678,9 +1676,7 @@ func (m *mockConn) getAuthRequest() (*api.AuthRequest, error) {
 	return &req, nil
 }
 
-// ============================================================================
-// AUTHENTICATION TESTS
-// ============================================================================
+// -- authenticate() -----------------------------------------------------------
 
 func TestAuthenticate_Success(t *testing.T) {
 	t.Parallel()
@@ -1929,9 +1925,7 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// INTEGRATION TESTS - Authentication in Run()
-// ============================================================================
+// -- Run() authentication integration -----------------------------------------
 
 func TestRun_AuthenticationFailure(t *testing.T) {
 	// Note: Not parallel - full integration test with server interaction

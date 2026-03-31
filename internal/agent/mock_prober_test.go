@@ -1,8 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// All code paths (successful probes, timeouts, context cancellation, and
-// concurrent access) are tested.
+// Coverage: 100% of mock_prober.go.
 
 package agent
 
@@ -15,9 +14,7 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
-// ============================================================================
-// TEST HELPER FUNCTIONS
-// ============================================================================
+// -- test helpers -------------------------------------------------------------
 
 func makeProbingDirective(dest string, proto api.Protocol) *api.ProbingDirective {
 	return &api.ProbingDirective{
@@ -27,9 +24,7 @@ func makeProbingDirective(dest string, proto api.Protocol) *api.ProbingDirective
 	}
 }
 
-// ============================================================================
-// UNIT TESTS - MockProber functionality
-// ============================================================================
+// -- MockProber ---------------------------------------------------------------
 
 func TestMockProber_SuccessfulProbe(t *testing.T) {
 	t.Parallel()

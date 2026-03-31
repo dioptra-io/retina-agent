@@ -1,13 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// ## Test Coverage
-//
-// Current coverage: 100%
-//
-// ProbeResult helper methods are simple utility functions with no external
-// dependencies or error paths. All methods (Success, RTT, String) are tested.
-
+// Coverage: 100% of prober.go.
 package agent
 
 import (
@@ -17,13 +11,10 @@ import (
 	"time"
 )
 
-// ============================================================================
-// UNIT TESTS - ProbeResult helper methods
-// ============================================================================
+// -- ProbeResult --------------------------------------------------------------
 
 func TestProbeResult_Success(t *testing.T) {
 	t.Parallel()
-
 	tests := []struct {
 		name     string
 		result   ProbeResult
@@ -40,7 +31,6 @@ func TestProbeResult_Success(t *testing.T) {
 			expected: false,
 		},
 	}
-
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
@@ -54,10 +44,8 @@ func TestProbeResult_Success(t *testing.T) {
 
 func TestProbeResult_RTT(t *testing.T) {
 	t.Parallel()
-
 	now := time.Now()
 	delay := 50 * time.Millisecond
-
 	tests := []struct {
 		name     string
 		result   ProbeResult
@@ -81,7 +69,6 @@ func TestProbeResult_RTT(t *testing.T) {
 			expected: 0,
 		},
 	}
-
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
@@ -95,10 +82,8 @@ func TestProbeResult_RTT(t *testing.T) {
 
 func TestProbeResult_String(t *testing.T) {
 	t.Parallel()
-
 	now := time.Now()
 	replyAddr := net.ParseIP("8.8.8.8")
-
 	tests := []struct {
 		name     string
 		result   ProbeResult
@@ -123,7 +108,6 @@ func TestProbeResult_String(t *testing.T) {
 			contains: []string{"TIMEOUT", "sent at"},
 		},
 	}
-
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {

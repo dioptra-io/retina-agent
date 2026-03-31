@@ -14,9 +14,7 @@ import (
 	"time"
 )
 
-// ============================================================================
-// TEST HELPERS
-// ============================================================================
+// -- test helpers -------------------------------------------------------------
 
 func validConfig() *Config {
 	return DefaultConfig()
@@ -83,9 +81,7 @@ func testDurationField(t *testing.T, fieldName string, setField func(*Config, ti
 	}
 }
 
-// ============================================================================
-// DEFAULT CONFIG TESTS
-// ============================================================================
+// -- DefaultConfig ------------------------------------------------------------
 
 func TestDefaultConfig(t *testing.T) {
 	t.Parallel()
@@ -144,9 +140,7 @@ func TestProberTypeConstants(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// VALIDATION TESTS - Agent Identity
-// ============================================================================
+// -- Validate: agent identity -------------------------------------------------
 
 func TestValidate_AgentID(t *testing.T) {
 	t.Parallel()
@@ -195,9 +189,7 @@ func TestValidate_AgentID(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// VALIDATION TESTS - Orchestrator Connection
-// ============================================================================
+// -- Validate: orchestrator connection ----------------------------------------
 
 func TestValidate_OrchestratorAddr(t *testing.T) {
 	t.Parallel()
@@ -272,9 +264,7 @@ func TestValidate_OrchestratorAddr(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// VALIDATION TESTS - Secret (Authentication)
-// ============================================================================
+// -- Validate: secret (authentication) ----------------------------------------
 
 func TestValidate_Secret(t *testing.T) {
 	t.Parallel()
@@ -378,6 +368,8 @@ func TestValidate_Secret(t *testing.T) {
 		})
 	}
 }
+
+// -- Validate: deadlines and backoff ------------------------------------------
 
 func TestValidate_Deadlines(t *testing.T) {
 	t.Parallel()
@@ -546,9 +538,7 @@ func TestValidate_MaxConsecutiveDecodeErrors(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// VALIDATION TESTS - Prober Configuration
-// ============================================================================
+// -- Validate: prober configuration -------------------------------------------
 
 func TestValidate_ProberType(t *testing.T) {
 	t.Parallel()
@@ -726,9 +716,7 @@ func TestValidate_ProbeTimeout(t *testing.T) {
 	})
 }
 
-// ============================================================================
-// VALIDATION TESTS - Pipeline Buffers
-// ============================================================================
+// -- Validate: pipeline buffers -----------------------------------------------
 
 func TestValidate_BufferSizes(t *testing.T) {
 	t.Parallel()
@@ -813,9 +801,7 @@ func TestValidate_BufferSizes(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// VALIDATION TESTS - Complete Config
-// ============================================================================
+// -- Validate: complete config -------------------------------------------------
 
 func TestValidate_ValidConfig(t *testing.T) {
 	t.Parallel()

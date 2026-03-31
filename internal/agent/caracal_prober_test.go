@@ -1,18 +1,12 @@
-// ## Test Coverage
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
+// Coverage: ~96.9% of caracal_prober.go.
 //
-// Current coverage: ~96.9%
-//
-// The remaining ~3% consists of defensive error handlers for catastrophic system-level failures:
-// - File descriptor exhaustion during pipe creation (StdinPipe, StdoutPipe, StderrPipe)
-// - These error paths in setupCaracalProcess cannot be reliably tested without:
-//   * Exhausting system file descriptors (ulimit -n manipulation)
-//   * Root access and dangerous system state manipulation
-//   * Flaky tests that depend on exact system resource availability
-//
-// These are defensive checks that handle scenarios indicating severe system resource problems
-// (e.g., running out of file descriptors). They remain untested by design.
-//
-// See TestSetupCaracalProcessPipeErrors for documentation of these untestable paths.
+// The remaining ~3% consists of defensive error handlers for pipe creation
+// failures (StdinPipe, StdoutPipe, StderrPipe) in setupCaracalProcess.
+// These paths require exhausting system file descriptors to trigger and
+// cannot be reliably tested without dangerous system state manipulation.
 
 //nolint:funlen // Test functions can be long for readability
 package agent
@@ -38,9 +32,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// ============================================================================
-// TEST HELPER TYPES
-// ============================================================================
+// -- test helper types --------------------------------------------------------
 
 type nopWriteCloser struct {
 	*bytes.Buffer
@@ -174,9 +166,7 @@ func (f *flushErrorWriter) Close() error {
 	return nil
 }
 
-// ============================================================================
-// TEST HELPER FUNCTIONS
-// ============================================================================
+// -- test helper functions ----------------------------------------------------
 
 func makeProbe() *api.ProbingDirective {
 	return &api.ProbingDirective{
@@ -228,9 +218,7 @@ func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadClose
 	return p, nil
 }
 
-// ============================================================================
-// UNIT TESTS - Pure functions (can run in parallel)
-// ============================================================================
+// -- pure functions -----------------------------------------------------------
 
 func TestNormalizeIPAddress(t *testing.T) {
 	t.Parallel()
@@ -670,9 +658,7 @@ func TestParseSentTime(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// INTEGRATION TESTS - Mock-based (can run in parallel)
-// ============================================================================
+// -- integration tests (mock-based) -------------------------------------------
 
 func TestProbeEndToEnd(t *testing.T) {
 	t.Parallel()
@@ -986,8 +972,6 @@ func TestCloseCancels(t *testing.T) {
 	close(csvChan)
 
 	err = prober.Close()
-	// Accept any error or nil - goroutines may exit with various errors
-	// The important thing is Close() completes without hanging
 	if err != nil {
 		t.Logf("Close returned error (acceptable): %v", err)
 	}
@@ -1105,9 +1089,7 @@ func TestProbeWithDifferentTTLs(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 }
 
-// ============================================================================
-// ERROR HANDLING TESTS (can run in parallel)
-// ============================================================================
+// -- error handling -----------------------------------------------------------
 
 func TestHandleResultInvalidCSV(t *testing.T) {
 	t.Parallel()
@@ -1605,9 +1587,7 @@ func TestLogStderrContextCancellationBetweenScans(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// TESTS THAT MODIFY GLOBAL STATE (cannot run in parallel)
-// ============================================================================
+// -- tests that modify global state (non-parallel) ----------------------------
 
 func TestClosePipeErrorLogging(t *testing.T) {
 	// Cannot run in parallel - modifies log output
@@ -1684,7 +1664,6 @@ func TestWriterLoopError(t *testing.T) {
 	err := prober.g.Wait()
 	_ = w.Close()
 
-	// Just verify the error path was triggered
 	if err == nil {
 		t.Error("Expected writerLoop to return error")
 	}
@@ -1747,9 +1726,7 @@ func TestWriterLoopStdinCloseError(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// REAL PROCESS TESTS (cannot run in parallel - compete for resources)
-// ============================================================================
+// -- real process tests (non-parallel) ----------------------------------------
 
 func TestNewCaracalProberWithRealProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
