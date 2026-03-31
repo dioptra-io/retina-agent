@@ -363,7 +363,6 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	}
 }
 
-// TODO: increment ICMPReplyTypeTotal once ProbeResult carries ICMP reply type.
 func (a *agent) recordProbeOutcome(result *ProbeResult) {
 	if result.TimedOut {
 		a.metrics.ProbesTotal.WithLabelValues("timeout").Inc()
