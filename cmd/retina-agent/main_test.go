@@ -11,6 +11,8 @@
 //   - startMetricsServer: goroutine error path after Serve failure requires
 //     closing the listener mid-serve, which is inherently racy.
 //   - main(): standard practice for functions with os.Exit.
+//   - envOrDefaultInt/envOrDefaultDuration: os.Exit(1) on invalid input is
+//     untestable without subprocess testing.
 
 package main
 
@@ -371,6 +373,38 @@ func TestConfig_Validation(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// -- envOrDefault* ------------------------------------------------------------
+
+func TestEnvOrDefault(t *testing.T) {
+	t.Setenv("RETINA_TEST_STR", "hello")
+	if got := envOrDefault("RETINA_TEST_STR", "default"); got != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+	if got := envOrDefault("RETINA_TEST_STR_UNSET", "default"); got != "default" {
+		t.Errorf("got %q, want %q", got, "default")
+	}
+}
+
+func TestEnvOrDefaultInt(t *testing.T) {
+	t.Setenv("RETINA_TEST_INT", "42")
+	if got := envOrDefaultInt("RETINA_TEST_INT", 0); got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+	if got := envOrDefaultInt("RETINA_TEST_INT_UNSET", 7); got != 7 {
+		t.Errorf("got %d, want 7", got)
+	}
+}
+
+func TestEnvOrDefaultDuration(t *testing.T) {
+	t.Setenv("RETINA_TEST_DUR", "30s")
+	if got := envOrDefaultDuration("RETINA_TEST_DUR", 0); got != 30*time.Second {
+		t.Errorf("got %v, want 30s", got)
+	}
+	if got := envOrDefaultDuration("RETINA_TEST_DUR_UNSET", 5*time.Second); got != 5*time.Second {
+		t.Errorf("got %v, want 5s", got)
 	}
 }
 

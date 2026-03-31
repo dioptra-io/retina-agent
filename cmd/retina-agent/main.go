@@ -21,6 +21,12 @@
 //
 //	Set RETINA_SECRET environment variable to enable authentication.
 //	Leave unset for local testing without authentication.
+//
+// Configuration:
+//
+//	All flags can be set via environment variables with the RETINA_ prefix.
+//	Example: -write-queue-size 500 → RETINA_WRITE_QUEUE_SIZE=500
+//	Flags take precedence over environment variables.
 package main
 
 import (
@@ -33,6 +39,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,30 +52,28 @@ import (
 )
 
 var (
-	agentID          = flag.String("id", "agent-1", "Unique identifier for this agent")
-	orchestratorAddr = flag.String("address", "localhost:50050", "Orchestrator address (host:port)")
+	agentID          = flag.String("id", envOrDefault("RETINA_AGENT_ID", "agent-1"), "Unique identifier for this agent")
+	orchestratorAddr = flag.String("address", envOrDefault("RETINA_ORCHESTRATOR_ADDR", "localhost:50050"), "Orchestrator address (host:port)")
 
-	proberType = flag.String("prober-type", agent.ProberTypeCaracal,
+	proberType = flag.String("prober-type", envOrDefault("RETINA_PROBER_TYPE", agent.ProberTypeCaracal),
 		fmt.Sprintf("Prober implementation (%s, %s)", agent.ProberTypeCaracal, agent.ProberTypeMock))
-	proberPath = flag.String("prober-path", "", "Path to prober executable (searches PATH if empty)")
+	proberPath = flag.String("prober-path", envOrDefault("RETINA_PROBER_PATH", ""), "Path to prober executable (searches PATH if empty)")
 
-	writeQueueSize  = flag.Int("write-queue-size", 1000, "Prober write queue buffer size")
-	cleanupInterval = flag.Duration("cleanup-interval", 10*time.Second, "Prober stale probe cleanup interval")
+	writeQueueSize  = flag.Int("write-queue-size", envOrDefaultInt("RETINA_WRITE_QUEUE_SIZE", 1000), "Prober write queue buffer size")
+	cleanupInterval = flag.Duration("cleanup-interval", envOrDefaultDuration("RETINA_CLEANUP_INTERVAL", 10*time.Second), "Prober stale probe cleanup interval")
 
-	pdsBufferSize  = flag.Int("pds-buffer", 100, "Directives channel buffer size")
-	fiesBufferSize = flag.Int("fies-buffer", 100, "FIEs channel buffer size")
+	pdsBufferSize  = flag.Int("pds-buffer", envOrDefaultInt("RETINA_PDS_BUFFER", 100), "Directives channel buffer size")
+	fiesBufferSize = flag.Int("fies-buffer", envOrDefaultInt("RETINA_FIES_BUFFER", 100), "FIEs channel buffer size")
 
-	readDeadline        = flag.Duration("read-deadline", 10*time.Second, "Read timeout for orchestrator connection")
-	writeDeadline       = flag.Duration("write-deadline", 5*time.Second, "Write timeout for orchestrator connection")
-	probeTimeout        = flag.Duration("probe-timeout", 5*time.Second, "Timeout for individual probe responses")
-	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", 5*time.Minute, "Maximum wait time between reconnection attempts")
+	readDeadline        = flag.Duration("read-deadline", envOrDefaultDuration("RETINA_READ_DEADLINE", 10*time.Second), "Read timeout for orchestrator connection")
+	writeDeadline       = flag.Duration("write-deadline", envOrDefaultDuration("RETINA_WRITE_DEADLINE", 5*time.Second), "Write timeout for orchestrator connection")
+	probeTimeout        = flag.Duration("probe-timeout", envOrDefaultDuration("RETINA_PROBE_TIMEOUT", 5*time.Second), "Timeout for individual probe responses")
+	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", envOrDefaultDuration("RETINA_MAX_RECONNECT_BACKOFF", 5*time.Minute), "Maximum wait time between reconnection attempts")
 
-	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", 3, "Maximum consecutive decode errors before reconnecting (0 to disable)")
+	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", envOrDefaultInt("RETINA_MAX_CONSECUTIVE_DECODE_ERRORS", 3), "Maximum consecutive decode errors before reconnecting (0 to disable)")
 
-	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-
-	// 9312 is retina-agent's allocated port; 9090 is Prometheus itself.
-	metricsAddr = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
+	logLevel    = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
+	metricsAddr = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 )
 
 // multiFlag allows a flag to be specified multiple times.
@@ -113,7 +118,7 @@ func main() {
 	}
 
 	if err := cfg.Validate(); err != nil {
-		logger.Error("configuration error", slog.Any("err", err))
+		logger.Error("Configuration error", slog.Any("err", err))
 		os.Exit(1)
 	}
 
@@ -124,7 +129,7 @@ func main() {
 
 	srv, err := startMetricsServer(logger, registry, *metricsAddr)
 	if err != nil {
-		logger.Error("failed to start metrics server", slog.Any("err", err))
+		logger.Error("Failed to start metrics server", slog.Any("err", err))
 		os.Exit(1)
 	}
 
@@ -136,8 +141,39 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("metrics server shutdown failed", slog.Any("err", err))
+		logger.Error("Metrics server shutdown failed", slog.Any("err", err))
 	}
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrDefaultInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v))
+			os.Exit(1)
+		}
+		return i
+	}
+	return def
+}
+
+func envOrDefaultDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v))
+			os.Exit(1)
+		}
+		return d
+	}
+	return def
 }
 
 // newLogger creates a JSON logger writing to stdout at the given level.
