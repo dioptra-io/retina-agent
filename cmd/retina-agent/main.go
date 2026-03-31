@@ -156,7 +156,7 @@ func envOrDefaultInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		i, err := strconv.Atoi(v)
 		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v))
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
 			os.Exit(1)
 		}
 		return i
@@ -168,7 +168,7 @@ func envOrDefaultDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v))
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
 			os.Exit(1)
 		}
 		return d

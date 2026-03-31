@@ -290,7 +290,7 @@ func TestValidate_Secret(t *testing.T) {
 			secret:  "",
 			wantErr: false,
 		},
-		{
+		{ //nolint:gosec // G101: test value, not a real credential
 			name:    "valid strong secret",
 			secret:  "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
 			wantErr: false,

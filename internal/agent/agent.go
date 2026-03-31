@@ -130,7 +130,7 @@ func (a *agent) authenticate(conn net.Conn) error {
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
-	if err := encoder.Encode(authReq); err != nil {
+	if err := encoder.Encode(authReq); err != nil { //nolint:gosec // G117: secret field is intentionally included in auth request
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
 
