@@ -1,27 +1,9 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// ## Test Coverage
-//
-// Current coverage by function:
-// - generatePD:    100% - All protocol variants, IP versions, and cycling logic
-// - reportStats:   100% - Both data and early return paths
-// - receiveFIEs:   100% - Success, EOF, decode error, nil info, and partial info paths
-// - sendPDs:       ~94% - Missing UNKNOWN protocol (unreachable defensive code)
-// - handleAgent:   100% - All paths including defer error handling
-// - main:          0%   - Cannot test infinite server loop
-//
-// ## Uncovered Lines Explanation
-//
-// main() function (0% coverage):
-// - Infinite server loop cannot be tested in unit tests
-// - Would require integration test with actual TCP server and shutdown mechanism
-// - Refactoring for testability not justified for a mock test utility
-//
-// sendPDs() function (~94% coverage):
-// - default branch in protocol switch: defensive code, unreachable in practice
-// - generatePD() only ever produces valid protocols (ICMP, ICMPv6, UDP)
-// - Would require mocking generatePD to return an invalid protocol
+// All functions reach 100% coverage except:
+//   - main(): infinite server loop cannot be tested in unit tests.
+//   - sendPDs(): default protocol branch is unreachable; generatePD only produces ICMP, ICMPv6, or UDP.
 package main
 
 import (
@@ -435,13 +417,20 @@ func TestSendPDs_SendsPDsUntilWriteError(t *testing.T) {
 
 	conn := &limitedWriteConn{mockConn: newMockConn(), limit: 5}
 	encoder := json.NewEncoder(conn)
-	origSent := pdsSent.Load()
-	defer pdsSent.Store(origSent)
 
 	sendPDs(encoder, "test-addr", 1000)
 
-	if got := pdsSent.Load() - origSent; got != 5 {
-		t.Errorf("pdsSent = %d, want 5", got)
+	decoder := json.NewDecoder(conn.writeBuf)
+	count := 0
+	for {
+		var pd api.ProbingDirective
+		if err := decoder.Decode(&pd); err != nil {
+			break
+		}
+		count++
+	}
+	if count != 5 {
+		t.Errorf("PDs written = %d, want 5", count)
 	}
 }
 
@@ -450,13 +439,11 @@ func TestSendPDs_ExitsOnNetworkError(t *testing.T) {
 
 	conn := &errorWriteConn{mockConn: newMockConn(), writeErr: errors.New("network error")}
 	encoder := json.NewEncoder(conn)
-	origSent := pdsSent.Load()
-	defer pdsSent.Store(origSent)
 
 	sendPDs(encoder, "test-addr", 1000)
 
-	if pdsSent.Load() != origSent {
-		t.Error("pdsSent incremented despite write error")
+	if conn.writeBuf.Len() != 0 {
+		t.Error("data written to buffer despite write error")
 	}
 }
 
