@@ -1,24 +1,26 @@
-.PHONY: build proper test run clean help
+.PHONY: build lint fmt tidy test run clean help
 
 help:
 	@echo "Valid targets:"
-	@echo "  build     - Build retina-agent binary"
-	@echo "  proper    - Format code and run linters"
-	@echo "  test      - Run tests"
-	@echo "  run       - Build and run retina-agent"
-	@echo "  clean     - Remove built binaries"
+	@echo "  build  - Format, lint, and build retina-agent binary"
+	@echo "  lint   - Format code and run linters"
+	@echo "  fmt    - Format code"
+	@echo "  tidy   - Tidy go modules"
+	@echo "  test   - Run tests with race detection"
+	@echo "  run    - Build and run retina-agent"
+	@echo "  clean  - Remove built binaries"
 
-build: proper
+build: lint
 	go build -o retina-agent ./cmd/retina-agent
 
-proper:
-	find . -name '*.go' | sort | xargs wc -l
-	gofmt -s -w $(shell go list -f '{{.Dir}}' ./...)
-	@if command -v goimports >/dev/null 2>&1; then \
-		echo goimports -w $(shell go list -f '{{.Dir}}' ./...); \
-		goimports -w $(shell go list -f '{{.Dir}}' ./...); \
-	fi
+lint: fmt
 	golangci-lint run
+
+fmt:
+	go fmt ./...
+
+tidy:
+	go mod tidy
 
 test:
 	go test -v -race -cover ./...
