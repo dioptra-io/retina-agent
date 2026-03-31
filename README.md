@@ -153,4 +153,4 @@ Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, 
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details
