@@ -98,6 +98,7 @@ func main() {
 	flag.Parse()
 
 	logger := newLogger(*logLevel)
+	logger = logger.With(slog.String("agent_id", *agentID))
 
 	cfg := &agent.Config{
 		AgentID:                    *agentID,
