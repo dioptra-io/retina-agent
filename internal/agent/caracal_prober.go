@@ -57,6 +57,8 @@ type caracalProber struct {
 	g       *errgroup.Group
 }
 
+var _ (Prober) = (*caracalProber)(nil)
+
 // probeKey uniquely identifies a probe within a time window.
 type probeKey struct {
 	dstAddr           string
