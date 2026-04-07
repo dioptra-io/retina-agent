@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -323,7 +324,7 @@ func (p *caracalProber) readerLoop() error {
 	for {
 		record, err := p.stdout.Read()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return fmt.Errorf("caracal stdout closed")
 			}
 			return fmt.Errorf("read error: %w", err)
@@ -335,12 +336,29 @@ func (p *caracalProber) readerLoop() error {
 	}
 }
 
+// handleResult processes a single caracal CSV output record and delivers the
+// parsed probe result to the waiting Probe() goroutine.
+//
+// Expected CSV fields (0-indexed):
+//
+//	[0]  capture_timestamp   - Unix timestamp of reply capture
+//	[1]  probe_protocol      - IP protocol number (1=ICMP, 17=UDP, 58=ICMPv6)
+//	[2]  probe_src_addr      - Source address of the probe
+//	[3]  probe_dst_addr      - Destination address of the probe
+//	[4]  probe_src_port      - Source port (or ICMP first half-word)
+//	[5]  probe_dst_port      - Destination port (or ICMP second half-word)
+//	[6]  probe_ttl           - TTL of the probe
+//	[7]  quoted_ttl          - TTL quoted back in ICMP reply
+//	[8]  reply_src_addr      - Address that sent the reply
+//	[9]  reply_protocol      - Protocol of the reply
+//	[10] reply_icmp_type     - ICMP type of the reply
+//	[11] reply_icmp_code     - ICMP code of the reply
+//	[12] reply_ttl           - TTL of the reply packet
+//	[13] reply_size          - Size of the reply packet
+//	[14] reply_mpls_labels   - MPLS labels (may be empty)
+//	[15] rtt                 - Round-trip time in units of 0.1ms
+//	[16] round               - Probe round number
 func (p *caracalProber) handleResult(record []string) error {
-	// CSV fields: capture_timestamp, probe_protocol, probe_src_addr, probe_dst_addr,
-	// probe_src_port, probe_dst_port, probe_ttl, quoted_ttl, reply_src_addr,
-	// reply_protocol, reply_icmp_type, reply_icmp_code, reply_ttl, reply_size,
-	// reply_mpls_labels, rtt, round
-
 	if len(record) < 17 {
 		return fmt.Errorf("invalid CSV record: expected 17 fields, got %d", len(record))
 	}
@@ -448,12 +466,11 @@ func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 	}, nil
 }
 
+// matchAndDeliverResult finds the in-flight probe matching key and sends it the
+// result. It searches ±2 seconds around the correlation timestamp to tolerate
+// clock skew between Go's system clock and caracal's reported timestamps.
+// If the channel is full or no match is found, the result is dropped.
 func (p *caracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult) {
-	// Try to match with up to 2 seconds tolerance for timing variations.
-	// The result has correlationSecond from caracal's timestamps (sent time).
-	// The in-flight map has correlationSecond from Go's system clock (queued time).
-	// Due to clock skew, NTP adjustments, and timestamp calculation differences,
-	// these can differ in either direction. Search ±2 seconds to handle this.
 	sentTime := key.correlationSecond
 
 	for _, offset := range []int64{0, -1, 1, -2, 2} {
@@ -555,6 +572,6 @@ func protocolToString(protocol api.Protocol) string {
 	case api.UDP:
 		return "udp"
 	default:
-		return fmt.Sprintf("%d", protocol)
+		return strconv.Itoa(int(protocol))
 	}
 }
