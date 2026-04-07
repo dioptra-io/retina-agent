@@ -784,8 +784,8 @@ func TestDuplicateProbe(t *testing.T) {
 	defer cancel()
 
 	result, err := prober.Probe(ctx, pd, 64)
-	if err != nil {
-		t.Errorf("duplicate probe should return nil error, got: %v", err)
+	if !errors.Is(err, ErrDuplicatePD) {
+		t.Errorf("duplicate probe should return ErrDuplicatePD, got: %v", err)
 	}
 	if result != nil {
 		t.Errorf("duplicate probe should return nil result, got: %v", result)

@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -12,12 +13,19 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
+var ErrDuplicatePD = errors.New("probing directive is already in-flight")
+
 // Prober sends network probes and returns timing information.
 // Implementations must be safe for concurrent use.
 type Prober interface {
-	// Probe blocks until a reply is received or the probe times out.
-	// TimedOut=true in the result is not an error — only ctx cancellation
-	// or probe operation failures return a non-nil error.
+	// Probe sends a network probe and blocks until one of:
+	//   - a reply is received: returns (result with TimedOut=false, nil)
+	//   - the implementation's internal timeout fires: returns (result with TimedOut=true, nil)
+	//   - a duplicate probe is already in-flight: returns (nil, ErrDuplicateProbe)
+	//   - ctx is cancelled or a probe operation failure occurs: returns (nil, non-nil error)
+	//
+	// Implementations are responsible for enforcing their own probe timeout.
+	// Probe must not block indefinitely — callers do not add a deadline to ctx.
 	Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
 
 	// Close releases resources. Safe to call multiple times.
