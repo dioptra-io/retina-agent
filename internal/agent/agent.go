@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -46,6 +47,9 @@ type agent struct {
 	prober  Prober
 	logger  *slog.Logger
 	metrics *Metrics
+
+	pdsDepth  atomic.Int64
+	fiesDepth atomic.Int64
 }
 
 type probeResult struct {
@@ -197,7 +201,8 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		case <-ctx.Done():
 			return ctx.Err()
 		case pds <- &pd:
-			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
+			a.pdsDepth.Add(1)
+			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
 		}
 	}
 }
@@ -260,7 +265,8 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			if !ok {
 				return nil
 			}
-			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
+			a.pdsDepth.Add(-1)
+			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
 			a.metrics.PDGoroutines.Inc()
 			wg.Go(func() {
 				a.processPD(ctx, pd, fies)
@@ -281,7 +287,8 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return nil
 			}
 
-			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(len(fies)))
+			a.fiesDepth.Add(-1)
+			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 
 			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
 				return fmt.Errorf("failed to set write deadline: %w", err)
@@ -357,6 +364,8 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 
 	select {
 	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL):
+		a.fiesDepth.Add(1)
+		a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 	case <-ctx.Done():
 	}
 }
