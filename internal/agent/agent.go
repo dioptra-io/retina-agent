@@ -72,7 +72,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 	a := &agent{
 		config:  cfg,
 		prober:  prober,
-		logger:  logger.With(slog.String("agent_id", cfg.AgentID)),
+		logger:  logger,
 		metrics: metrics,
 	}
 
@@ -262,11 +262,9 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			}
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(len(pds)))
 			a.metrics.PDGoroutines.Inc()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				a.processPD(ctx, pd, fies)
-			}()
+			})
 		}
 	}
 }

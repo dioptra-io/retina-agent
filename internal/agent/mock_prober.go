@@ -21,6 +21,8 @@ type MockProber struct {
 	config *Config
 }
 
+var _ (Prober) = (*MockProber)(nil)
+
 func NewMockProber(cfg *Config) *MockProber {
 	return &MockProber{
 		rng:    rand.New(rand.NewSource(time.Now().UnixNano())), // #nosec G404 -- crypto/rand not needed for mock prober testing
