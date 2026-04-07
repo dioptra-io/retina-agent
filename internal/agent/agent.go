@@ -269,9 +269,6 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 	}
 }
 
-// writerLoop encodes and sends ForwardingInfoElement messages to the orchestrator.
-// It reads from the fies channel, applies write deadlines, and handles encoding
-// errors. Returns when context is cancelled or fies channel is closed.
 func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
 	encoder := json.NewEncoder(conn)
 
