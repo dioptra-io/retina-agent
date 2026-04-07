@@ -268,11 +268,9 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			a.pdsDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
 			a.metrics.PDGoroutines.Inc()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				a.processPD(ctx, pd, fies)
-			}()
+			})
 		}
 	}
 }
