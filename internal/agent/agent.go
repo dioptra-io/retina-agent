@@ -52,11 +52,6 @@ type agent struct {
 	fiesDepth atomic.Int64
 }
 
-type probeResult struct {
-	result *ProbeResult
-	err    error
-}
-
 // Run starts the agent and blocks until the context is cancelled or an error occurs.
 func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics) error {
 	if cfg == nil {
@@ -317,6 +312,11 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 // Timed-out probes produce a nil NearInfo or FarInfo in the FIE.
 func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
 	defer a.metrics.PDGoroutines.Dec()
+
+	type probeResult struct {
+		result *ProbeResult
+		err    error
+	}
 
 	nearTTL := pd.NearTTL
 	farTTL := pd.NearTTL + 1
