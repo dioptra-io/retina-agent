@@ -236,7 +236,7 @@ func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(ttl)))
 		p.metrics.DuplicateProbesTotal.Inc()
-		return nil, nil
+		return nil, ErrDuplicatePD
 	}
 	p.inFlight[key] = &inFlightProbe{resultCh: resultCh, queuedTime: now}
 	p.metrics.InFlightProbes.Inc()

@@ -1303,7 +1303,7 @@ func TestProcessPD_NilNearResult(t *testing.T) {
 		prober: &stubProber{
 			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 				if ttl == 5 {
-					return nil, nil // probe already in-flight
+					return nil, ErrDuplicatePD // probe already in-flight
 				}
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},
@@ -1332,7 +1332,7 @@ func TestProcessPD_NilFarResult(t *testing.T) {
 		prober: &stubProber{
 			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 				if ttl == 6 {
-					return nil, nil // probe already in-flight
+					return nil, ErrDuplicatePD // probe already in-flight
 				}
 				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
 			},

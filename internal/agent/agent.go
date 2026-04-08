@@ -335,6 +335,9 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	farRes := <-farCh
 
 	if nearRes.err != nil {
+		if errors.Is(nearRes.err, ErrDuplicatePD) {
+			return // probe already in-flight for this destination/TTL/second
+		}
 		a.logger.Error("Near probe failed",
 			slog.Uint64("pd_id", pd.ProbingDirectiveID),
 			slog.String("dest", pd.DestinationAddress.String()),
@@ -343,12 +346,12 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
 	}
-	if nearRes.result == nil {
-		return // probe already in-flight for this destination/TTL/second
-	}
 	a.recordProbeOutcome(nearRes.result)
 
 	if farRes.err != nil {
+		if errors.Is(farRes.err, ErrDuplicatePD) {
+			return // probe already in-flight for this destination/TTL/second
+		}
 		a.logger.Error("Far probe failed",
 			slog.Uint64("pd_id", pd.ProbingDirectiveID),
 			slog.String("dest", pd.DestinationAddress.String()),
@@ -356,9 +359,6 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			slog.Any("err", farRes.err))
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
-	}
-	if farRes.result == nil {
-		return // probe already in-flight for this destination/TTL/second
 	}
 	a.recordProbeOutcome(farRes.result)
 
