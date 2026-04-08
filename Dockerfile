@@ -29,4 +29,4 @@ RUN curl -L https://github.com/dioptra-io/caracal/releases/download/v0.15.3/cara
 WORKDIR /app
 COPY --from=builder /build/retina-agent .
 
-CMD ["./retina-agent"]
+ENTRYPOINT ["./retina-agent"]
