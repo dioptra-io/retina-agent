@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
 
 FROM docker.io/library/debian:bookworm-slim
 
-LABEL maintainer="Elena Nardi <elena.nardi@lip6.fr>"
+LABEL org.opencontainers.image.authors="Dioptra <contact@dioptra.io>"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
