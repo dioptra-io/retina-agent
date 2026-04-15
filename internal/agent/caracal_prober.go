@@ -491,7 +491,7 @@ func (p *caracalProber) matchAndDeliverResult(key probeKey, result *ProbeResult)
 	}
 
 	p.metrics.CorrelationFailuresTotal.Inc()
-	p.logger.Warn("No in-flight probe found for result",
+	p.logger.Debug("No in-flight probe found for result",
 		slog.String("dest", key.dstAddr),
 		slog.Int("ttl", int(key.ttl)),
 		slog.String("protocol", protocolToString(key.protocol)),
