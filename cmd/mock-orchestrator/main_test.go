@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Dioptra
+// Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
 // All functions reach 100% coverage except:

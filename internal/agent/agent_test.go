@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Dioptra
+// Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
 // Package agent provides unit tests for the retina-agent network measurement system.
