@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Dioptra
+// Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
 // metrics.go defines all Prometheus metrics for the retina agent.
