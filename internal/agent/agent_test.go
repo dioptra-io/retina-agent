@@ -11,7 +11,7 @@
 //     SetKeepAlive and SetKeepAlivePeriod error paths are untested; setsockopt
 //     failures are not realistically injectable without low-level OS mocking.
 //
-//   - readerLoop (95.0%): the context cancellation branch inside the select is
+//   - readerLoop (97.0%): the context cancellation branch inside the select is
 //     timing-dependent and is indirectly covered by TestReaderLoop_ContextCancelled.
 //
 //   - caracal_prober.go is excluded entirely; NewCaracalProber requires the caracal
@@ -478,29 +478,6 @@ func TestRun_WithMockConnection(t *testing.T) {
 
 // -- handleDecodeError() ------------------------------------------------------
 
-func TestHandleDecodeError_Timeout(t *testing.T) {
-	t.Parallel()
-
-	a := &agent{
-		config:  &Config{AgentID: "test-agent"},
-		logger:  testLogger(),
-		metrics: testMetrics(),
-	}
-
-	err := &mockNetError{timeout: true, err: "timeout"}
-	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
-
-	if !shouldContinue {
-		t.Error("should continue on timeout")
-	}
-	if newCount != 0 {
-		t.Errorf("error count should remain 0, got: %d", newCount)
-	}
-	if handledErr != nil {
-		t.Errorf("should not return error on timeout, got: %v", handledErr)
-	}
-}
-
 func TestHandleDecodeError_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
@@ -777,6 +754,33 @@ func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("readerLoop did not exit after consecutive decode errors")
+	}
+}
+
+func TestReaderLoop_DeadConnectionDetection(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{
+			AgentID:      "test-agent",
+			ReadDeadline: 1 * time.Millisecond,
+		},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	pds := make(chan *api.ProbingDirective, 1)
+	err := a.readerLoop(context.Background(), client, pds)
+
+	if err == nil {
+		t.Fatal("expected error after consecutive timeouts, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection timed out after") {
+		t.Errorf("expected timeout error, got: %v", err)
 	}
 }
 
