@@ -42,6 +42,12 @@ import (
 
 var ErrInvalidDirective = errors.New("invalid probing directive")
 
+// orchestratorKeepalivePeriod is the interval between TCP keepalive probes
+// for the orchestrator connection. Keepalives ensure that a dead connection is
+// detected even when no data is being exchanged, triggering reconnection instead
+// of blocking indefinitely on a read timeout.
+const orchestratorKeepalivePeriod = 10 * time.Second
+
 type agent struct {
 	config  *Config
 	prober  Prober
@@ -75,15 +81,23 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		metrics: metrics,
 	}
 
-	conn, err := net.Dial("tcp", a.config.OrchestratorAddr)
+	tcpConn, err := net.Dial("tcp", a.config.OrchestratorAddr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to orchestrator: %w", err)
 	}
+	conn := tcpConn.(*net.TCPConn)
 	defer func() {
 		if err := conn.Close(); err != nil {
 			a.logger.Debug("Failed to close connection", slog.Any("err", err))
 		}
 	}()
+
+	if err := conn.SetKeepAlive(true); err != nil {
+		return fmt.Errorf("failed to enable keepalive: %w", err)
+	}
+	if err := conn.SetKeepAlivePeriod(orchestratorKeepalivePeriod); err != nil {
+		return fmt.Errorf("failed to set keepalive period: %w", err)
+	}
 
 	a.logger.Info("Connected to orchestrator",
 		slog.String("address", a.config.OrchestratorAddr))

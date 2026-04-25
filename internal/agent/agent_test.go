@@ -5,9 +5,11 @@
 //
 // Intentionally uncovered (94-95% overall):
 //
-//   - Run (94.3%): defer conn.Close() and defer prober.Close() error paths are
+//   - Run (85%): defer conn.Close() and defer prober.Close() error paths are
 //     unreachable in practice; Go returns nil on Close() of a cleanly established
 //     connection.
+//     SetKeepAlive and SetKeepAlivePeriod error paths are untested; setsockopt
+//     failures are not realistically injectable without low-level OS mocking.
 //
 //   - readerLoop (95.0%): the context cancellation branch inside the select is
 //     timing-dependent and is indirectly covered by TestReaderLoop_ContextCancelled.
