@@ -48,6 +48,13 @@ var ErrInvalidDirective = errors.New("invalid probing directive")
 // of blocking indefinitely on a read timeout.
 const orchestratorKeepalivePeriod = 10 * time.Second
 
+// maxConsecutiveReadTimeouts is the number of consecutive read timeouts before
+// the connection is considered dead and reconnection is triggered. With the
+// default ReadDeadline of 10s, a dead connection is detected in ~60s. Kept as
+// a constant rather than a config field since operators should tune ReadDeadline
+// instead.
+const maxConsecutiveReadTimeouts = 6
+
 type agent struct {
 	config  *Config
 	prober  Prober
@@ -170,12 +177,14 @@ func (a *agent) authenticate(conn net.Conn) error {
 
 // readerLoop receives and validates ProbingDirective messages from the orchestrator.
 // After MaxConsecutiveDecodeErrors consecutive JSON failures the connection is
-// terminated (set to 0 to disable). Closing pds on return signals processorLoop
-// to drain in-flight goroutines and exit.
+// terminated (set to 0 to disable). After maxConsecutiveReadTimeouts consecutive
+// read timeouts the connection is considered dead and reconnection is triggered.
+// Closing pds on return signals processorLoop to drain in-flight goroutines and exit.
 func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
 	defer close(pds)
 	decoder := json.NewDecoder(conn)
 	consecutiveDecodeErrors := 0
+	consecutiveTimeouts := 0
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
@@ -184,6 +193,20 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 
 		var pd api.ProbingDirective
 		if err := decoder.Decode(&pd); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				consecutiveTimeouts++
+				a.logger.Debug("Read timeout, no data received",
+					slog.Int("consecutive", consecutiveTimeouts),
+					slog.Int("max", maxConsecutiveReadTimeouts))
+				if consecutiveTimeouts >= maxConsecutiveReadTimeouts {
+					return fmt.Errorf("connection timed out after %d consecutive read timeouts", consecutiveTimeouts)
+				}
+				continue
+			}
+			consecutiveTimeouts = 0
 			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
 			consecutiveDecodeErrors = newCount
 			if !shouldContinue {
@@ -193,6 +216,7 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		}
 
 		consecutiveDecodeErrors = 0
+		consecutiveTimeouts = 0
 		a.metrics.PDsReceivedTotal.Inc()
 
 		if err := validatePD(&pd); err != nil {
@@ -217,17 +241,11 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 }
 
 // handleDecodeError classifies a JSON decode error and decides whether to retry.
-// Returns (shouldContinue, updatedErrorCount, errorToReturn).
+// Timeouts are handled by the caller. Returns (shouldContinue, updatedErrorCount, errorToReturn).
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
 	// Check for context cancellation first, regardless of error type.
 	if ctx.Err() != nil {
 		return false, consecutiveErrors, ctx.Err()
-	}
-
-	// Check for read timeout (expected, just retry).
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		a.logger.Debug("Read timeout, no data received")
-		return true, consecutiveErrors, nil
 	}
 
 	// Check for network errors (trigger reconnection)
