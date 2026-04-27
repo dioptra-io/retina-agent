@@ -97,6 +97,35 @@ go run test/mock_orchestrator.go
 
 See `--help` for all options.
 
+### Environment Variables
+
+All flags can be configured via environment variables. These act as defaults and are overridden by CLI flags.
+
+Precedence:
+
+```
+CLI flags > environment variables > hardcoded defaults
+```
+
+| Variable                               | Default           | Description                                                      |
+| -------------------------------------- | ----------------- | ---------------------------------------------------------------- |
+| `RETINA_SECRET`                        | *                 | Shared secret for orchestrator authentication, required          |
+| `RETINA_ID`                            | `agent-1`         | Agent identifier                                                 |
+| `RETINA_ADDRESS`                       | `localhost:50050` | Orchestrator address (host:port)                                 |
+| `RETINA_PROBER_TYPE`                   | `caracal`         | Prober to use (`caracal` or `mock`)                              |
+| `RETINA_PROBER_PATH`                   | *(searches PATH)* | Path to prober executable                                        |
+| `RETINA_WRITE_QUEUE_SIZE`              | `1000`            | Prober write queue buffer size                                   |
+| `RETINA_CLEANUP_INTERVAL`              | `10s`             | Prober stale probe cleanup interval                              |
+| `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
+| `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
+| `RETINA_READ_DEADLINE`                 | `10s`             | Read timeout for orchestrator connection                         |
+| `RETINA_WRITE_DEADLINE`                | `5s`              | Write timeout for orchestrator connection                        |
+| `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
+| `RETINA_MAX_RECONNECT_BACKOFF`         | `5m`              | Maximum wait between reconnection attempts                       |
+| `RETINA_MAX_CONSECUTIVE_DECODE_ERRORS` | `3`               | Max consecutive decode errors before reconnecting (0 to disable) |
+| `RETINA_LOG_LEVEL`                     | `info`            | Log level (`debug`, `info`, `warn`, `error`)                     |
+| `RETINA_METRICS_ADDR`                  | `:9312`           | Address to expose Prometheus metrics on                          |
+
 ## How It Works
 
 ### Processing Model
