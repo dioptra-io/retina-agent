@@ -65,7 +65,7 @@ type agent struct {
 	fiesDepth atomic.Int64
 }
 
-// Run starts the agent and blocks until the context is cancelled or an error occurs.
+// Run starts the agent and blocks until the context is canceled or an error occurs.
 func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics) error {
 	if cfg == nil {
 		cfg = DefaultConfig()

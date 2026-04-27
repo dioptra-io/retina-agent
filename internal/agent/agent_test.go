@@ -1,8 +1,6 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
-// Package agent provides unit tests for the retina-agent network measurement system.
-//
 // Intentionally uncovered (94-95% overall):
 //
 //   - Run (85%): defer conn.Close() and defer prober.Close() error paths are
@@ -392,7 +390,7 @@ func TestRun_ContextCancelledBeforeConnect(t *testing.T) {
 
 	err := Run(ctx, cfg, testLogger(), testMetrics())
 	if err == nil {
-		t.Error("Run(cancelled context) should fail")
+		t.Error("Run(canceled context) should fail")
 	}
 }
 
@@ -663,7 +661,7 @@ func TestReaderLoop_DecodeErrorWithUnlimitedRetries(t *testing.T) {
 	conn := &stubConn{
 		readFunc: func(b []byte) (int, error) {
 			attempts++
-			return copy(b, []byte("invalid json\n")), nil
+			return copy(b, "invalid json\n"), nil
 		},
 	}
 
@@ -711,7 +709,7 @@ func TestReaderLoop_ContextCancelled(t *testing.T) {
 
 	err := a.readerLoop(ctx, conn, make(chan *api.ProbingDirective, 1))
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("readerLoop(ctx cancelled) = %v, want context.Canceled", err)
+		t.Errorf("readerLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
 }
 
@@ -770,8 +768,8 @@ func TestReaderLoop_DeadConnectionDetection(t *testing.T) {
 	}
 
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	pds := make(chan *api.ProbingDirective, 1)
 	err := a.readerLoop(context.Background(), client, pds)
@@ -944,7 +942,7 @@ func TestWriterLoop_ContextCancelled(t *testing.T) {
 
 	err := a.writerLoop(ctx, &stubConn{}, make(chan *api.ForwardingInfoElement))
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("writerLoop(ctx cancelled) = %v, want context.Canceled", err)
+		t.Errorf("writerLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
 }
 
@@ -1058,7 +1056,7 @@ func TestProcessorLoop_ContextCancelled(t *testing.T) {
 
 	err := a.processorLoop(ctx, make(chan *api.ProbingDirective), make(chan *api.ForwardingInfoElement))
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("processorLoop(ctx cancelled) = %v, want context.Canceled", err)
+		t.Errorf("processorLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
 }
 
@@ -1156,61 +1154,48 @@ func TestProcessPD_Success(t *testing.T) {
 	}
 }
 
-func TestProcessPD_NearProbeError(t *testing.T) {
+func TestProcessPD_ProbeError(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 5 {
-					return nil, errors.New("near probe fail")
-				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
-		},
-		logger:  testLogger(),
-		metrics: testMetrics(),
+	tests := []struct {
+		name    string
+		failTTL uint8
+		errMsg  string
+	}{
+		{name: "near probe error", failTTL: 5, errMsg: "should not send FIE on near probe error"},
+		{name: "far probe error", failTTL: 6, errMsg: "should not send FIE on far probe error"},
 	}
 
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	a.processPD(context.Background(), pd, fies)
+			a := &agent{
+				config: &Config{AgentID: "test"},
+				prober: &stubProber{
+					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+						if ttl == tt.failTTL {
+							return nil, errors.New("probe fail")
+						}
+						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+					},
+				},
+				logger:  testLogger(),
+				metrics: testMetrics(),
+			}
 
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE on near probe error")
-	case <-time.After(100 * time.Millisecond):
-	}
-}
+			pd := &api.ProbingDirective{NearTTL: 5}
+			fies := make(chan *api.ForwardingInfoElement, 1)
 
-func TestProcessPD_FarProbeError(t *testing.T) {
-	t.Parallel()
+			a.processPD(context.Background(), pd, fies)
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 6 {
-					return nil, errors.New("far probe fail")
-				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
-		},
-		logger:  testLogger(),
-		metrics: testMetrics(),
-	}
-
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
-
-	a.processPD(context.Background(), pd, fies)
-
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE on far probe error")
-	case <-time.After(100 * time.Millisecond):
+			select {
+			case <-fies:
+				t.Error(tt.errMsg)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -1301,61 +1286,48 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	}
 }
 
-func TestProcessPD_NilNearResult(t *testing.T) {
+func TestProcessPD_NilResult(t *testing.T) {
 	t.Parallel()
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 5 {
-					return nil, ErrDuplicatePD // probe already in-flight
-				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
-		},
-		logger:  testLogger(),
-		metrics: testMetrics(),
+	tests := []struct {
+		name   string
+		nilTTL uint8
+		errMsg string
+	}{
+		{name: "nil near result", nilTTL: 5, errMsg: "should not send FIE when near result is nil"},
+		{name: "nil far result", nilTTL: 6, errMsg: "should not send FIE when far result is nil"},
 	}
 
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	a.processPD(context.Background(), pd, fies)
+			a := &agent{
+				config: &Config{AgentID: "test"},
+				prober: &stubProber{
+					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+						if ttl == tt.nilTTL {
+							return nil, ErrDuplicatePD // probe already in-flight
+						}
+						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+					},
+				},
+				logger:  testLogger(),
+				metrics: testMetrics(),
+			}
 
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE when near result is nil")
-	case <-time.After(100 * time.Millisecond):
-	}
-}
+			pd := &api.ProbingDirective{NearTTL: 5}
+			fies := make(chan *api.ForwardingInfoElement, 1)
 
-func TestProcessPD_NilFarResult(t *testing.T) {
-	t.Parallel()
+			a.processPD(context.Background(), pd, fies)
 
-	a := &agent{
-		config: &Config{AgentID: "test"},
-		prober: &stubProber{
-			probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
-				if ttl == 6 {
-					return nil, ErrDuplicatePD // probe already in-flight
-				}
-				return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
-			},
-		},
-		logger:  testLogger(),
-		metrics: testMetrics(),
-	}
-
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
-
-	a.processPD(context.Background(), pd, fies)
-
-	select {
-	case <-fies:
-		t.Error("processPD should not send FIE when far result is nil")
-	case <-time.After(100 * time.Millisecond):
+			select {
+			case <-fies:
+				t.Error(tt.errMsg)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 

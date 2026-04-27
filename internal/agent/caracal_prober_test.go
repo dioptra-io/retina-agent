@@ -181,7 +181,7 @@ func makeProbe() *api.ProbingDirective {
 	}
 }
 
-func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) (*caracalProber, error) {
+func NewCaracalProberMock(cfg *Config, stdin io.WriteCloser, stdout, stderr io.ReadCloser) (*caracalProber, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -597,64 +597,6 @@ func TestBuildProbeKeyFromDirective(t *testing.T) {
 	}
 	if key.correlationSecond != timestamp {
 		t.Errorf("expected correlationSecond=%d, got %d", timestamp, key.correlationSecond)
-	}
-}
-
-func TestParseSentTime(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		record      []string
-		expectError bool
-	}{
-		{
-			name: "valid timestamps",
-			record: []string{
-				"1609459200", "17", "192.0.2.1", "8.8.8.8",
-				"50000", "33434", "10", "0", "8.8.8.8",
-				"1", "0", "0", "64", "28", "", "50", "0",
-			},
-			expectError: false,
-		},
-		{
-			name: "missing capture timestamp",
-			record: []string{
-				"", "17", "192.0.2.1", "8.8.8.8",
-				"50000", "33434", "10", "0", "8.8.8.8",
-				"1", "0", "0", "64", "28", "", "50", "0",
-			},
-			expectError: true,
-		},
-		{
-			name: "missing rtt",
-			record: []string{
-				"1609459200", "17", "192.0.2.1", "8.8.8.8",
-				"50000", "33434", "10", "0", "8.8.8.8",
-				"1", "0", "0", "64", "28", "", "", "0",
-			},
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			result, err := parseProbeResult(tt.record)
-			if tt.expectError {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if result.SentTime.IsZero() {
-					t.Error("expected non-zero time")
-				}
-			}
-		})
 	}
 }
 

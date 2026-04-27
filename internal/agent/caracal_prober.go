@@ -133,7 +133,7 @@ var NewCaracalProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) 
 // Uses cfg.ProberPath to locate the caracal executable (defaults to searching PATH).
 // Custom caracal arguments are specified via cfg.ProberArgs.
 // Example: cfg.ProberArgs = []string{"--probing-rate", "100000", "--n-packets", "3"}
-func setupCaracalProcess(cfg *Config, logger *slog.Logger) (cmd *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser, err error) {
+func setupCaracalProcess(cfg *Config, logger *slog.Logger) (cmd *exec.Cmd, stdin io.WriteCloser, stdout, stderr io.ReadCloser, err error) {
 	caracalPath := cfg.ProberPath
 	if caracalPath == "" {
 		caracalPath = "caracal"
@@ -216,13 +216,13 @@ func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp i
 }
 
 // Probe sends a single probe and blocks until a result arrives, the probe times
-// out, or ctx is cancelled. The actual send happens asynchronously via
+// out, or ctx is canceled. The actual send happens asynchronously via
 // writerLoop → caracal → network.
 //
 // Returns nil, nil if an identical probe is already in-flight (deduplication).
 // Returns a ProbeResult with TimedOut=true on timeout; SentTime is approximated
 // as queue time and may differ from actual send time under backpressure.
-// Returns a non-nil error only if ctx is cancelled.
+// Returns a non-nil error only if ctx is canceled.
 func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
