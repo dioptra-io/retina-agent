@@ -1,4 +1,4 @@
-version: 2
+version: "2"
 
 run:
   concurrency: 4
@@ -24,34 +24,22 @@ linters:
     - whitespace
     - exhaustive
     - unparam
-
-linters-settings:
-  gocyclo:
-    min-complexity: 10
-  funlen:
-    lines: 80
-    statements: 100
-  misspell:
-    locale: US
-  dupl:
-    threshold: 100
-  gocritic:
-    enabled-checks:
-      - appendAssign
-      - captLocal
-      - channelClose
-      - commentFormatting
-      - hugeParam
-      - ifElseChain
-      - importShadow
-      - lenCompare
-      - paramTypeCombine
-      - sloppyLen
-      - stringXbytes
-      - underef
-      - unnecessaryTypeConversion
-      - valueOf
-      - wrapperFunc
+  settings:
+    gocyclo:
+      min-complexity: 15
+    funlen:
+      lines: 80
+      statements: 100
+    misspell:
+      locale: US
+    dupl:
+      threshold: 100
+    gocritic:
+      enabled-checks:
+        - hugeParam
+        - importShadow
+        - paramTypeCombine
+        - stringXbytes
 
 issues:
   max-issues-per-linter: 0

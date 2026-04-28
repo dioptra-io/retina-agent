@@ -31,6 +31,41 @@ func createTempProber(t *testing.T) string {
 	return proberPath
 }
 
+// validationTestCase is a reusable test case for cfg.Validate() subtests.
+type validationTestCase struct {
+	name    string
+	setup   func(*Config)
+	wantErr bool
+	errMsg  string
+}
+
+// runValidationTests runs table-driven subtests that call cfg.Validate().
+func runValidationTests(t *testing.T, tests []validationTestCase) {
+	t.Helper()
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := validConfig()
+			tt.setup(cfg)
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func testDurationField(t *testing.T, fieldName string, setField func(*Config, time.Duration)) {
 	t.Helper()
 	t.Parallel()
@@ -40,26 +75,10 @@ func testDurationField(t *testing.T, fieldName string, setField func(*Config, ti
 		duration time.Duration
 		wantErr  bool
 	}{
-		{
-			name:     "valid duration",
-			duration: 5 * time.Second,
-			wantErr:  false,
-		},
-		{
-			name:     "small valid duration",
-			duration: 100 * time.Millisecond,
-			wantErr:  false,
-		},
-		{
-			name:     "zero duration",
-			duration: 0,
-			wantErr:  true,
-		},
-		{
-			name:     "negative duration",
-			duration: -1 * time.Second,
-			wantErr:  true,
-		},
+		{name: "valid duration", duration: 5 * time.Second, wantErr: false},
+		{name: "small valid duration", duration: 100 * time.Millisecond, wantErr: false},
+		{name: "zero duration", duration: 0, wantErr: true},
+		{name: "negative duration", duration: -1 * time.Second, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -150,21 +169,9 @@ func TestValidate_AgentID(t *testing.T) {
 		agentID string
 		wantErr bool
 	}{
-		{
-			name:    "valid agent ID",
-			agentID: "agent-1",
-			wantErr: false,
-		},
-		{
-			name:    "empty agent ID",
-			agentID: "",
-			wantErr: true,
-		},
-		{
-			name:    "complex agent ID",
-			agentID: "prod-agent-us-east-1a",
-			wantErr: false,
-		},
+		{name: "valid agent ID", agentID: "agent-1", wantErr: false},
+		{name: "empty agent ID", agentID: "", wantErr: true},
+		{name: "complex agent ID", agentID: "prod-agent-us-east-1a", wantErr: false},
 	}
 
 	for _, tt := range tests {
@@ -194,74 +201,46 @@ func TestValidate_AgentID(t *testing.T) {
 func TestValidate_OrchestratorAddr(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		addr    string
-		wantErr bool
-		errMsg  string
-	}{
+	runValidationTests(t, []validationTestCase{
 		{
 			name:    "valid hostname with port",
-			addr:    "localhost:50050",
+			setup:   func(c *Config) { c.OrchestratorAddr = "localhost:50050" },
 			wantErr: false,
 		},
 		{
 			name:    "valid IP with port",
-			addr:    "192.168.1.1:50050",
+			setup:   func(c *Config) { c.OrchestratorAddr = "192.168.1.1:50050" },
 			wantErr: false,
 		},
 		{
 			name:    "valid IPv6 with port",
-			addr:    "[::1]:50050",
+			setup:   func(c *Config) { c.OrchestratorAddr = "[::1]:50050" },
 			wantErr: false,
 		},
 		{
 			name:    "empty address",
-			addr:    "",
+			setup:   func(c *Config) { c.OrchestratorAddr = "" },
 			wantErr: true,
 			errMsg:  "cannot be empty",
 		},
 		{
 			name:    "missing port",
-			addr:    "localhost",
+			setup:   func(c *Config) { c.OrchestratorAddr = "localhost" },
 			wantErr: true,
 			errMsg:  "host:port format",
 		},
 		{
 			name:    "port only",
-			addr:    ":50050",
+			setup:   func(c *Config) { c.OrchestratorAddr = ":50050" },
 			wantErr: false, // net.SplitHostPort allows this
 		},
 		{
 			name:    "invalid format",
-			addr:    "localhost:port:extra",
+			setup:   func(c *Config) { c.OrchestratorAddr = "localhost:port:extra" },
 			wantErr: true,
 			errMsg:  "host:port format",
 		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			cfg.OrchestratorAddr = tt.addr
-
-			err := cfg.Validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error but got none")
-				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
+	})
 }
 
 // -- Validate: secret (authentication) ----------------------------------------
@@ -269,104 +248,76 @@ func TestValidate_OrchestratorAddr(t *testing.T) {
 func TestValidate_Secret(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		secret  string
-		wantErr bool
-		errMsg  string
-	}{
+	runValidationTests(t, []validationTestCase{
 		{
 			name:    "empty secret (valid - no auth)",
-			secret:  "",
+			setup:   func(c *Config) { c.Secret = "" },
 			wantErr: false,
 		},
 		{ //nolint:gosec // G101: test value, not a real credential
 			name:    "valid strong secret",
-			secret:  "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+			setup:   func(c *Config) { c.Secret = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6" },
 			wantErr: false,
 		},
 		{
 			name:    "valid minimum length (16 chars)",
-			secret:  "1234567890abcdef",
+			setup:   func(c *Config) { c.Secret = "1234567890abcdef" },
 			wantErr: false,
 		},
 		{
 			name:    "too short (15 chars)",
-			secret:  "123456789012345",
+			setup:   func(c *Config) { c.Secret = "123456789012345" },
 			wantErr: true,
 			errMsg:  "too short",
 		},
 		{
 			name:    "too short (1 char)",
-			secret:  "a",
+			setup:   func(c *Config) { c.Secret = "a" },
 			wantErr: true,
 			errMsg:  "too short",
 		},
 		{
 			name:    "weak secret: test",
-			secret:  "test",
+			setup:   func(c *Config) { c.Secret = "test" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "weak secret: secret",
-			secret:  "secret",
+			setup:   func(c *Config) { c.Secret = "secret" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "weak secret: password",
-			secret:  "password",
+			setup:   func(c *Config) { c.Secret = "password" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "weak secret: 123456",
-			secret:  "123456",
+			setup:   func(c *Config) { c.Secret = "123456" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "weak secret: abc123",
-			secret:  "abc123",
+			setup:   func(c *Config) { c.Secret = "abc123" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "weak secret: changeme",
-			secret:  "changeme",
+			setup:   func(c *Config) { c.Secret = "changeme" },
 			wantErr: true,
 			errMsg:  "weak/test value",
 		},
 		{
 			name:    "long strong secret",
-			secret:  "thisIsAVeryLongAndStrongSecretThatIsDefinitelySecure123456",
+			setup:   func(c *Config) { c.Secret = "thisIsAVeryLongAndStrongSecretThatIsDefinitelySecure123456" },
 			wantErr: false,
 		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			cfg.Secret = tt.secret
-
-			err := cfg.Validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error but got none")
-				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
+	})
 }
 
 // -- Validate: deadlines and backoff ------------------------------------------
@@ -374,75 +325,37 @@ func TestValidate_Secret(t *testing.T) {
 func TestValidate_Deadlines(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name     string
-		setField func(*Config)
-		wantErr  bool
-		errMsg   string
-	}{
+	runValidationTests(t, []validationTestCase{
 		{
-			name: "valid read deadline",
-			setField: func(c *Config) {
-				c.ReadDeadline = 30 * time.Second
-			},
+			name:    "valid read deadline",
+			setup:   func(c *Config) { c.ReadDeadline = 30 * time.Second },
 			wantErr: false,
 		},
 		{
-			name: "zero read deadline",
-			setField: func(c *Config) {
-				c.ReadDeadline = 0
-			},
+			name:    "zero read deadline",
+			setup:   func(c *Config) { c.ReadDeadline = 0 },
 			wantErr: true,
 			errMsg:  "read deadline",
 		},
 		{
-			name: "negative read deadline",
-			setField: func(c *Config) {
-				c.ReadDeadline = -1 * time.Second
-			},
+			name:    "negative read deadline",
+			setup:   func(c *Config) { c.ReadDeadline = -1 * time.Second },
 			wantErr: true,
 			errMsg:  "read deadline",
 		},
 		{
-			name: "zero write deadline",
-			setField: func(c *Config) {
-				c.WriteDeadline = 0
-			},
+			name:    "zero write deadline",
+			setup:   func(c *Config) { c.WriteDeadline = 0 },
 			wantErr: true,
 			errMsg:  "write deadline",
 		},
 		{
-			name: "negative write deadline",
-			setField: func(c *Config) {
-				c.WriteDeadline = -1 * time.Second
-			},
+			name:    "negative write deadline",
+			setup:   func(c *Config) { c.WriteDeadline = -1 * time.Second },
 			wantErr: true,
 			errMsg:  "write deadline",
 		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			tt.setField(cfg)
-
-			err := cfg.Validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error but got none")
-				} else if !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
+	})
 }
 
 func TestValidate_MaxReconnectBackoff(t *testing.T) {
@@ -453,21 +366,9 @@ func TestValidate_MaxReconnectBackoff(t *testing.T) {
 		backoff time.Duration
 		wantErr bool
 	}{
-		{
-			name:    "valid backoff",
-			backoff: 5 * time.Minute,
-			wantErr: false,
-		},
-		{
-			name:    "zero backoff",
-			backoff: 0,
-			wantErr: true,
-		},
-		{
-			name:    "negative backoff",
-			backoff: -1 * time.Second,
-			wantErr: true,
-		},
+		{name: "valid backoff", backoff: 5 * time.Minute, wantErr: false},
+		{name: "zero backoff", backoff: 0, wantErr: true},
+		{name: "negative backoff", backoff: -1 * time.Second, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -497,26 +398,10 @@ func TestValidate_MaxConsecutiveDecodeErrors(t *testing.T) {
 		value   int
 		wantErr bool
 	}{
-		{
-			name:    "zero (valid - never terminate)",
-			value:   0,
-			wantErr: false,
-		},
-		{
-			name:    "positive value",
-			value:   3,
-			wantErr: false,
-		},
-		{
-			name:    "large positive value",
-			value:   100,
-			wantErr: false,
-		},
-		{
-			name:    "negative value",
-			value:   -1,
-			wantErr: true,
-		},
+		{name: "zero (valid - never terminate)", value: 0, wantErr: false},
+		{name: "positive value", value: 3, wantErr: false},
+		{name: "large positive value", value: 100, wantErr: false},
+		{name: "negative value", value: -1, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -548,31 +433,11 @@ func TestValidate_ProberType(t *testing.T) {
 		proberType string
 		wantErr    bool
 	}{
-		{
-			name:       "valid caracal",
-			proberType: ProberTypeCaracal,
-			wantErr:    false,
-		},
-		{
-			name:       "valid mock",
-			proberType: ProberTypeMock,
-			wantErr:    false,
-		},
-		{
-			name:       "invalid type",
-			proberType: "invalid",
-			wantErr:    true,
-		},
-		{
-			name:       "empty type",
-			proberType: "",
-			wantErr:    true,
-		},
-		{
-			name:       "wrong case",
-			proberType: "Caracal",
-			wantErr:    true,
-		},
+		{name: "valid caracal", proberType: ProberTypeCaracal, wantErr: false},
+		{name: "valid mock", proberType: ProberTypeMock, wantErr: false},
+		{name: "invalid type", proberType: "invalid", wantErr: true},
+		{name: "empty type", proberType: "", wantErr: true},
+		{name: "wrong case", proberType: "Caracal", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -604,31 +469,11 @@ func TestValidate_ProberPath(t *testing.T) {
 		path    string
 		wantErr bool
 	}{
-		{
-			name:    "empty path (valid - searches PATH)",
-			path:    "",
-			wantErr: false,
-		},
-		{
-			name:    "valid existing path",
-			path:    validPath,
-			wantErr: false,
-		},
-		{
-			name:    "non-existent path",
-			path:    "/nonexistent/path/to/prober",
-			wantErr: true,
-		},
-		{
-			name:    "relative non-existent path",
-			path:    "./nonexistent",
-			wantErr: true,
-		},
-		{
-			name:    "path is a directory",
-			path:    t.TempDir(),
-			wantErr: true,
-		},
+		{name: "empty path (valid - searches PATH)", path: "", wantErr: false},
+		{name: "valid existing path", path: validPath, wantErr: false},
+		{name: "non-existent path", path: "/nonexistent/path/to/prober", wantErr: true},
+		{name: "relative non-existent path", path: "./nonexistent", wantErr: true},
+		{name: "path is a directory", path: t.TempDir(), wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -658,31 +503,11 @@ func TestValidate_WriteQueueSize(t *testing.T) {
 		size    int
 		wantErr bool
 	}{
-		{
-			name:    "valid size",
-			size:    1000,
-			wantErr: false,
-		},
-		{
-			name:    "small valid size",
-			size:    1,
-			wantErr: false,
-		},
-		{
-			name:    "large valid size",
-			size:    100000,
-			wantErr: false,
-		},
-		{
-			name:    "zero size",
-			size:    0,
-			wantErr: true,
-		},
-		{
-			name:    "negative size",
-			size:    -1,
-			wantErr: true,
-		},
+		{name: "valid size", size: 1000, wantErr: false},
+		{name: "small valid size", size: 1, wantErr: false},
+		{name: "large valid size", size: 100000, wantErr: false},
+		{name: "zero size", size: 0, wantErr: true},
+		{name: "negative size", size: -1, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -721,84 +546,42 @@ func TestValidate_ProbeTimeout(t *testing.T) {
 func TestValidate_BufferSizes(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name     string
-		setField func(*Config)
-		wantErr  bool
-		errMsg   string
-	}{
+	runValidationTests(t, []validationTestCase{
 		{
-			name: "valid buffer sizes",
-			setField: func(c *Config) {
-				c.PDsBufferSize = 100
-				c.FIEsBufferSize = 100
-			},
+			name:    "valid buffer sizes",
+			setup:   func(c *Config) { c.PDsBufferSize = 100; c.FIEsBufferSize = 100 },
 			wantErr: false,
 		},
 		{
-			name: "large buffer sizes",
-			setField: func(c *Config) {
-				c.PDsBufferSize = 10000
-				c.FIEsBufferSize = 10000
-			},
+			name:    "large buffer sizes",
+			setup:   func(c *Config) { c.PDsBufferSize = 10000; c.FIEsBufferSize = 10000 },
 			wantErr: false,
 		},
 		{
-			name: "zero PDs buffer",
-			setField: func(c *Config) {
-				c.PDsBufferSize = 0
-			},
+			name:    "zero PDs buffer",
+			setup:   func(c *Config) { c.PDsBufferSize = 0 },
 			wantErr: true,
 			errMsg:  "PDs buffer",
 		},
 		{
-			name: "negative PDs buffer",
-			setField: func(c *Config) {
-				c.PDsBufferSize = -1
-			},
+			name:    "negative PDs buffer",
+			setup:   func(c *Config) { c.PDsBufferSize = -1 },
 			wantErr: true,
 			errMsg:  "PDs buffer",
 		},
 		{
-			name: "zero FIEs buffer",
-			setField: func(c *Config) {
-				c.FIEsBufferSize = 0
-			},
+			name:    "zero FIEs buffer",
+			setup:   func(c *Config) { c.FIEsBufferSize = 0 },
 			wantErr: true,
 			errMsg:  "FIEs buffer",
 		},
 		{
-			name: "negative FIEs buffer",
-			setField: func(c *Config) {
-				c.FIEsBufferSize = -1
-			},
+			name:    "negative FIEs buffer",
+			setup:   func(c *Config) { c.FIEsBufferSize = -1 },
 			wantErr: true,
 			errMsg:  "FIEs buffer",
 		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := validConfig()
-			tt.setField(cfg)
-
-			err := cfg.Validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error but got none")
-				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("error should contain %q, got: %v", tt.errMsg, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
+	})
 }
 
 // -- Validate: complete config -------------------------------------------------

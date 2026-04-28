@@ -22,7 +22,7 @@ type Prober interface {
 	//   - a reply is received: returns (result with TimedOut=false, nil)
 	//   - the implementation's internal timeout fires: returns (result with TimedOut=true, nil)
 	//   - a duplicate probe is already in-flight: returns (nil, ErrDuplicateProbe)
-	//   - ctx is cancelled or a probe operation failure occurs: returns (nil, non-nil error)
+	//   - ctx is canceled or a probe operation failure occurs: returns (nil, non-nil error)
 	//
 	// Implementations are responsible for enforcing their own probe timeout.
 	// Probe must not block indefinitely — callers do not add a deadline to ctx.

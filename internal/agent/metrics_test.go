@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+//nolint:gocyclo // Complexity comes from one nil-check per metric field; splitting would hurt readability.
 func TestNewMetrics(t *testing.T) {
 	t.Parallel()
 

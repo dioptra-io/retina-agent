@@ -134,7 +134,7 @@ func createTestFIE(pdID uint64) api.ForwardingInfoElement {
 }
 
 // encodeFIE encodes a FIE to the connection's read buffer.
-func encodeFIE(t *testing.T, conn *mockConn, fie api.ForwardingInfoElement) {
+func encodeFIE(t *testing.T, conn *mockConn, fie *api.ForwardingInfoElement) {
 	t.Helper()
 	encoder := json.NewEncoder(conn.readBuf)
 	if err := encoder.Encode(fie); err != nil {
@@ -454,7 +454,7 @@ func TestHandleAgent_BasicFlow(t *testing.T) {
 
 	conn := newMockConn()
 	fie := createTestFIE(1)
-	encodeFIE(t, conn, fie)
+	encodeFIE(t, conn, &fie)
 
 	done := make(chan bool)
 	go func() {
@@ -484,7 +484,7 @@ func TestHandleAgent_CloseError(t *testing.T) {
 
 	conn := &errorCloseConn{mockConn: newMockConn()}
 	fie := createTestFIE(1)
-	encodeFIE(t, conn.mockConn, fie)
+	encodeFIE(t, conn.mockConn, &fie)
 
 	done := make(chan bool)
 	go func() {
@@ -512,7 +512,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		pdID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
 		fie := createTestFIE(pdID)
-		encodeFIE(t, conn, fie)
+		encodeFIE(t, conn, &fie)
 	}
 
 	done := make(chan bool)
@@ -561,7 +561,7 @@ func TestHandleAgent_WriteError(t *testing.T) {
 	}
 
 	fie := createTestFIE(1)
-	encodeFIE(t, conn.mockConn, fie)
+	encodeFIE(t, conn.mockConn, &fie)
 
 	done := make(chan bool)
 	go func() {
