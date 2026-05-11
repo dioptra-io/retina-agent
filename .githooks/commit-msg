@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+COMMIT_MSG_FILE=$1
+
+if ! grep -q "^Signed-off-by:" "$COMMIT_MSG_FILE"; then
+  echo "❌ Error: Missing 'Signed-off-by:' signature."
+  echo "💡 Tip: Use 'git commit -s' to add it automatically."
+  exit 1
+fi
+
+HEADER_LINE=$(head -n 1 "$COMMIT_MSG_FILE")
+
+if [ "${#HEADER_LINE}" -gt 72 ]; then
+  echo "❌ Error: Commit subject is too long (${#HEADER_LINE} chars). Max: 72."
+  exit 1
+fi
+
+# Allowed types: feat, fix, refactor, test, docs, deps, chore, perf
+PATTERN="^(feat|fix|refactor|test|docs|deps|chore|perf)(\([^)]+\))?: .+"
+
+if ! [[ "$HEADER_LINE" =~ $PATTERN ]]; then
+  echo "❌ Error: Invalid commit format."
+  echo "Expected format: <type>: <subject in imperative mood>"
+  echo "Allowed types: feat, fix, refactor, test, docs, deps, chore, perf"
+  echo "Example: feat: add ICMP echo probe support"
+  exit 1
+fi
+
+echo "✅ Commit format validated locally."
