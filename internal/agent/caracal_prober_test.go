@@ -358,7 +358,7 @@ func TestParseProbeResult(t *testing.T) {
 		{
 			name: "valid record",
 			record: []string{
-				"1609459200", "17", "192.0.2.1", "8.8.8.8",
+				"1609459200000000", "17", "192.0.2.1", "8.8.8.8",
 				"50000", "33434", "10", "0", "8.8.8.8",
 				"1", "0", "0", "64", "28", "", "50", "0",
 			},
@@ -376,7 +376,7 @@ func TestParseProbeResult(t *testing.T) {
 		{
 			name: "missing rtt",
 			record: []string{
-				"1609459200", "17", "192.0.2.1", "8.8.8.8",
+				"1609459200000000", "17", "192.0.2.1", "8.8.8.8",
 				"50000", "33434", "10", "0", "8.8.8.8",
 				"1", "0", "0", "64", "28", "", "", "0",
 			},
@@ -612,7 +612,8 @@ func TestProbeEndToEnd(t *testing.T) {
 	}
 
 	stdin := &nopWriteCloser{Buffer: &bytes.Buffer{}}
-	fixedTime := int64(1600000000)
+	fixedTimeMicros := int64(1600000000) * 1_000_000 // for CSV data
+	fixedTimeSeconds := int64(1600000000)            // for correlationSecond in key
 
 	csvChan := make(chan string, 2)
 	stdout := &dynamicReadCloser{ch: csvChan}
@@ -638,19 +639,19 @@ func TestProbeEndToEnd(t *testing.T) {
 		secondHalfWord:    80,
 		ttl:               64,
 		protocol:          api.ICMP,
-		correlationSecond: fixedTime,
+		correlationSecond: fixedTimeSeconds,
 	}
 
 	resultCh := make(chan *ProbeResult, 1)
 	prober.inFlightMu.Lock()
 	prober.inFlight[key] = &inFlightProbe{
 		resultCh:   resultCh,
-		queuedTime: time.Unix(fixedTime, 0),
+		queuedTime: time.Unix(fixedTimeSeconds, 0),
 	}
 	prober.inFlightMu.Unlock()
 
 	rtt := int64(100)
-	data := fmt.Sprintf("%d,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.2,1,0,0,64,60,,%d,1\n", fixedTime, rtt)
+	data := fmt.Sprintf("%d,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.2,1,0,0,64,60,,%d,1\n", fixedTimeMicros, rtt)
 	csvChan <- data
 
 	select {
@@ -1682,7 +1683,7 @@ func TestNewCaracalProberWithRealProcess(t *testing.T) {
 			`
 echo "capture_timestamp,probe_protocol,probe_src_addr,probe_dst_addr,probe_src_port,probe_dst_port,probe_ttl,quoted_ttl,reply_src_addr,reply_protocol,reply_icmp_type,reply_icmp_code,reply_ttl,reply_size,reply_mpls_labels,rtt,round"
 while IFS=, read -r dst_addr src_port dst_port ttl protocol; do
-	timestamp=$(date +%s)
+	timestamp=$(date +%s)000000
 	echo "$timestamp,1,10.0.0.1,$dst_addr,$src_port,$dst_port,$ttl,$ttl,10.0.0.1,1,0,0,64,28,,100,0"
 done
 			`,
@@ -1831,7 +1832,7 @@ func TestCloseKillError(t *testing.T) {
 			`
 echo "capture_timestamp,probe_protocol,probe_src_addr,probe_dst_addr,probe_src_port,probe_dst_port,probe_ttl,quoted_ttl,reply_src_addr,reply_protocol,reply_icmp_type,reply_icmp_code,reply_ttl,reply_size,reply_mpls_labels,rtt,round"
 while read line; do
-	timestamp=$(date +%s)
+	timestamp=$(date +%s)000000
 	echo "$timestamp,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.1,1,0,0,64,28,,100,0"
 done
 			`,
@@ -1900,7 +1901,7 @@ func TestCloseKillErrorLogging(t *testing.T) {
 		ProberArgs: []string{
 			"-c",
 			`echo "capture_timestamp,probe_protocol,probe_src_addr,probe_dst_addr,probe_src_port,probe_dst_port,probe_ttl,quoted_ttl,reply_src_addr,reply_protocol,reply_icmp_type,reply_icmp_code,reply_ttl,reply_size,reply_mpls_labels,rtt,round"
-while read line; do timestamp=$(date +%s); echo "$timestamp,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.1,1,0,0,64,28,,100,0"; done`,
+while read line; do timestamp=$(date +%s)000000; echo "$timestamp,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.1,1,0,0,64,28,,100,0"; done`,
 		},
 		WriteQueueSize:  10,
 		CleanupInterval: 100 * time.Millisecond,
@@ -1942,7 +1943,7 @@ func TestSetupCaracalProcessDefaultPath(t *testing.T) {
 	script := `#!/bin/sh
 echo "capture_timestamp,probe_protocol,probe_src_addr,probe_dst_addr,probe_src_port,probe_dst_port,probe_ttl,quoted_ttl,reply_src_addr,reply_protocol,reply_icmp_type,reply_icmp_code,reply_ttl,reply_size,reply_mpls_labels,rtt,round"
 while read line; do
-	timestamp=$(date +%s)
+	timestamp=$(date +%s)000000
 	echo "$timestamp,1,10.0.0.1,10.0.0.2,1234,80,64,64,10.0.0.1,1,0,0,64,28,,100,0"
 done
 `
