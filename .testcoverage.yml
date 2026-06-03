@@ -1,17 +1,10 @@
-# .testcoverage.yml
 profile: coverage.out
 
 threshold:
-  file: 65
-  package: 80
+  package: 95
   total: 95
 
 exclude:
   paths:
     - ^cmd/
     - \.pb\.go$
-    - _mock\.go$
-
-override:
-  - threshold: 90
-    path: ^internal/agent

@@ -19,10 +19,10 @@ jobs:
           cache: true
 
       - name: Run tests with atomic coverage
-        run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic
+        run: go test ./... -race -count=1 -coverpkg=./... -coverprofile=coverage.out -covermode=atomic
 
       - name: Enforce thresholds (Strict Gate)
-        uses: vladopajic/go-test-coverage/action/source@v2
+        uses: vladopajic/go-test-coverage@v2
         with:
           config: ./.testcoverage.yml
 
