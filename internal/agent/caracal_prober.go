@@ -384,7 +384,7 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 
 	if captureTS := record[0]; captureTS != "" {
 		if ts, err := strconv.ParseInt(captureTS, 10, 64); err == nil {
-			result.ReceivedTime = time.Unix(ts, 0)
+			result.ReceivedTime = time.Unix(ts/1_000_000, (ts%1_000_000)*1_000)
 		}
 	}
 
