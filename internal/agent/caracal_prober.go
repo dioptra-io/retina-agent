@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -183,21 +183,22 @@ func closePipe(pipe io.Closer, name string, logger *slog.Logger) {
 }
 
 func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
-	switch pd.Protocol {
-	case api.ICMP:
-		if pd.NextHeader.ICMPNextHeader != nil {
-			return pd.NextHeader.ICMPNextHeader.FirstHalfWord,
-				pd.NextHeader.ICMPNextHeader.SecondHalfWord
+	if pd.NextHeader == nil {
+		return 0, 0
+	}
+
+	switch h := pd.NextHeader.GetHeader().(type) {
+	case *api.NextHeader_IcmpNextHeader:
+		if h.IcmpNextHeader != nil {
+			return uint16(h.IcmpNextHeader.FirstHalfWord), uint16(h.IcmpNextHeader.SecondHalfWord)
 		}
-	case api.ICMPv6:
-		if pd.NextHeader.ICMPv6NextHeader != nil {
-			return pd.NextHeader.ICMPv6NextHeader.FirstHalfWord,
-				pd.NextHeader.ICMPv6NextHeader.SecondHalfWord
+	case *api.NextHeader_Icmpv6NextHeader:
+		if h.Icmpv6NextHeader != nil {
+			return uint16(h.Icmpv6NextHeader.FirstHalfWord), uint16(h.Icmpv6NextHeader.SecondHalfWord)
 		}
-	case api.UDP:
-		if pd.NextHeader.UDPNextHeader != nil {
-			return pd.NextHeader.UDPNextHeader.SourcePort,
-				pd.NextHeader.UDPNextHeader.DestinationPort
+	case *api.NextHeader_UdpNextHeader:
+		if h.UdpNextHeader != nil {
+			return uint16(h.UdpNextHeader.SourcePort), uint16(h.UdpNextHeader.DestinationPort)
 		}
 	}
 	return 0, 0
@@ -206,7 +207,7 @@ func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
 func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp int64) probeKey {
 	firstHalf, secondHalf := extractHalfWords(pd)
 	return probeKey{
-		dstAddr:           normalizeIPAddress(pd.DestinationAddress.String()),
+		dstAddr:           normalizeIPAddress(pd.DestinationAddress),
 		firstHalfWord:     firstHalf,
 		secondHalfWord:    secondHalf,
 		ttl:               ttl,
@@ -233,7 +234,7 @@ func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl
 	if _, exists := p.inFlight[key]; exists {
 		p.inFlightMu.Unlock()
 		p.logger.Warn("Duplicate probe rejected",
-			slog.String("dest", pd.DestinationAddress.String()),
+			slog.String("dest", pd.DestinationAddress),
 			slog.Int("ttl", int(ttl)))
 		p.metrics.DuplicateProbesTotal.Inc()
 		return nil, ErrDuplicatePD
@@ -304,7 +305,7 @@ func (p *caracalProber) encodeAndSendProbe(req *probeRequest) error {
 	firstHalfWord, secondHalfWord := extractHalfWords(pd)
 
 	record := []string{
-		pd.DestinationAddress.String(),
+		pd.DestinationAddress,
 		strconv.Itoa(int(firstHalfWord)),
 		strconv.Itoa(int(secondHalfWord)),
 		strconv.Itoa(int(req.ttl)),
@@ -447,11 +448,11 @@ func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 	var protoType api.Protocol
 	switch protocol {
 	case 1:
-		protoType = api.ICMP
+		protoType = api.Protocol_ICMP
 	case 17:
-		protoType = api.UDP
+		protoType = api.Protocol_UDP
 	case 58:
-		protoType = api.ICMPv6
+		protoType = api.Protocol_ICMPv6
 	default:
 		return probeKey{}, fmt.Errorf("unsupported protocol: %d", protocol)
 	}
@@ -565,11 +566,11 @@ func (p *caracalProber) Close() error {
 // protocolToString converts api.Protocol to caracal's protocol string.
 func protocolToString(protocol api.Protocol) string {
 	switch protocol {
-	case api.ICMP:
+	case api.Protocol_ICMP:
 		return "icmp"
-	case api.ICMPv6:
+	case api.Protocol_ICMPv6:
 		return "icmp6"
-	case api.UDP:
+	case api.Protocol_UDP:
 		return "udp"
 	default:
 		return strconv.Itoa(int(protocol))

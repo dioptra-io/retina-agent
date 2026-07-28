@@ -32,7 +32,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v2"
 )
 
 // testLogger returns a logger that discards all output, keeping test output clean.
@@ -158,11 +158,11 @@ func TestRun_WithLocalServer(t *testing.T) {
 		decoder := json.NewDecoder(conn)
 
 		pd := &api.ProbingDirective{
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+			AgentId:            "test-agent",
+			NearTtl:            10,
+			DestinationAddress: net.ParseIP("8.8.8.8").String(),
+			Protocol:           api.Protocol_ICMP,
+			NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 		}
 
 		t.Log("Sending directive...")
@@ -180,7 +180,7 @@ func TestRun_WithLocalServer(t *testing.T) {
 		}
 
 		if fie.NearInfo != nil {
-			t.Logf("✓ Received FIE with TTL %d", fie.NearInfo.ProbeTTL)
+			t.Logf("✓ Received FIE with TTL %d", fie.NearInfo.ProbeTtl)
 		} else {
 			t.Log("✓ Received FIE (near probe timed out)")
 		}
@@ -435,11 +435,11 @@ func TestRun_WithMockConnection(t *testing.T) {
 	}()
 
 	validPD := &api.ProbingDirective{
-		AgentID:            "test-agent",
-		NearTTL:            10,
-		DestinationAddress: []byte{8, 8, 8, 8},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+		AgentId:            "test-agent",
+		NearTtl:            10,
+		DestinationAddress: string([]byte{8, 8, 8, 8}),
+		Protocol:           api.Protocol_ICMP,
+		NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 	}
 
 	encoder := json.NewEncoder(clientConn)
@@ -456,8 +456,8 @@ func TestRun_WithMockConnection(t *testing.T) {
 	} else {
 		if fie.NearInfo == nil {
 			t.Error("NearInfo should be set when near probe succeeded")
-		} else if fie.NearInfo.ProbeTTL != 10 {
-			t.Errorf("FIE NearInfo.ProbeTTL = %d, want 10", fie.NearInfo.ProbeTTL)
+		} else if fie.NearInfo.ProbeTtl != 10 {
+			t.Errorf("FIE NearInfo.ProbeTTL = %d, want 10", fie.NearInfo.ProbeTtl)
 		}
 		t.Logf("Successfully completed full pipeline test")
 	}
@@ -789,18 +789,18 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	invalidPD := &api.ProbingDirective{
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+		NearTtl:            5,
+		DestinationAddress: string([]byte{1, 2, 3, 4}),
 	}
 	invalidJSON, _ := json.Marshal(invalidPD)
 	invalidJSON = append(invalidJSON, '\n')
 
 	validPD := &api.ProbingDirective{
-		AgentID:            "test",
-		NearTTL:            10,
-		DestinationAddress: []byte{8, 8, 8, 8},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+		AgentId:            "test",
+		NearTtl:            10,
+		DestinationAddress: string([]byte{8, 8, 8, 8}),
+		Protocol:           api.Protocol_ICMP,
+		NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 	}
 	validJSON, _ := json.Marshal(validPD)
 	validJSON = append(validJSON, '\n')
@@ -833,8 +833,8 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 			t.Errorf("received nil PD")
 			return
 		}
-		if pd.NearTTL != 10 {
-			t.Errorf("expected valid PD with TTL 10, got: %d", pd.NearTTL)
+		if pd.NearTtl != 10 {
+			t.Errorf("expected valid PD with TTL 10, got: %d", pd.NearTtl)
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Error("timeout waiting for valid PD (invalid should be skipped)")
@@ -856,11 +856,11 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
 	validPD := &api.ProbingDirective{
-		AgentID:            "test",
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+		AgentId:            "test",
+		NearTtl:            5,
+		DestinationAddress: string([]byte{1, 2, 3, 4}),
+		Protocol:           api.Protocol_ICMP,
+		NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 	}
 	validJSON, _ := json.Marshal(validPD)
 	data := bytes.NewBuffer(append(validJSON, '\n'))
@@ -885,7 +885,7 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 			t.Errorf("received nil PD from channel")
 			return
 		}
-		if pd.NearTTL != 5 || pd.AgentID != "test" {
+		if pd.NearTtl != 5 || pd.AgentId != "test" {
 			t.Errorf("readerLoop got %+v, want TTL=5 AgentID=test", pd)
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -959,7 +959,7 @@ func TestWriterLoop_NetworkError(t *testing.T) {
 
 	fies := make(chan *api.ForwardingInfoElement, 1)
 	fies <- &api.ForwardingInfoElement{
-		DestinationAddress: []byte{8, 8, 8, 8},
+		DestinationAddress: string([]byte{8, 8, 8, 8}),
 	}
 
 	err := a.writerLoop(context.Background(), conn, fies)
@@ -1007,7 +1007,7 @@ func TestWriterLoop_Success(t *testing.T) {
 
 	fies := make(chan *api.ForwardingInfoElement, 1)
 	fie := &api.ForwardingInfoElement{
-		DestinationAddress: []byte{8, 8, 8, 8},
+		DestinationAddress: string([]byte{8, 8, 8, 8}),
 	}
 	fies <- fie
 	close(fies)
@@ -1074,9 +1074,9 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	fies := make(chan *api.ForwardingInfoElement, 1)
 
 	pd := &api.ProbingDirective{
-		AgentID:            "test",
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+		AgentId:            "test",
+		NearTtl:            5,
+		DestinationAddress: string([]byte{1, 2, 3, 4}),
 	}
 	pds <- pd
 
@@ -1096,8 +1096,8 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 			t.Errorf("NearInfo should be set when near probe succeeded")
 			return
 		}
-		if fie.NearInfo.ProbeTTL != 5 {
-			t.Errorf("processorLoop FIE TTL = %d, want 5", fie.NearInfo.ProbeTTL)
+		if fie.NearInfo.ProbeTtl != 5 {
+			t.Errorf("processorLoop FIE TTL = %d, want 5", fie.NearInfo.ProbeTtl)
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Error("processorLoop did not produce FIE")
@@ -1125,8 +1125,8 @@ func TestProcessPD_Success(t *testing.T) {
 	}
 
 	pd := &api.ProbingDirective{
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+		NearTtl:            5,
+		DestinationAddress: string([]byte{1, 2, 3, 4}),
 	}
 	fies := make(chan *api.ForwardingInfoElement, 1)
 
@@ -1142,11 +1142,11 @@ func TestProcessPD_Success(t *testing.T) {
 			t.Errorf("NearInfo and FarInfo should be set when both probes succeed")
 			return
 		}
-		if fie.NearInfo.ProbeTTL != 5 || fie.FarInfo.ProbeTTL != 6 {
+		if fie.NearInfo.ProbeTtl != 5 || fie.FarInfo.ProbeTtl != 6 {
 			t.Errorf("processPD TTLs = %d/%d, want 5/6",
-				fie.NearInfo.ProbeTTL, fie.FarInfo.ProbeTTL)
+				fie.NearInfo.ProbeTtl, fie.FarInfo.ProbeTtl)
 		}
-		if fie.NearInfo.ReplyAddress.String() != "1.1.1.1" {
+		if fie.NearInfo.ReplyAddress != "1.1.1.1" {
 			t.Errorf("processPD reply = %s, want 1.1.1.1", fie.NearInfo.ReplyAddress)
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -1185,7 +1185,7 @@ func TestProcessPD_ProbeError(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
+			pd := &api.ProbingDirective{NearTtl: 5}
 			fies := make(chan *api.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
@@ -1232,7 +1232,7 @@ func TestProcessPD_Timeout(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
+			pd := &api.ProbingDirective{NearTtl: 5}
 			fies := make(chan *api.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
@@ -1275,7 +1275,7 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	pd := &api.ProbingDirective{NearTTL: 5}
+	pd := &api.ProbingDirective{NearTtl: 5}
 	fies := make(chan *api.ForwardingInfoElement, 1)
 
 	a.processPD(ctx, pd, fies)
@@ -1317,7 +1317,7 @@ func TestProcessPD_NilResult(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
+			pd := &api.ProbingDirective{NearTtl: 5}
 			fies := make(chan *api.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
@@ -1389,87 +1389,87 @@ func TestValidatePD_AllBranches(t *testing.T) {
 	}{
 		{name: "nil", pd: nil, wantErr: true},
 		{name: "empty-agent", pd: &api.ProbingDirective{}, wantErr: true},
-		{name: "nil-dest", pd: &api.ProbingDirective{AgentID: "a", NearTTL: 1}, wantErr: true},
+		{name: "nil-dest", pd: &api.ProbingDirective{AgentId: "a", NearTtl: 1}, wantErr: true},
 		{
 			name: "zero-ttl",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            0,
-				DestinationAddress: []byte{1},
+				AgentId:            "a",
+				NearTtl:            0,
+				DestinationAddress: string([]byte{1}),
 			},
 			wantErr: true,
 		},
 		{
 			name: "nearttl-255",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            255,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
-				NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+				AgentId:            "a",
+				NearTtl:            255,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_ICMP,
+				NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 			},
 			wantErr: true,
 		},
 		{
 			name: "icmp-good",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
-				NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_ICMP,
+				NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 			},
 			wantErr: false,
 		},
 		{
 			name: "icmpv6-good",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMPv6,
-				NextHeader:         api.NextHeader{ICMPv6NextHeader: &api.ICMPv6NextHeader{}},
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_ICMPv6,
+				NextHeader:         &api.NextHeader{Header: &api.NextHeader_Icmpv6NextHeader{Icmpv6NextHeader: &api.ICMPv6NextHeader{}}},
 			},
 			wantErr: false,
 		},
 		{
 			name: "udp-good",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.UDP,
-				NextHeader:         api.NextHeader{UDPNextHeader: &api.UDPNextHeader{}},
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_UDP,
+				NextHeader:         &api.NextHeader{Header: &api.NextHeader_UdpNextHeader{UdpNextHeader: &api.UDPNextHeader{}}},
 			},
 			wantErr: false,
 		},
 		{
 			name: "icmp-noheader",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_ICMP,
 			},
 			wantErr: true,
 		},
 		{
 			name: "udp-noheader",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.UDP,
-				NextHeader:         api.NextHeader{},
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
+				Protocol:           api.Protocol_UDP,
+				NextHeader:         &api.NextHeader{Header: &api.NextHeader_UdpNextHeader{UdpNextHeader: &api.UDPNextHeader{}}},
 			},
 			wantErr: true,
 		},
 		{
 			name: "unknown-protocol",
 			pd: &api.ProbingDirective{
-				AgentID:            "a",
-				NearTTL:            1,
-				DestinationAddress: []byte{1},
+				AgentId:            "a",
+				NearTtl:            1,
+				DestinationAddress: string([]byte{1}),
 				Protocol:           99,
 			},
 			wantErr: true,
@@ -1509,16 +1509,16 @@ func TestProbeResultToInfo(t *testing.T) {
 		return
 	}
 
-	if info.ProbeTTL != 64 {
-		t.Errorf("probeResultToInfo TTL = %d, want 64", info.ProbeTTL)
+	if info.ProbeTtl != 64 {
+		t.Errorf("probeResultToInfo TTL = %d, want 64", info.ProbeTtl)
 	}
-	if info.ReplyAddress.String() != "8.8.8.8" {
+	if info.ReplyAddress != "8.8.8.8" {
 		t.Errorf("probeResultToInfo addr = %s, want 8.8.8.8", info.ReplyAddress)
 	}
-	if !info.SentTimestamp.Equal(sentTime) {
+	if info.SentTimestampNs != sentTime.UnixNano() {
 		t.Errorf("probeResultToInfo sent time mismatch")
 	}
-	if !info.ReceivedTimestamp.Equal(recvTime) {
+	if info.ReceivedTimestampNs != recvTime.UnixNano() {
 		t.Errorf("probeResultToInfo recv time mismatch")
 	}
 }
@@ -1682,8 +1682,8 @@ func TestAuthenticate_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to decode auth request: %v", err)
 	}
-	if req.AgentID != "test-agent" {
-		t.Errorf("expected AgentID 'test-agent', got: %s", req.AgentID)
+	if req.AgentId != "test-agent" {
+		t.Errorf("expected AgentID 'test-agent', got: %s", req.AgentId)
 	}
 	if req.Secret != "test-secret-1234567890" {
 		t.Errorf("expected Secret 'test-secret-1234567890', got: %s", req.Secret)
@@ -2000,13 +2000,13 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		authSuccess <- true
 
 		pd := &api.ProbingDirective{
-			ProbingDirectiveID: 1,
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			IPVersion:          api.IPv4,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+			ProbingDirectiveId: 1,
+			AgentId:            "test-agent",
+			NearTtl:            10,
+			DestinationAddress: net.ParseIP("8.8.8.8").String(),
+			Protocol:           api.Protocol_ICMP,
+			IpVersion:          api.IPVersion_IPV4,
+			NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 		}
 		_ = encoder.Encode(pd)
 
@@ -2077,13 +2077,13 @@ func TestRun_NoAuthentication(t *testing.T) {
 		encoder := json.NewEncoder(conn)
 
 		pd := &api.ProbingDirective{
-			ProbingDirectiveID: 1,
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			IPVersion:          api.IPv4,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+			ProbingDirectiveId: 1,
+			AgentId:            "test-agent",
+			NearTtl:            10,
+			DestinationAddress: net.ParseIP("8.8.8.8").String(),
+			Protocol:           api.Protocol_ICMP,
+			IpVersion:          api.IPVersion_IPV4,
+			NextHeader:         &api.NextHeader{Header: &api.NextHeader_IcmpNextHeader{IcmpNextHeader: &api.ICMPNextHeader{}}},
 		}
 		_ = encoder.Encode(pd)
 

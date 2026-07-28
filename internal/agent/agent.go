@@ -25,7 +25,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +36,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	api "github.com/dioptra-io/retina-commons/api/v2"
+	"github.com/dioptra-io/retina-commons/network"
 )
 
 var ErrInvalidDirective = errors.New("invalid probing directive")
@@ -138,37 +138,36 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 // authenticate must be called immediately after connecting, before any other messages.
 func (a *agent) authenticate(conn net.Conn) error {
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
-
 	authReq := &api.AuthRequest{
-		AgentID: a.config.AgentID,
+		AgentId: a.config.AgentID, // Corrigé pour correspondre au code Go généré par Protobuf
 		Secret:  a.config.Secret,
 	}
 
-	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set write deadline: %w", err)
+	envelope := &api.StreamMessage{
+		Payload: &api.StreamMessage_AuthRequest{
+			AuthRequest: authReq,
+		},
 	}
 
-	if err := encoder.Encode(authReq); err != nil { //nolint:gosec // G117: secret field is intentionally included in auth request
+	if err := network.SendStreamMessage(conn, 5*time.Second, envelope); err != nil {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
-	}
-
-	var authResp api.AuthResponse
-	if err := decoder.Decode(&authResp); err != nil {
+	respEnvelope, err := network.ReceiveStreamMessage(conn, 5*time.Second)
+	if err != nil {
 		return fmt.Errorf("failed to receive auth response: %w", err)
 	}
 
+	authRespPayload, ok := respEnvelope.GetPayload().(*api.StreamMessage_AuthResponse)
+	if !ok {
+		return fmt.Errorf("unexpected message type: %T", respEnvelope.GetPayload())
+	}
+
+	authResp := authRespPayload.AuthResponse
 	if !authResp.Authenticated {
 		return fmt.Errorf("authentication rejected: %s", authResp.Message)
 	}
 
-	// Intentionally ignore errors: if the connection is already broken,
-	// the next read/write operation will surface the failure.
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
@@ -182,31 +181,24 @@ func (a *agent) authenticate(conn net.Conn) error {
 // Closing pds on return signals processorLoop to drain in-flight goroutines and exit.
 func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
 	defer close(pds)
-	decoder := json.NewDecoder(conn)
 	consecutiveDecodeErrors := 0
 	consecutiveTimeouts := 0
 
 	for {
-		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
-			return fmt.Errorf("failed to set read deadline: %w", err)
-		}
-
-		var pd api.ProbingDirective
-		if err := decoder.Decode(&pd); err != nil {
+		envelope, err := network.ReceiveStreamMessage(conn, a.config.ReadDeadline)
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				consecutiveTimeouts++
-				a.logger.Debug("Read timeout, no data received",
-					slog.Int("consecutive", consecutiveTimeouts),
-					slog.Int("max", maxConsecutiveReadTimeouts))
 				if consecutiveTimeouts >= maxConsecutiveReadTimeouts {
 					return fmt.Errorf("connection timed out after %d consecutive read timeouts", consecutiveTimeouts)
 				}
 				continue
 			}
 			consecutiveTimeouts = 0
+
 			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
 			consecutiveDecodeErrors = newCount
 			if !shouldContinue {
@@ -214,26 +206,29 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			}
 			continue
 		}
-
 		consecutiveDecodeErrors = 0
 		consecutiveTimeouts = 0
+
+		pdPayload, ok := envelope.GetPayload().(*api.StreamMessage_ProbingDirective)
+		if !ok {
+			a.logger.Warn("Received unexpected message type, ignoring",
+				slog.String("type", fmt.Sprintf("%T", envelope.GetPayload())))
+			continue
+		}
+
+		pd := pdPayload.ProbingDirective
 		a.metrics.PDsReceivedTotal.Inc()
 
-		if err := validatePD(&pd); err != nil {
+		if err := validatePD(pd); err != nil {
 			a.logger.Warn("Invalid directive", slog.Any("err", err))
 			a.metrics.PDsInvalidTotal.Inc()
 			continue
 		}
 
-		a.logger.Debug("← PD received",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
-			slog.String("dest", pd.DestinationAddress.String()),
-			slog.Int("near_ttl", int(pd.NearTTL)))
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case pds <- &pd:
+		case pds <- pd:
 			a.pdsDepth.Add(1)
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
 		}
@@ -303,8 +298,6 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 }
 
 func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
-	encoder := json.NewEncoder(conn)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -313,28 +306,24 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 			if !ok {
 				return nil
 			}
-
 			a.fiesDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 
-			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
-				return fmt.Errorf("failed to set write deadline: %w", err)
+			envelope := &api.StreamMessage{
+				Payload: &api.StreamMessage_ForwardingInfo{
+					ForwardingInfo: fie,
+				},
 			}
 
-			if err := encoder.Encode(fie); err != nil {
+			if err := network.SendStreamMessage(conn, a.config.WriteDeadline, envelope); err != nil {
 				a.metrics.WriteErrorsTotal.Inc()
 				if isNetworkError(err) {
 					return fmt.Errorf("connection lost while writing: %w", err)
 				}
-				return fmt.Errorf("failed to encode FIE: %w", err)
+				return fmt.Errorf("failed to send FIE: %w", err)
 			}
 
 			a.metrics.FIEsSentTotal.Inc()
-			a.logger.Debug("→ FIE sent",
-				slog.Uint64("pd_id", fie.ProbingDirectiveID),
-				slog.String("dest", fie.DestinationAddress.String()),
-				slog.Bool("near_timeout", fie.NearInfo == nil),
-				slog.Bool("far_timeout", fie.FarInfo == nil))
 		}
 	}
 }
@@ -350,8 +339,8 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		err    error
 	}
 
-	nearTTL := pd.NearTTL
-	farTTL := pd.NearTTL + 1
+	nearTTL := pd.NearTtl
+	farTTL := pd.NearTtl + 1
 	nearCh := make(chan probeResult, 1)
 	farCh := make(chan probeResult, 1)
 
@@ -360,8 +349,8 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		ch <- probeResult{result, err}
 	}
 
-	go probe(nearTTL, nearCh)
-	go probe(farTTL, farCh)
+	go probe(uint8(nearTTL), nearCh)
+	go probe(uint8(nearTTL), farCh)
 
 	nearRes := <-nearCh
 	farRes := <-farCh
@@ -371,8 +360,8 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			return // probe already in-flight for this destination/TTL/second
 		}
 		a.logger.Error("Near probe failed",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
-			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Uint64("pd_id", pd.ProbingDirectiveId),
+			slog.String("dest", pd.DestinationAddress),
 			slog.Int("ttl", int(nearTTL)),
 			slog.Any("err", nearRes.err))
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
@@ -385,8 +374,8 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			return // probe already in-flight for this destination/TTL/second
 		}
 		a.logger.Error("Far probe failed",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
-			slog.String("dest", pd.DestinationAddress.String()),
+			slog.Uint64("pd_id", pd.ProbingDirectiveId),
+			slog.String("dest", pd.DestinationAddress),
 			slog.Int("ttl", int(farTTL)),
 			slog.Any("err", farRes.err))
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
@@ -395,7 +384,7 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 	a.recordProbeOutcome(farRes.result)
 
 	select {
-	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL):
+	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, uint8(nearTTL), uint8(farTTL)):
 		a.fiesDepth.Add(1)
 		a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 	case <-ctx.Done():
@@ -442,14 +431,14 @@ func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult,
 	}
 
 	return &api.ForwardingInfoElement{
-		Agent:               api.Agent{AgentID: a.config.AgentID},
-		ProbingDirectiveID:  pd.ProbingDirectiveID,
-		IPVersion:           pd.IPVersion,
-		Protocol:            pd.Protocol,
-		DestinationAddress:  pd.DestinationAddress,
-		NearInfo:            nearInfo,
-		FarInfo:             farInfo,
-		ProductionTimestamp: time.Now().UTC(),
+		Agent:                 &api.Agent{AgentId: a.config.AgentID},
+		ProbingDirectiveId:    pd.ProbingDirectiveId,
+		IpVersion:             pd.IpVersion,
+		Protocol:              pd.Protocol,
+		DestinationAddress:    pd.DestinationAddress,
+		NearInfo:              nearInfo,
+		FarInfo:               farInfo,
+		ProductionTimestampNs: time.Now().UnixNano(),
 	}
 }
 
@@ -477,26 +466,28 @@ func validatePD(pd *api.ProbingDirective) error {
 	if pd == nil {
 		return fmt.Errorf("%w: directive is nil", ErrInvalidDirective)
 	}
-	if pd.AgentID == "" {
+	if pd.AgentId == "" {
 		return fmt.Errorf("%w: agent ID is empty", ErrInvalidDirective)
 	}
-	if pd.DestinationAddress == nil {
+	if pd.DestinationAddress == "" {
 		return fmt.Errorf("%w: destination address is nil", ErrInvalidDirective)
 	}
-	if pd.NearTTL == 0 {
+	if pd.NearTtl == 0 {
 		return fmt.Errorf("%w: TTL cannot be zero", ErrInvalidDirective)
 	}
-	if pd.NearTTL == 255 {
-		return fmt.Errorf("%w: NearTTL 255 would overflow farTTL", ErrInvalidDirective)
+	if pd.NearTtl == 255 {
+		return fmt.Errorf("%w: NearTtl 255 would overflow farTTL", ErrInvalidDirective)
 	}
 
 	switch pd.Protocol {
-	case api.ICMP, api.ICMPv6:
-		if pd.NextHeader.ICMPNextHeader == nil && pd.NextHeader.ICMPv6NextHeader == nil {
+	case api.Protocol_ICMP, api.Protocol_ICMPv6:
+		switch pd.NextHeader.GetHeader().(type) {
+		case *api.NextHeader_IcmpNextHeader, *api.NextHeader_Icmpv6NextHeader:
+		default:
 			return fmt.Errorf("%w: ICMP directive missing next header", ErrInvalidDirective)
 		}
-	case api.UDP:
-		if pd.NextHeader.UDPNextHeader == nil {
+	case api.Protocol_UDP:
+		if _, ok := pd.NextHeader.GetHeader().(*api.NextHeader_UdpNextHeader); !ok {
 			return fmt.Errorf("%w: UDP directive missing next header", ErrInvalidDirective)
 		}
 	default:
@@ -508,10 +499,10 @@ func validatePD(pd *api.ProbingDirective) error {
 
 func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
 	return &api.Info{
-		ProbeTTL:          ttl,
-		ReplyAddress:      result.ReplyAddress,
-		SentTimestamp:     result.SentTime,
-		ReceivedTimestamp: result.ReceivedTime,
+		ProbeTtl:            uint32(ttl),
+		ReplyAddress:        result.ReplyAddress.String(),
+		SentTimestampNs:     result.SentTime.UnixNano(),
+		ReceivedTimestampNs: result.ReceivedTime.UnixNano(),
 	}
 }
 

@@ -6,10 +6,11 @@ package agent
 import (
 	"context"
 	"math/rand"
+	"net"
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v2"
 )
 
 // MockProber simulates network probing for testing without sending real packets.
@@ -58,7 +59,7 @@ func (m *MockProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl ui
 	}
 
 	return &ProbeResult{
-		ReplyAddress: pd.DestinationAddress,
+		ReplyAddress: net.ParseIP(pd.DestinationAddress),
 		SentTime:     sentTime,
 		ReceivedTime: time.Now(),
 		TimedOut:     false,
