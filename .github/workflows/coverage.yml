@@ -1,32 +1,28 @@
 name: CI Coverage
-
 on:
   push:
-    branches: [ main ]
+    branches: [main, dev, 'research', 'research/**']
   pull_request:
-
 jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           cache: true
-
       - name: Run tests with atomic coverage
         run: go test ./... -race -count=1 -coverpkg=./... -coverprofile=coverage.out -covermode=atomic
-
       - name: Enforce thresholds (Strict Gate)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request'
         uses: vladopajic/go-test-coverage@v2
         with:
           config: ./.testcoverage.yml
-
       - name: Upload to Codecov (Visual Dashboard & PR annotations)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request'
         uses: codecov/codecov-action@v4
         with:
           files: coverage.out
