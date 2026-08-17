@@ -5,12 +5,13 @@
 //
 // Usage:
 //
-//	mock-orchestrator [-address localhost:50050] [-probing-rate 10]
+//	mock-orchestrator [-address localhost:50050] [-probing-rate 10] [-secret ""]
 //
 // Flags:
 //
 //	-address       Listen address (default: localhost:50050)
 //	-probing-rate  Probing directives per second (default: 10)
+//	-secret        Shared secret for authentication (default: "", auth disabled)
 package main
 
 import (
@@ -34,9 +35,14 @@ var (
 // startTime is set once at program start and never written after that.
 var startTime = time.Now()
 
+// authTimeout bounds how long a connecting agent has to complete the auth handshake
+// before mock-orchestrator gives up on it and closes the connection.
+const authTimeout = 5 * time.Second
+
 func main() {
 	addr := flag.String("address", "localhost:50050", "Listen address")
 	rate := flag.Int("probing-rate", 10, "Probing directives per second")
+	secret := flag.String("secret", "", "Shared secret for authentication (empty = disabled)")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", *addr)
@@ -50,6 +56,11 @@ func main() {
 	}()
 
 	log.Printf("Mock orchestrator listening on %s (sending %d PDs/s)", *addr, *rate)
+	if *secret == "" {
+		log.Printf("Authentication disabled")
+	} else {
+		log.Printf("Authentication enabled")
+	}
 
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -67,7 +78,7 @@ func main() {
 		}
 
 		log.Printf("Agent connected from %s", conn.RemoteAddr())
-		go handleAgent(conn, *rate)
+		go handleAgent(conn, *rate, *secret)
 	}
 }
 
@@ -89,9 +100,52 @@ func reportStats() {
 		pdsPerSec, fiesPerSec, successRate, sent, received)
 }
 
+// handleAuth performs the authentication handshake. The decoder is created here and returned
+// so that the PD/FIE loop reuses it — avoiding loss of buffered bytes.
+// A read deadline bounds the handshake so a connected-but-silent client can't hang the
+// goroutine forever; it's cleared once auth succeeds so it doesn't affect the PD/FIE loop.
+// Returns the shared decoder and true on success, nil and false on failure.
+func handleAuth(conn net.Conn, secret string) (*json.Decoder, bool) {
+	remoteAddr := conn.RemoteAddr().String()
+
+	if err := conn.SetReadDeadline(time.Now().Add(authTimeout)); err != nil {
+		log.Printf("[%s] Failed to set auth read deadline: %v", remoteAddr, err)
+		return nil, false
+	}
+
+	decoder := json.NewDecoder(conn)
+	encoder := json.NewEncoder(conn)
+
+	var req api.AuthRequest
+	if err := decoder.Decode(&req); err != nil {
+		log.Printf("[%s] Failed to decode auth request: %v", remoteAddr, err)
+		return nil, false
+	}
+
+	if secret != "" && req.Secret != secret {
+		_ = encoder.Encode(api.AuthResponse{Authenticated: false, Message: "secret is not correct"})
+		log.Printf("[%s] Authentication failed", remoteAddr)
+		return nil, false
+	}
+
+	if err := encoder.Encode(api.AuthResponse{Authenticated: true, Message: "authenticated"}); err != nil {
+		log.Printf("[%s] Failed to send auth response: %v", remoteAddr, err)
+		return nil, false
+	}
+
+	// Clear the deadline now that the handshake is done; the PD/FIE loop manages its own lifetime.
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("[%s] Failed to clear read deadline: %v", remoteAddr, err)
+		return nil, false
+	}
+
+	log.Printf("[%s] Authenticated", remoteAddr)
+	return decoder, true
+}
+
 // receiveFIEs runs in a separate goroutine so that sending and receiving can proceed
 // concurrently on the same connection. sendPDs blocks until the connection closes.
-func handleAgent(conn net.Conn, rate int) {
+func handleAgent(conn net.Conn, rate int, secret string) {
 	remoteAddr := conn.RemoteAddr().String()
 
 	defer func() {
@@ -101,8 +155,12 @@ func handleAgent(conn net.Conn, rate int) {
 		log.Printf("[%s] Connection closed", remoteAddr)
 	}()
 
+	decoder, ok := handleAuth(conn, secret)
+	if !ok {
+		return
+	}
+
 	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
 
 	go receiveFIEs(decoder, remoteAddr)
 	sendPDs(encoder, remoteAddr, rate)
