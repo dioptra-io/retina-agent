@@ -109,6 +109,26 @@ func (l *limitedWriteConn) Write(b []byte) (n int, err error) {
 	return l.writeBuf.Write(b)
 }
 
+// errorDeadlineConn returns an error from SetReadDeadline. failOnCall controls which
+// invocation fails: 1 for the initial deadline set (before decode), 2 for the clearing
+// deadline (after successful auth) — handleAuth calls SetReadDeadline twice on the
+// success path, so a single failing mock can't exercise both branches at once.
+type errorDeadlineConn struct {
+	*mockConn
+	failOnCall int
+	callCount  int
+}
+
+func (e *errorDeadlineConn) SetReadDeadline(t time.Time) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.callCount++
+	if e.callCount == e.failOnCall {
+		return errors.New("deadline error")
+	}
+	return nil
+}
+
 // -- test helpers -------------------------------------------------------------
 
 // createTestFIE creates a ForwardingInfoElement for testing.
@@ -139,6 +159,18 @@ func encodeFIE(t *testing.T, conn *mockConn, fie *api.ForwardingInfoElement) {
 	encoder := json.NewEncoder(conn.readBuf)
 	if err := encoder.Encode(fie); err != nil {
 		t.Fatalf("Failed to encode FIE: %v", err)
+	}
+}
+
+// writeAuthRequest encodes an AuthRequest to the connection's read buffer. handleAgent's
+// first read is now the auth handshake, so any test driving handleAgent (or handleAuth
+// directly) needs one of these ahead of whatever payload it expects sendPDs/receiveFIEs
+// to see afterward.
+func writeAuthRequest(t *testing.T, conn *mockConn, secret string) {
+	t.Helper()
+	encoder := json.NewEncoder(conn.readBuf)
+	if err := encoder.Encode(api.AuthRequest{Secret: secret}); err != nil { //nolint:gosec // G117: secret is the point of this struct, never logged
+		t.Fatalf("Failed to encode auth request: %v", err)
 	}
 }
 
@@ -285,6 +317,132 @@ func TestReportStats_EarlyReturn(t *testing.T) {
 	fiesReceived.Store(0)
 
 	reportStats()
+}
+
+// -- handleAuth -----------------------------------------------------------------
+
+func TestHandleAuth_SuccessNoSecret(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	writeAuthRequest(t, conn, "")
+
+	decoder, ok := handleAuth(conn, "")
+	if !ok {
+		t.Fatal("handleAuth failed, want success")
+	}
+	if decoder == nil {
+		t.Fatal("handleAuth returned nil decoder on success")
+	}
+
+	var resp api.AuthResponse
+	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode auth response: %v", err)
+	}
+	if !resp.Authenticated {
+		t.Error("AuthResponse.Authenticated = false, want true")
+	}
+}
+
+func TestHandleAuth_SuccessMatchingSecret(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	writeAuthRequest(t, conn, "correct-secret")
+
+	decoder, ok := handleAuth(conn, "correct-secret")
+	if !ok {
+		t.Fatal("handleAuth failed, want success")
+	}
+	if decoder == nil {
+		t.Fatal("handleAuth returned nil decoder on success")
+	}
+}
+
+func TestHandleAuth_WrongSecret(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	writeAuthRequest(t, conn, "wrong-secret")
+
+	decoder, ok := handleAuth(conn, "correct-secret")
+	if ok {
+		t.Fatal("handleAuth succeeded, want failure")
+	}
+	if decoder != nil {
+		t.Error("handleAuth returned non-nil decoder on failure")
+	}
+
+	var resp api.AuthResponse
+	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode auth response: %v", err)
+	}
+	if resp.Authenticated {
+		t.Error("AuthResponse.Authenticated = true, want false")
+	}
+}
+
+func TestHandleAuth_DecodeError(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	conn.readBuf.WriteString("not valid json")
+
+	decoder, ok := handleAuth(conn, "some-secret")
+	if ok {
+		t.Fatal("handleAuth succeeded, want failure")
+	}
+	if decoder != nil {
+		t.Error("handleAuth returned non-nil decoder on failure")
+	}
+}
+
+func TestHandleAuth_ResponseWriteError(t *testing.T) {
+	t.Parallel()
+
+	conn := &errorWriteConn{mockConn: newMockConn(), writeErr: errors.New("network error")}
+	writeAuthRequest(t, conn.mockConn, "")
+
+	decoder, ok := handleAuth(conn, "")
+	if ok {
+		t.Fatal("handleAuth succeeded, want failure")
+	}
+	if decoder != nil {
+		t.Error("handleAuth returned non-nil decoder on failure")
+	}
+}
+
+func TestHandleAuth_SetDeadlineError(t *testing.T) {
+	t.Parallel()
+
+	// Fails on the first SetReadDeadline call, made before the auth request is decoded.
+	conn := &errorDeadlineConn{mockConn: newMockConn(), failOnCall: 1}
+	writeAuthRequest(t, conn.mockConn, "")
+
+	decoder, ok := handleAuth(conn, "")
+	if ok {
+		t.Fatal("handleAuth succeeded, want failure")
+	}
+	if decoder != nil {
+		t.Error("handleAuth returned non-nil decoder on failure")
+	}
+}
+
+func TestHandleAuth_ClearDeadlineError(t *testing.T) {
+	t.Parallel()
+
+	// Fails on the second SetReadDeadline call, made after a successful handshake to
+	// clear the deadline before handing the decoder off to the PD/FIE loop.
+	conn := &errorDeadlineConn{mockConn: newMockConn(), failOnCall: 2}
+	writeAuthRequest(t, conn.mockConn, "")
+
+	decoder, ok := handleAuth(conn, "")
+	if ok {
+		t.Fatal("handleAuth succeeded, want failure")
+	}
+	if decoder != nil {
+		t.Error("handleAuth returned non-nil decoder on failure")
+	}
 }
 
 // -- receiveFIEs --------------------------------------------------------------
@@ -453,12 +611,13 @@ func TestHandleAgent_BasicFlow(t *testing.T) {
 	t.Parallel()
 
 	conn := newMockConn()
+	writeAuthRequest(t, conn, "")
 	fie := createTestFIE(1)
 	encodeFIE(t, conn, &fie)
 
 	done := make(chan bool)
 	go func() {
-		handleAgent(conn, 100)
+		handleAgent(conn, 100, "")
 		done <- true
 	}()
 
@@ -474,8 +633,41 @@ func TestHandleAgent_BasicFlow(t *testing.T) {
 		t.Fatal("Timeout waiting for handleAgent")
 	}
 
+	// writeBuf now contains the auth response ahead of the PDs; just confirm something was written.
 	if conn.writeBuf.Len() == 0 {
-		t.Error("No PDs were sent")
+		t.Error("No data was sent")
+	}
+}
+
+func TestHandleAgent_AuthFailureClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	conn := newMockConn()
+	writeAuthRequest(t, conn, "wrong-secret")
+
+	done := make(chan bool)
+	go func() {
+		handleAgent(conn, 100, "correct-secret")
+		done <- true
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for handleAgent to reject bad auth")
+	}
+
+	var resp api.AuthResponse
+	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode auth response: %v", err)
+	}
+	if resp.Authenticated {
+		t.Error("AuthResponse.Authenticated = true, want false")
+	}
+	// No PDs should follow a failed handshake.
+	var pd api.ProbingDirective
+	if err := json.NewDecoder(conn.writeBuf).Decode(&pd); err == nil {
+		t.Error("PD written to buffer after failed auth, want none")
 	}
 }
 
@@ -483,12 +675,13 @@ func TestHandleAgent_CloseError(t *testing.T) {
 	t.Parallel()
 
 	conn := &errorCloseConn{mockConn: newMockConn()}
+	writeAuthRequest(t, conn.mockConn, "")
 	fie := createTestFIE(1)
 	encodeFIE(t, conn.mockConn, &fie)
 
 	done := make(chan bool)
 	go func() {
-		handleAgent(conn, 100)
+		handleAgent(conn, 100, "")
 		done <- true
 	}()
 
@@ -508,6 +701,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 	t.Parallel()
 
 	conn := newMockConn()
+	writeAuthRequest(t, conn, "")
 
 	for i := 0; i < 10; i++ {
 		pdID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
@@ -517,7 +711,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		handleAgent(conn, 100)
+		handleAgent(conn, 100, "")
 		done <- true
 	}()
 
@@ -534,8 +728,18 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 	}
 
 	decoder := json.NewDecoder(conn.writeBuf)
-	foundICMPv6 := false
 
+	// First message on the wire is now the auth response, not a PD — consume and check it
+	// before looking for the ICMPv6 directive among the PDs that follow.
+	var resp api.AuthResponse
+	if err := decoder.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode auth response: %v", err)
+	}
+	if !resp.Authenticated {
+		t.Fatal("AuthResponse.Authenticated = false, want true")
+	}
+
+	foundICMPv6 := false
 	for {
 		var pd api.ProbingDirective
 		if err := decoder.Decode(&pd); err != nil {
@@ -560,12 +764,13 @@ func TestHandleAgent_WriteError(t *testing.T) {
 		writeErr: errors.New("network timeout"),
 	}
 
+	writeAuthRequest(t, conn.mockConn, "")
 	fie := createTestFIE(1)
 	encodeFIE(t, conn.mockConn, &fie)
 
 	done := make(chan bool)
 	go func() {
-		handleAgent(conn, 10)
+		handleAgent(conn, 10, "")
 		done <- true
 	}()
 
