@@ -14,13 +14,25 @@
 //
 //   - caracal_prober.go is excluded entirely; NewCaracalProber requires the caracal
 //     binary and is exercised by integration tests.
+//
+//   - handleDecodeError's "malformed, retry until MaxConsecutiveDecodeErrors"
+//     branch (consecutiveErrors++ path) is tested directly as a pure function
+//     below, but may no longer be reachable via real framing.Receive errors:
+//     every failure mode in framing.Receive (oversized length, truncated
+//     payload, unmarshal failure) is wrapped in framing.ErrProtocolViolation,
+//     which this package's handleDecodeError correctly treats as fatal (per
+//     framing's own contract), not retriable — unlike JSON, where a malformed
+//     line was recoverable by skipping to the next newline. Worth revisiting
+//     whether MaxConsecutiveDecodeErrors still serves a purpose, or whether
+//     validatePD failures (which remain a distinct, still-reachable, currently
+//     uncounted path) should count toward it instead.
 
 package agent
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -31,8 +43,11 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
 
 // testLogger returns a logger that discards all output, keeping test output clean.
@@ -45,14 +60,73 @@ func testMetrics() *Metrics {
 	return NewMetrics(prometheus.NewRegistry(), "test-agent")
 }
 
+// -- frame helpers --------------------------------------------------------------
+//
+// authenticate/readerLoop/writerLoop now speak length-prefixed protobuf via
+// framing.Send/Receive, not newline-delimited JSON — stub connections that
+// need to inject or capture specific payloads have to construct/parse that
+// same wire format.
+
+// encodeFrame builds a length-prefixed protobuf frame matching what
+// framing.Send would produce.
+func encodeFrame(t *testing.T, msg proto.Message) []byte {
+	t.Helper()
+	payload, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("cannot marshal message: %v", err)
+	}
+	header := make([]byte, 4, 4+len(payload))
+	binary.BigEndian.PutUint32(header, uint32(len(payload))) //nolint:gosec // G115: a test payload never approaches uint32 range
+	return append(header, payload...)
+}
+
+// encodeGarbageFrame builds a length-prefixed frame with a valid header but
+// a payload that fails protobuf unmarshaling — simulating a decode error
+// at the framing level, distinct from a network/EOF error.
+func encodeGarbageFrame(payloadLen int) []byte {
+	header := make([]byte, 4, 4+payloadLen)
+	binary.BigEndian.PutUint32(header, uint32(payloadLen)) //nolint:gosec // G115: test-only payload length, never approaches uint32 range
+	garbage := make([]byte, payloadLen)
+	for i := range garbage {
+		garbage[i] = 0xFF
+	}
+	return append(header, garbage...)
+}
+
+func icmpNextHeader() *wire.NextHeader {
+	return &wire.NextHeader{Header: &wire.NextHeader_IcmpNextHeader{IcmpNextHeader: &wire.ICMPNextHeader{}}}
+}
+
+func icmpv6NextHeader() *wire.NextHeader {
+	return &wire.NextHeader{Header: &wire.NextHeader_Icmpv6NextHeader{Icmpv6NextHeader: &wire.ICMPv6NextHeader{}}}
+}
+
+func udpNextHeader() *wire.NextHeader {
+	return &wire.NextHeader{Header: &wire.NextHeader_UdpNextHeader{UdpNextHeader: &wire.UDPNextHeader{}}}
+}
+
+// validWirePD returns a minimally valid wire.ProbingDirective — enough to
+// pass model.ProbingDirectiveFromProto (DestinationAddress required, TTL
+// in uint8 range) and validatePD (AgentID non-empty, TTL not 0/255,
+// NextHeader present for the protocol).
+func validWirePD(agentID string, ttl uint32) *wire.ProbingDirective {
+	return &wire.ProbingDirective{
+		AgentId:            agentID,
+		NearTtl:            ttl,
+		DestinationAddress: "8.8.8.8",
+		Protocol:           wire.Protocol_PROTOCOL_ICMP,
+		NextHeader:         icmpNextHeader(),
+	}
+}
+
 // -- stubs --------------------------------------------------------------------
 
 type stubProber struct {
-	probeFunc func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
+	probeFunc func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error)
 	closeFunc func() error
 }
 
-func (s *stubProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+func (s *stubProber) Probe(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	if s.probeFunc != nil {
 		return s.probeFunc(ctx, pd, ttl)
 	}
@@ -154,35 +228,35 @@ func TestRun_WithLocalServer(t *testing.T) {
 		defer func() { _ = conn.Close() }()
 		t.Logf("Agent connected")
 
-		encoder := json.NewEncoder(conn)
-		decoder := json.NewDecoder(conn)
-
-		pd := &api.ProbingDirective{
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+		var authReq wire.AuthRequest
+		if err := framing.Receive(conn, 2*time.Second, &authReq); err != nil {
+			t.Logf("Auth receive failed: %v", err)
+			return
+		}
+		if err := framing.Send(conn, 2*time.Second, &wire.AuthResponse{Authenticated: true}); err != nil {
+			t.Logf("Auth response send failed: %v", err)
+			return
 		}
 
+		pd := validWirePD("test-agent", 10)
+
 		t.Log("Sending directive...")
-		if err := encoder.Encode(pd); err != nil {
+		if err := framing.Send(conn, 2*time.Second, pd); err != nil {
 			t.Logf("Send failed: %v", err)
 			return
 		}
 
 		t.Log("Waiting for FIE...")
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		var fie api.ForwardingInfoElement
-		if err := decoder.Decode(&fie); err != nil {
+		var fie wire.ForwardingInfoElement
+		if err := framing.Receive(conn, 2*time.Second, &fie); err != nil {
 			t.Logf("Receive failed: %v", err)
 			return
 		}
 
 		if fie.NearInfo != nil {
-			t.Logf("✓ Received FIE with TTL %d", fie.NearInfo.ProbeTTL)
+			t.Logf("Received FIE with TTL %d", fie.NearInfo.ProbeTtl)
 		} else {
-			t.Log("✓ Received FIE (near probe timed out)")
+			t.Log("Received FIE (near probe timed out)")
 		}
 		gotFIE <- true
 
@@ -293,7 +367,7 @@ func TestRun_ProberCloseError(t *testing.T) {
 	if err == nil {
 		t.Error("Run should fail with invalid address")
 	}
-	t.Log("✓ prober.Close() error was logged in defer")
+	t.Log("prober.Close() error was logged in defer")
 }
 
 func TestRun_ProberCreationError(t *testing.T) {
@@ -311,6 +385,12 @@ func TestRun_ProberCreationError(t *testing.T) {
 	}
 }
 
+// TestRun_GoroutineErrorPropagation sends repeated malformed frames (valid
+// header, garbage payload) rather than malformed JSON lines — see this
+// file's top-of-file note on why the old "retry until threshold" scenario
+// doesn't map cleanly onto framing's error model. This now exercises the
+// fatal/immediate-disconnect path (ErrProtocolViolation), not a
+// retry-then-threshold path.
 func TestRun_GoroutineErrorPropagation(t *testing.T) {
 	t.Parallel()
 
@@ -329,8 +409,16 @@ func TestRun_GoroutineErrorPropagation(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
+		var authReq wire.AuthRequest
+		if err := framing.Receive(conn, time.Second, &authReq); err != nil {
+			return
+		}
+		if err := framing.Send(conn, time.Second, &wire.AuthResponse{Authenticated: true}); err != nil {
+			return
+		}
+
 		for i := 0; i < 20; i++ {
-			_, _ = conn.Write([]byte("invalid json line\n"))
+			_, _ = conn.Write(encodeGarbageFrame(16))
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
@@ -418,8 +506,8 @@ func TestRun_WithMockConnection(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		pds := make(chan *api.ProbingDirective, 10)
-		fies := make(chan *api.ForwardingInfoElement, 10)
+		pds := make(chan *model.ProbingDirective, 10)
+		fies := make(chan *model.ForwardingInfoElement, 10)
 
 		errCh := make(chan error, 3)
 		go func() { errCh <- a.readerLoop(ctx, serverConn, pds) }()
@@ -434,30 +522,19 @@ func TestRun_WithMockConnection(t *testing.T) {
 		}
 	}()
 
-	validPD := &api.ProbingDirective{
-		AgentID:            "test-agent",
-		NearTTL:            10,
-		DestinationAddress: []byte{8, 8, 8, 8},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
-	}
-
-	encoder := json.NewEncoder(clientConn)
-	if err := encoder.Encode(validPD); err != nil {
+	validPD := validWirePD("test-agent", 10)
+	if err := framing.Send(clientConn, 0, validPD); err != nil {
 		t.Fatalf("Failed to send directive: %v", err)
 	}
 
-	decoder := json.NewDecoder(clientConn)
-	var fie api.ForwardingInfoElement
-
-	_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	if err := decoder.Decode(&fie); err != nil {
+	var fie wire.ForwardingInfoElement
+	if err := framing.Receive(clientConn, 200*time.Millisecond, &fie); err != nil {
 		t.Logf("Note: Could not read FIE (expected if goroutines exit early): %v", err)
 	} else {
 		if fie.NearInfo == nil {
 			t.Error("NearInfo should be set when near probe succeeded")
-		} else if fie.NearInfo.ProbeTTL != 10 {
-			t.Errorf("FIE NearInfo.ProbeTTL = %d, want 10", fie.NearInfo.ProbeTTL)
+		} else if fie.NearInfo.ProbeTtl != 10 {
+			t.Errorf("FIE NearInfo.ProbeTtl = %d, want 10", fie.NearInfo.ProbeTtl)
 		}
 		t.Logf("Successfully completed full pipeline test")
 	}
@@ -475,6 +552,11 @@ func TestRun_WithMockConnection(t *testing.T) {
 }
 
 // -- handleDecodeError() ------------------------------------------------------
+//
+// Tested directly as a pure function — see this file's top-of-file note on
+// why the retriable branch may no longer be reachable via real
+// framing.Receive errors in practice, even though the function itself
+// still correctly implements that logic given an arbitrary error.
 
 func TestHandleDecodeError_ContextCancelled(t *testing.T) {
 	t.Parallel()
@@ -529,7 +611,30 @@ func TestHandleDecodeError_NetworkError(t *testing.T) {
 	}
 }
 
-func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
+func TestHandleDecodeError_ProtocolViolation(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config:  &Config{AgentID: "test-agent"},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	err := fmt.Errorf("%w: bad frame", framing.ErrProtocolViolation)
+	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
+
+	if shouldContinue {
+		t.Error("should not continue on protocol violation — framing's own contract treats it as fatal")
+	}
+	if newCount != 0 {
+		t.Errorf("error count should remain 0, got: %d", newCount)
+	}
+	if handledErr == nil || !strings.Contains(handledErr.Error(), "connection lost while reading") {
+		t.Errorf("expected connection-lost error, got: %v", handledErr)
+	}
+}
+
+func TestHandleDecodeError_MalformedError_WithLimit(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
@@ -541,11 +646,15 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 		metrics: testMetrics(),
 	}
 
-	err := errors.New("json: invalid character")
+	// A synthetic error that's neither a network error nor
+	// ErrProtocolViolation — exercises handleDecodeError's retriable
+	// branch directly, even though real framing.Receive errors may never
+	// actually take this shape (see top-of-file note).
+	err := errors.New("synthetic malformed-but-retriable error")
 
 	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
 	if !shouldContinue {
-		t.Error("should continue on first JSON error")
+		t.Error("should continue on first malformed error")
 	}
 	if newCount != 1 {
 		t.Errorf("error count should be 1, got: %d", newCount)
@@ -556,7 +665,7 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 
 	shouldContinue, newCount, handledErr = a.handleDecodeError(context.Background(), err, 1)
 	if !shouldContinue {
-		t.Error("should continue on second JSON error")
+		t.Error("should continue on second malformed error")
 	}
 	if newCount != 2 {
 		t.Errorf("error count should be 2, got: %d", newCount)
@@ -581,7 +690,7 @@ func TestHandleDecodeError_JSONError_WithLimit(t *testing.T) {
 	}
 }
 
-func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
+func TestHandleDecodeError_MalformedError_NoLimit(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{
@@ -593,7 +702,7 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 		metrics: testMetrics(),
 	}
 
-	err := errors.New("json: invalid character")
+	err := errors.New("synthetic malformed-but-retriable error")
 
 	shouldContinue, newCount, handledErr := a.handleDecodeError(context.Background(), err, 0)
 	if !shouldContinue {
@@ -620,68 +729,6 @@ func TestHandleDecodeError_JSONError_NoLimit(t *testing.T) {
 
 // -- readerLoop() -------------------------------------------------------------
 
-func TestReaderLoop_DecodeErrorLog(t *testing.T) {
-	t.Parallel()
-
-	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-	a.config.MaxConsecutiveDecodeErrors = 2
-
-	data := bytes.NewBufferString("{ bad json\n{ more bad\n")
-
-	conn := &stubConn{
-		readFunc: func(b []byte) (int, error) {
-			return data.Read(b)
-		},
-	}
-
-	pds := make(chan *api.ProbingDirective, 1)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- a.readerLoop(context.Background(), conn, pds)
-	}()
-
-	select {
-	case err := <-done:
-		if !strings.Contains(err.Error(), "consecutive decode errors") {
-			t.Logf("Got error: %v", err)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Error("readerLoop did not finish")
-	}
-}
-
-func TestReaderLoop_DecodeErrorWithUnlimitedRetries(t *testing.T) {
-	t.Parallel()
-
-	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-	a.config.MaxConsecutiveDecodeErrors = 0
-
-	attempts := 0
-	conn := &stubConn{
-		readFunc: func(b []byte) (int, error) {
-			attempts++
-			return copy(b, "invalid json\n"), nil
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	pds := make(chan *api.ProbingDirective, 1)
-
-	err := a.readerLoop(ctx, conn, pds)
-
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Logf("readerLoop = %v (expected context.DeadlineExceeded)", err)
-	}
-
-	if attempts < 1 {
-		t.Error("Expected at least one decode attempt")
-	}
-	t.Log("✓ Decode error with unlimited retries was logged")
-}
-
 func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 	t.Parallel()
 
@@ -692,7 +739,7 @@ func TestReaderLoop_SetReadDeadlineFail(t *testing.T) {
 	}
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
-	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
+	err := a.readerLoop(context.Background(), conn, make(chan *model.ProbingDirective, 1))
 	if err == nil || !strings.Contains(err.Error(), "failed to set read deadline") {
 		t.Errorf("readerLoop(deadline fail) = %v", err)
 	}
@@ -707,7 +754,7 @@ func TestReaderLoop_ContextCancelled(t *testing.T) {
 
 	conn := &stubConn{}
 
-	err := a.readerLoop(ctx, conn, make(chan *api.ProbingDirective, 1))
+	err := a.readerLoop(ctx, conn, make(chan *model.ProbingDirective, 1))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("readerLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
@@ -717,41 +764,11 @@ func TestReaderLoop_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-	conn := &stubConn{}
+	conn := &stubConn{} // default readFunc returns io.EOF
 
-	err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
+	err := a.readerLoop(context.Background(), conn, make(chan *model.ProbingDirective, 1))
 	if !isNetworkError(err) || !strings.Contains(err.Error(), "connection lost while reading") {
 		t.Errorf("readerLoop(network EOF) = %v", err)
-	}
-}
-
-func TestReaderLoop_ConsecutiveDecodeErrors(t *testing.T) {
-	t.Parallel()
-
-	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-	a.config.MaxConsecutiveDecodeErrors = 2
-
-	data := bytes.NewBufferString("bad\nbad\n")
-
-	conn := &stubConn{
-		readFunc: func(b []byte) (int, error) {
-			return data.Read(b)
-		},
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		err := a.readerLoop(context.Background(), conn, make(chan *api.ProbingDirective, 1))
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "too many consecutive decode errors") {
-			t.Errorf("readerLoop(consecutive errors) = %v, want consecutive decode error", err)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("readerLoop did not exit after consecutive decode errors")
 	}
 }
 
@@ -771,7 +788,7 @@ func TestReaderLoop_DeadConnectionDetection(t *testing.T) {
 	defer func() { _ = server.Close() }()
 	defer func() { _ = client.Close() }()
 
-	pds := make(chan *api.ProbingDirective, 1)
+	pds := make(chan *model.ProbingDirective, 1)
 	err := a.readerLoop(context.Background(), client, pds)
 
 	if err == nil {
@@ -782,32 +799,29 @@ func TestReaderLoop_DeadConnectionDetection(t *testing.T) {
 	}
 }
 
-//nolint:funlen // Test requires setup of invalid and valid PDs with full validation
-func TestReaderLoop_InvalidDirective(t *testing.T) {
+// TestReaderLoop_InvalidDirective_SkipsAndContinues covers validatePD
+// rejecting a structurally-well-formed-but-semantically-invalid directive
+// (empty AgentID) and continuing to the next one — this is a genuinely
+// different failure mode than a framing-level decode error (see
+// top-of-file note): it happens after successful decode, isn't
+// ErrProtocolViolation, and isn't counted toward MaxConsecutiveDecodeErrors.
+func TestReaderLoop_InvalidDirective_SkipsAndContinues(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
-	invalidPD := &api.ProbingDirective{
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+	invalidPD := &wire.ProbingDirective{
+		AgentId:            "", // empty — validatePD rejects this
+		NearTtl:            5,
+		DestinationAddress: "1.2.3.4",
+		Protocol:           wire.Protocol_PROTOCOL_ICMP,
+		NextHeader:         icmpNextHeader(),
 	}
-	invalidJSON, _ := json.Marshal(invalidPD)
-	invalidJSON = append(invalidJSON, '\n')
+	validPD := validWirePD("test", 10)
 
-	validPD := &api.ProbingDirective{
-		AgentID:            "test",
-		NearTTL:            10,
-		DestinationAddress: []byte{8, 8, 8, 8},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
-	}
-	validJSON, _ := json.Marshal(validPD)
-	validJSON = append(validJSON, '\n')
-
-	data := make([]byte, 0, len(invalidJSON)+len(validJSON))
-	data = append(data, invalidJSON...)
-	data = append(data, validJSON...)
+	var data []byte
+	data = append(data, encodeFrame(t, invalidPD)...)
+	data = append(data, encodeFrame(t, validPD)...)
 
 	conn := &stubConn{
 		readFunc: func(b []byte) (int, error) {
@@ -820,7 +834,7 @@ func TestReaderLoop_InvalidDirective(t *testing.T) {
 		},
 	}
 
-	pds := make(chan *api.ProbingDirective, 2)
+	pds := make(chan *model.ProbingDirective, 2)
 
 	done := make(chan error, 1)
 	go func() {
@@ -855,15 +869,8 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
-	validPD := &api.ProbingDirective{
-		AgentID:            "test",
-		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
-		Protocol:           api.ICMP,
-		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
-	}
-	validJSON, _ := json.Marshal(validPD)
-	data := bytes.NewBuffer(append(validJSON, '\n'))
+	validPD := validWirePD("test", 5)
+	data := bytes.NewBuffer(encodeFrame(t, validPD))
 
 	conn := &stubConn{
 		readFunc: func(b []byte) (int, error) {
@@ -871,7 +878,7 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 		},
 	}
 
-	pds := make(chan *api.ProbingDirective, 1)
+	pds := make(chan *model.ProbingDirective, 1)
 	done := make(chan error, 1)
 
 	go func() {
@@ -911,8 +918,11 @@ func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
 	}
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
-	fies := make(chan *api.ForwardingInfoElement, 1)
-	fies <- &api.ForwardingInfoElement{}
+	fies := make(chan *model.ForwardingInfoElement, 1)
+	fies <- &model.ForwardingInfoElement{
+		DestinationAddress:  net.ParseIP("8.8.8.8"),
+		ProductionTimestamp: time.Now(),
+	}
 
 	err := a.writerLoop(context.Background(), conn, fies)
 	if err == nil || !strings.Contains(err.Error(), "failed to set write deadline") {
@@ -924,7 +934,7 @@ func TestWriterLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-	fies := make(chan *api.ForwardingInfoElement)
+	fies := make(chan *model.ForwardingInfoElement)
 	close(fies)
 
 	err := a.writerLoop(context.Background(), &stubConn{}, fies)
@@ -940,7 +950,7 @@ func TestWriterLoop_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := a.writerLoop(ctx, &stubConn{}, make(chan *api.ForwardingInfoElement))
+	err := a.writerLoop(ctx, &stubConn{}, make(chan *model.ForwardingInfoElement))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("writerLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
@@ -957,9 +967,10 @@ func TestWriterLoop_NetworkError(t *testing.T) {
 		},
 	}
 
-	fies := make(chan *api.ForwardingInfoElement, 1)
-	fies <- &api.ForwardingInfoElement{
-		DestinationAddress: []byte{8, 8, 8, 8},
+	fies := make(chan *model.ForwardingInfoElement, 1)
+	fies <- &model.ForwardingInfoElement{
+		DestinationAddress:  net.ParseIP("8.8.8.8"),
+		ProductionTimestamp: time.Now(),
 	}
 
 	err := a.writerLoop(context.Background(), conn, fies)
@@ -968,26 +979,20 @@ func TestWriterLoop_NetworkError(t *testing.T) {
 	}
 }
 
-func TestWriterLoop_EncodeError(t *testing.T) {
+// TestWriterLoop_ToProtoError covers fie.ToProto() itself failing (e.g. a
+// missing required DestinationAddress) — a distinct failure mode from a
+// network-level write error, only possible now that ToProto is fallible.
+func TestWriterLoop_ToProtoError(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 
-	written := make(chan string, 1)
+	fies := make(chan *model.ForwardingInfoElement, 1)
+	fies <- &model.ForwardingInfoElement{} // no DestinationAddress — required
 
-	conn := &stubConn{
-		writeFunc: func(b []byte) (int, error) {
-			written <- string(b)
-			return 0, errors.New("encode error")
-		},
-	}
-
-	fies := make(chan *api.ForwardingInfoElement, 1)
-	fies <- &api.ForwardingInfoElement{}
-
-	err := a.writerLoop(context.Background(), conn, fies)
-	if err == nil || !strings.Contains(err.Error(), "failed to encode FIE") {
-		t.Errorf("writerLoop(encode error) = %v", err)
+	err := a.writerLoop(context.Background(), &stubConn{}, fies)
+	if err == nil || !strings.Contains(err.Error(), "failed to convert FIE to wire format") {
+		t.Errorf("writerLoop(ToProto error) = %v", err)
 	}
 }
 
@@ -997,17 +1002,23 @@ func TestWriterLoop_Success(t *testing.T) {
 	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
 	a.config.AgentID = "test-agent"
 
-	written := make(chan []byte, 1)
+	// writerLoop is called synchronously below (not in a goroutine), so
+	// accumulating into a plain buffer is simpler and safer than a
+	// channel here — framing.Send makes two separate Write calls per
+	// frame (header, then payload), and a channel with buffer 1 would
+	// deadlock on the second call with nothing around to drain the first.
+	var written bytes.Buffer
 	conn := &stubConn{
 		writeFunc: func(b []byte) (int, error) {
-			written <- append([]byte(nil), b...)
+			written.Write(b)
 			return len(b), nil
 		},
 	}
 
-	fies := make(chan *api.ForwardingInfoElement, 1)
-	fie := &api.ForwardingInfoElement{
-		DestinationAddress: []byte{8, 8, 8, 8},
+	fies := make(chan *model.ForwardingInfoElement, 1)
+	fie := &model.ForwardingInfoElement{
+		DestinationAddress:  net.ParseIP("8.8.8.8"),
+		ProductionTimestamp: time.Now(),
 	}
 	fies <- fie
 	close(fies)
@@ -1017,18 +1028,15 @@ func TestWriterLoop_Success(t *testing.T) {
 		t.Errorf("writerLoop(success) = %v, want nil", err)
 	}
 
-	select {
-	case data := <-written:
-		if len(data) == 0 {
-			t.Error("writerLoop wrote empty data")
-			return
-		}
-		var decoded api.ForwardingInfoElement
-		if err := json.Unmarshal(data, &decoded); err != nil {
-			t.Errorf("writerLoop wrote invalid JSON: %v", err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("writerLoop did not write FIE")
+	data := written.Bytes()
+	if len(data) <= 4 {
+		t.Error("writerLoop wrote no payload beyond the frame header")
+		return
+	}
+	length := binary.BigEndian.Uint32(data[:4])
+	var decoded wire.ForwardingInfoElement
+	if err := proto.Unmarshal(data[4:4+length], &decoded); err != nil {
+		t.Errorf("writerLoop wrote invalid protobuf: %v", err)
 	}
 }
 
@@ -1038,10 +1046,10 @@ func TestProcessorLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
 	a := &agent{config: DefaultConfig(), prober: &stubProber{}, logger: testLogger(), metrics: testMetrics()}
-	pds := make(chan *api.ProbingDirective)
+	pds := make(chan *model.ProbingDirective)
 	close(pds)
 
-	err := a.processorLoop(context.Background(), pds, make(chan *api.ForwardingInfoElement))
+	err := a.processorLoop(context.Background(), pds, make(chan *model.ForwardingInfoElement))
 	if err != nil {
 		t.Errorf("processorLoop(channel closed) = %v, want nil", err)
 	}
@@ -1054,7 +1062,7 @@ func TestProcessorLoop_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := a.processorLoop(ctx, make(chan *api.ProbingDirective), make(chan *api.ForwardingInfoElement))
+	err := a.processorLoop(ctx, make(chan *model.ProbingDirective), make(chan *model.ForwardingInfoElement))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("processorLoop(ctx canceled) = %v, want context.Canceled", err)
 	}
@@ -1070,13 +1078,13 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 		metrics: testMetrics(),
 	}
 
-	pds := make(chan *api.ProbingDirective, 1)
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	pds := make(chan *model.ProbingDirective, 1)
+	fies := make(chan *model.ForwardingInfoElement, 1)
 
-	pd := &api.ProbingDirective{
+	pd := &model.ProbingDirective{
 		AgentID:            "test",
 		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+		DestinationAddress: net.ParseIP("1.2.3.4"),
 	}
 	pds <- pd
 
@@ -1124,11 +1132,11 @@ func TestProcessPD_Success(t *testing.T) {
 		metrics: testMetrics(),
 	}
 
-	pd := &api.ProbingDirective{
+	pd := &model.ProbingDirective{
 		NearTTL:            5,
-		DestinationAddress: []byte{1, 2, 3, 4},
+		DestinationAddress: net.ParseIP("1.2.3.4"),
 	}
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	fies := make(chan *model.ForwardingInfoElement, 1)
 
 	a.processPD(context.Background(), pd, fies)
 
@@ -1174,7 +1182,7 @@ func TestProcessPD_ProbeError(t *testing.T) {
 			a := &agent{
 				config: &Config{AgentID: "test"},
 				prober: &stubProber{
-					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+					probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 						if ttl == tt.failTTL {
 							return nil, errors.New("probe fail")
 						}
@@ -1185,8 +1193,8 @@ func TestProcessPD_ProbeError(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
-			fies := make(chan *api.ForwardingInfoElement, 1)
+			pd := &model.ProbingDirective{NearTTL: 5}
+			fies := make(chan *model.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
 
@@ -1221,7 +1229,7 @@ func TestProcessPD_Timeout(t *testing.T) {
 			a := &agent{
 				config: &Config{AgentID: "test"},
 				prober: &stubProber{
-					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+					probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 						if ttl == tt.timedOutTTL {
 							return &ProbeResult{TimedOut: true}, nil
 						}
@@ -1232,8 +1240,8 @@ func TestProcessPD_Timeout(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
-			fies := make(chan *api.ForwardingInfoElement, 1)
+			pd := &model.ProbingDirective{NearTTL: 5}
+			fies := make(chan *model.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
 
@@ -1262,6 +1270,85 @@ func TestProcessPD_Timeout(t *testing.T) {
 	}
 }
 
+// TestProcessPD_BothTimeout confirms buildFIE still produces a FIE (with a
+// nil SourceAddress) when both probes time out — the scenario that used
+// to be a hard blocker before SourceAddress became optional on
+// model.ForwardingInfoElement. This is what UpdateFromFIE's
+// consecutive-miss/replacement logic depends on continuing to receive.
+func TestProcessPD_BothTimeout(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{AgentID: "test"},
+		prober: &stubProber{
+			probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+				return &ProbeResult{TimedOut: true}, nil
+			},
+		},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	pd := &model.ProbingDirective{NearTTL: 5, DestinationAddress: net.ParseIP("1.2.3.4")}
+	fies := make(chan *model.ForwardingInfoElement, 1)
+
+	a.processPD(context.Background(), pd, fies)
+
+	select {
+	case fie := <-fies:
+		if fie == nil {
+			t.Fatal("expected a FIE even when both probes time out")
+		}
+		if fie.NearInfo != nil || fie.FarInfo != nil {
+			t.Error("expected both NearInfo and FarInfo nil")
+		}
+		if fie.SourceAddress != nil {
+			t.Errorf("expected nil SourceAddress, got %v", fie.SourceAddress)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("processPD did not send FIE")
+	}
+}
+
+// TestProcessPD_IgnoresSourceAddressFromTimedOutResult covers the fix
+// where buildFIE previously used a timed-out ProbeResult's SourceAddress
+// if present, contradicting its own doc comment ("from whichever
+// succeeded"). A real Prober shouldn't populate SourceAddress on a
+// timeout, but this confirms buildFIE ignores it defensively if one does.
+func TestProcessPD_IgnoresSourceAddressFromTimedOutResult(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{AgentID: "test"},
+		prober: &stubProber{
+			probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+				// Spurious SourceAddress on a timed-out result — shouldn't
+				// happen from a real Prober, but buildFIE must not use it.
+				return &ProbeResult{TimedOut: true, SourceAddress: net.ParseIP("9.9.9.9")}, nil
+			},
+		},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	pd := &model.ProbingDirective{NearTTL: 5, DestinationAddress: net.ParseIP("1.2.3.4")}
+	fies := make(chan *model.ForwardingInfoElement, 1)
+
+	a.processPD(context.Background(), pd, fies)
+
+	select {
+	case fie := <-fies:
+		if fie == nil {
+			t.Fatal("expected a FIE even when both probes time out")
+		}
+		if fie.SourceAddress != nil {
+			t.Errorf("expected nil SourceAddress from a timed-out result, got %v", fie.SourceAddress)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("processPD did not send FIE")
+	}
+}
+
 func TestProcessPD_ContextCancelled(t *testing.T) {
 	t.Parallel()
 
@@ -1275,8 +1362,8 @@ func TestProcessPD_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	pd := &api.ProbingDirective{NearTTL: 5}
-	fies := make(chan *api.ForwardingInfoElement, 1)
+	pd := &model.ProbingDirective{NearTTL: 5}
+	fies := make(chan *model.ForwardingInfoElement, 1)
 
 	a.processPD(ctx, pd, fies)
 
@@ -1306,7 +1393,7 @@ func TestProcessPD_NilResult(t *testing.T) {
 			a := &agent{
 				config: &Config{AgentID: "test"},
 				prober: &stubProber{
-					probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+					probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 						if ttl == tt.nilTTL {
 							return nil, ErrDuplicatePD // probe already in-flight
 						}
@@ -1317,14 +1404,68 @@ func TestProcessPD_NilResult(t *testing.T) {
 				metrics: testMetrics(),
 			}
 
-			pd := &api.ProbingDirective{NearTTL: 5}
-			fies := make(chan *api.ForwardingInfoElement, 1)
+			pd := &model.ProbingDirective{NearTTL: 5}
+			fies := make(chan *model.ForwardingInfoElement, 1)
 
 			a.processPD(context.Background(), pd, fies)
 
 			select {
 			case <-fies:
 				t.Error(tt.errMsg)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestProcessPD_NilResultWithNilError covers the actual panic guard fix:
+// a Prober returning (nil, nil) — not (nil, ErrDuplicatePD) — for an
+// in-flight probe. The comment on ProbeResult always assumed
+// ErrDuplicatePD accompanies a nil result, but nothing enforced that
+// against a buggy or different Prober implementation; without the guard,
+// recordProbeOutcome's unconditional dereference would panic here, which
+// is especially bad since processPD runs under wg.Go.
+func TestProcessPD_NilResultWithNilError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		nilTTL uint8
+	}{
+		{name: "nil near result, nil error", nilTTL: 5},
+		{name: "nil far result, nil error", nilTTL: 6},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := &agent{
+				config: &Config{AgentID: "test"},
+				prober: &stubProber{
+					probeFunc: func(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+						if ttl == tt.nilTTL {
+							return nil, nil //nolint:nilnil // deliberately simulating a misbehaving Prober
+						}
+						return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1")}, nil
+					},
+				},
+				logger:  testLogger(),
+				metrics: testMetrics(),
+			}
+
+			pd := &model.ProbingDirective{NearTTL: 5}
+			fies := make(chan *model.ForwardingInfoElement, 1)
+
+			// The assertion here is that this doesn't panic — a nil
+			// ProbeResult with a nil error must not reach
+			// recordProbeOutcome's unconditional dereference.
+			a.processPD(context.Background(), pd, fies)
+
+			select {
+			case <-fies:
+				t.Error("should not send FIE when a probe result is nil, even with a nil error")
 			case <-time.After(100 * time.Millisecond):
 			}
 		})
@@ -1360,7 +1501,7 @@ func TestCreateProber_CaracalError(t *testing.T) {
 	if err != expectedErr {
 		t.Errorf("createProber(caracal) error = %v, want %v", err, expectedErr)
 	}
-	t.Log("✓ Caracal error path covered")
+	t.Log("Caracal error path covered")
 }
 
 func TestCreateProber_Unknown(t *testing.T) {
@@ -1377,6 +1518,14 @@ func TestCreateProber_Unknown(t *testing.T) {
 }
 
 // -- validatePD() -------------------------------------------------------------
+//
+// The "nil-dest" case from the original table is gone — DestinationAddress
+// validity is now enforced upstream by model.ProbingDirectiveFromProto
+// (already covered in retina-commons's model_test.go), before validatePD
+// is ever reached, so a *model.ProbingDirective validatePD actually sees
+// can't have a nil/invalid DestinationAddress in practice. The "zero-ttl"
+// and "nearttl-255" cases are restored below — see the fix to validatePD
+// itself, which had silently dropped both checks during migration.
 
 //nolint:funlen // Table-driven test with many validation cases
 func TestValidatePD_AllBranches(t *testing.T) {
@@ -1384,93 +1533,118 @@ func TestValidatePD_AllBranches(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		pd      *api.ProbingDirective
+		pd      *model.ProbingDirective
 		wantErr bool
 	}{
 		{name: "nil", pd: nil, wantErr: true},
-		{name: "empty-agent", pd: &api.ProbingDirective{}, wantErr: true},
-		{name: "nil-dest", pd: &api.ProbingDirective{AgentID: "a", NearTTL: 1}, wantErr: true},
+		{name: "empty-agent", pd: &model.ProbingDirective{}, wantErr: true},
 		{
 			name: "zero-ttl",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            0,
-				DestinationAddress: []byte{1},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
 			},
 			wantErr: true,
 		},
 		{
 			name: "nearttl-255",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            255,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
-				NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMP,
+				NextHeader:         icmpNextHeader(),
 			},
 			wantErr: true,
 		},
 		{
 			name: "icmp-good",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
-				NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMP,
+				NextHeader:         icmpNextHeader(),
 			},
 			wantErr: false,
 		},
 		{
 			name: "icmpv6-good",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMPv6,
-				NextHeader:         api.NextHeader{ICMPv6NextHeader: &api.ICMPv6NextHeader{}},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMPV6,
+				NextHeader:         icmpv6NextHeader(),
 			},
 			wantErr: false,
 		},
 		{
 			name: "udp-good",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.UDP,
-				NextHeader:         api.NextHeader{UDPNextHeader: &api.UDPNextHeader{}},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_UDP,
+				NextHeader:         udpNextHeader(),
 			},
 			wantErr: false,
 		},
 		{
 			name: "icmp-noheader",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.ICMP,
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMP,
+			},
+			wantErr: true,
+		},
+		{
+			name: "icmpv6-noheader",
+			pd: &model.ProbingDirective{
+				AgentID:            "a",
+				NearTTL:            1,
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMPV6,
+			},
+			wantErr: true,
+		},
+		// icmp-wrong-header-type covers the fix for a real bug (also
+		// present pre-migration, in v1): ICMP and ICMPv6 were treated as
+		// interchangeable for header-presence checking, so an
+		// ICMP-protocol PD carrying only an ICMPv6NextHeader passed
+		// validation incorrectly.
+		{
+			name: "icmp-wrong-header-type",
+			pd: &model.ProbingDirective{
+				AgentID:            "a",
+				NearTTL:            1,
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_ICMP,
+				NextHeader:         icmpv6NextHeader(),
 			},
 			wantErr: true,
 		},
 		{
 			name: "udp-noheader",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           api.UDP,
-				NextHeader:         api.NextHeader{},
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol_PROTOCOL_UDP,
+				NextHeader:         &wire.NextHeader{},
 			},
 			wantErr: true,
 		},
 		{
 			name: "unknown-protocol",
-			pd: &api.ProbingDirective{
+			pd: &model.ProbingDirective{
 				AgentID:            "a",
 				NearTTL:            1,
-				DestinationAddress: []byte{1},
-				Protocol:           99,
+				DestinationAddress: net.ParseIP("1.2.3.4"),
+				Protocol:           wire.Protocol(99),
 			},
 			wantErr: true,
 		},
@@ -1536,7 +1710,7 @@ func TestIsNetworkError_AllCases(t *testing.T) {
 		{"EOF", io.EOF, true},
 		{"UnexpectedEOF", io.ErrUnexpectedEOF, true},
 		{"OpError", &net.OpError{}, true},
-		{"OtherError", errors.New("json error"), false},
+		{"OtherError", errors.New("some error"), false},
 		{"WrappedEOF", fmt.Errorf("wrapped: %w", io.EOF), true},
 	}
 
@@ -1642,13 +1816,36 @@ func (m *mockConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (m *mockConn) queueAuthResponse(resp *api.AuthResponse) error {
-	return json.NewEncoder(m.readBuf).Encode(resp)
+// queueAuthResponse writes a length-prefixed frame directly into readBuf —
+// what the code-under-test will read via framing.Receive.
+func (m *mockConn) queueAuthResponse(resp *wire.AuthResponse) error {
+	payload, err := proto.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(payload))) //nolint:gosec // G115: a test payload never approaches uint32 range
+	if _, err := m.readBuf.Write(header); err != nil {
+		return err
+	}
+	_, err = m.readBuf.Write(payload)
+	return err
 }
 
-func (m *mockConn) getAuthRequest() (*api.AuthRequest, error) {
-	var req api.AuthRequest
-	if err := json.NewDecoder(m.writeBuf).Decode(&req); err != nil {
+// getAuthRequest reads a length-prefixed frame from writeBuf — what the
+// code-under-test wrote via framing.Send.
+func (m *mockConn) getAuthRequest() (*wire.AuthRequest, error) {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(m.writeBuf, header); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(header)
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(m.writeBuf, payload); err != nil {
+		return nil, err
+	}
+	var req wire.AuthRequest
+	if err := proto.Unmarshal(payload, &req); err != nil {
 		return nil, err
 	}
 	return &req, nil
@@ -1661,7 +1858,7 @@ func TestAuthenticate_Success(t *testing.T) {
 
 	conn := newMockConn()
 
-	if err := conn.queueAuthResponse(&api.AuthResponse{
+	if err := conn.queueAuthResponse(&wire.AuthResponse{
 		Authenticated: true,
 		Message:       "OK",
 	}); err != nil {
@@ -1682,8 +1879,8 @@ func TestAuthenticate_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to decode auth request: %v", err)
 	}
-	if req.AgentID != "test-agent" {
-		t.Errorf("expected AgentID 'test-agent', got: %s", req.AgentID)
+	if req.AgentId != "test-agent" {
+		t.Errorf("expected AgentId 'test-agent', got: %s", req.AgentId)
 	}
 	if req.Secret != "test-secret-1234567890" {
 		t.Errorf("expected Secret 'test-secret-1234567890', got: %s", req.Secret)
@@ -1695,17 +1892,17 @@ func TestAuthenticate_Rejected(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		response    api.AuthResponse
+		response    *wire.AuthResponse
 		expectedErr string
 	}{
 		{
 			name:        "rejected with message",
-			response:    api.AuthResponse{Authenticated: false, Message: "Invalid secret"},
+			response:    &wire.AuthResponse{Authenticated: false, Message: "Invalid secret"},
 			expectedErr: "Invalid secret",
 		},
 		{
 			name:        "rejected without message",
-			response:    api.AuthResponse{Authenticated: false},
+			response:    &wire.AuthResponse{Authenticated: false},
 			expectedErr: "authentication rejected",
 		},
 	}
@@ -1716,7 +1913,7 @@ func TestAuthenticate_Rejected(t *testing.T) {
 			t.Parallel()
 
 			conn := newMockConn()
-			if err := conn.queueAuthResponse(&tt.response); err != nil {
+			if err := conn.queueAuthResponse(tt.response); err != nil {
 				t.Fatalf("failed to queue response: %v", err)
 			}
 
@@ -1802,7 +1999,9 @@ func TestAuthenticate_InvalidResponse(t *testing.T) {
 	t.Parallel()
 
 	conn := newMockConn()
-	conn.readBuf.WriteString("{invalid json")
+	// A length header claiming 4 bytes, but a payload that isn't valid
+	// protobuf for AuthResponse.
+	conn.readBuf.Write(encodeGarbageFrame(4))
 
 	a := &agent{
 		config:  &Config{AgentID: "test-agent", Secret: "test-secret-1234567890"},
@@ -1825,7 +2024,7 @@ func TestAuthenticate_EmptySecret(t *testing.T) {
 
 	conn := newMockConn()
 
-	if err := conn.queueAuthResponse(&api.AuthResponse{
+	if err := conn.queueAuthResponse(&wire.AuthResponse{
 		Authenticated: true,
 		Message:       "OK",
 	}); err != nil {
@@ -1878,7 +2077,7 @@ func TestAuthenticate_SetReadDeadlineError(t *testing.T) {
 
 	conn := newMockConn()
 
-	if err := conn.queueAuthResponse(&api.AuthResponse{
+	if err := conn.queueAuthResponse(&wire.AuthResponse{
 		Authenticated: true,
 		Message:       "OK",
 	}); err != nil {
@@ -1921,12 +2120,10 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		decoder := json.NewDecoder(conn)
-		var authReq api.AuthRequest
-		_ = decoder.Decode(&authReq)
+		var authReq wire.AuthRequest
+		_ = framing.Receive(conn, time.Second, &authReq)
 
-		encoder := json.NewEncoder(conn)
-		_ = encoder.Encode(&api.AuthResponse{
+		_ = framing.Send(conn, time.Second, &wire.AuthResponse{
 			Authenticated: false,
 			Message:       "Invalid secret",
 		})
@@ -1980,16 +2177,13 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		decoder := json.NewDecoder(conn)
-		encoder := json.NewEncoder(conn)
-
-		var authReq api.AuthRequest
-		if err := decoder.Decode(&authReq); err != nil {
+		var authReq wire.AuthRequest
+		if err := framing.Receive(conn, time.Second, &authReq); err != nil {
 			t.Logf("Failed to decode auth request: %v", err)
 			return
 		}
 
-		if err := encoder.Encode(&api.AuthResponse{
+		if err := framing.Send(conn, time.Second, &wire.AuthResponse{
 			Authenticated: true,
 			Message:       "Welcome",
 		}); err != nil {
@@ -1999,16 +2193,10 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 
 		authSuccess <- true
 
-		pd := &api.ProbingDirective{
-			ProbingDirectiveID: 1,
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			IPVersion:          api.IPv4,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
-		}
-		_ = encoder.Encode(pd)
+		pd := validWirePD("test-agent", 10)
+		pd.ProbingDirectiveId = 1
+		pd.IpVersion = wire.IPVersion_IP_VERSION_IPV4
+		_ = framing.Send(conn, time.Second, pd)
 
 		time.Sleep(200 * time.Millisecond)
 	}()
@@ -2037,7 +2225,7 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 
 	select {
 	case <-authSuccess:
-		t.Log("✓ Authentication succeeded in Run()")
+		t.Log("Authentication succeeded in Run()")
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Authentication did not complete")
 	}
@@ -2074,18 +2262,10 @@ func TestRun_NoAuthentication(t *testing.T) {
 
 		connected <- true
 
-		encoder := json.NewEncoder(conn)
-
-		pd := &api.ProbingDirective{
-			ProbingDirectiveID: 1,
-			AgentID:            "test-agent",
-			NearTTL:            10,
-			DestinationAddress: net.ParseIP("8.8.8.8"),
-			Protocol:           api.ICMP,
-			IPVersion:          api.IPv4,
-			NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
-		}
-		_ = encoder.Encode(pd)
+		pd := validWirePD("test-agent", 10)
+		pd.ProbingDirectiveId = 1
+		pd.IpVersion = wire.IPVersion_IP_VERSION_IPV4
+		_ = framing.Send(conn, time.Second, pd)
 
 		time.Sleep(200 * time.Millisecond)
 	}()
@@ -2114,7 +2294,7 @@ func TestRun_NoAuthentication(t *testing.T) {
 
 	select {
 	case <-connected:
-		t.Log("✓ Connected without authentication")
+		t.Log("Connected without authentication")
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Did not connect")
 	}

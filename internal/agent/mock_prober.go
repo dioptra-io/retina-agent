@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
 )
 
 // MockProber simulates network probing for testing without sending real packets.
@@ -36,7 +36,7 @@ func NewMockProber(cfg *Config) *MockProber {
 // When successful, returns a reply from the destination address.
 //
 // Respects context cancellation during the simulated delay.
-func (m *MockProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+func (m *MockProber) Probe(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	sentTime := time.Now()
 
 	m.mu.Lock()

@@ -15,7 +15,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -24,7 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
 
 var (
@@ -100,47 +100,34 @@ func reportStats() {
 		pdsPerSec, fiesPerSec, successRate, sent, received)
 }
 
-// handleAuth performs the authentication handshake. The decoder is created here and returned
-// so that the PD/FIE loop reuses it — avoiding loss of buffered bytes.
-// A read deadline bounds the handshake so a connected-but-silent client can't hang the
-// goroutine forever; it's cleared once auth succeeds so it doesn't affect the PD/FIE loop.
-// Returns the shared decoder and true on success, nil and false on failure.
-func handleAuth(conn net.Conn, secret string) (*json.Decoder, bool) {
+// handleAuth performs the authentication handshake. Unlike the old JSON-based
+// version, there's no decoder to thread through to the PD/FIE loop —
+// framing.Receive reads directly off conn each call, with no buffering
+// state to preserve across calls. framing.Send/Receive apply authTimeout
+// as their own read/write deadline internally, so no manual
+// SetReadDeadline/clear-deadline calls are needed either.
+func handleAuth(conn net.Conn, secret string) bool {
 	remoteAddr := conn.RemoteAddr().String()
 
-	if err := conn.SetReadDeadline(time.Now().Add(authTimeout)); err != nil {
-		log.Printf("[%s] Failed to set auth read deadline: %v", remoteAddr, err)
-		return nil, false
-	}
-
-	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
-
-	var req api.AuthRequest
-	if err := decoder.Decode(&req); err != nil {
+	var req wire.AuthRequest
+	if err := framing.Receive(conn, authTimeout, &req); err != nil {
 		log.Printf("[%s] Failed to decode auth request: %v", remoteAddr, err)
-		return nil, false
+		return false
 	}
 
 	if secret != "" && req.Secret != secret {
-		_ = encoder.Encode(api.AuthResponse{Authenticated: false, Message: "secret is not correct"})
+		_ = framing.Send(conn, authTimeout, &wire.AuthResponse{Authenticated: false, Message: "secret is not correct"})
 		log.Printf("[%s] Authentication failed", remoteAddr)
-		return nil, false
+		return false
 	}
 
-	if err := encoder.Encode(api.AuthResponse{Authenticated: true, Message: "authenticated"}); err != nil {
+	if err := framing.Send(conn, authTimeout, &wire.AuthResponse{Authenticated: true, Message: "authenticated"}); err != nil {
 		log.Printf("[%s] Failed to send auth response: %v", remoteAddr, err)
-		return nil, false
-	}
-
-	// Clear the deadline now that the handshake is done; the PD/FIE loop manages its own lifetime.
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("[%s] Failed to clear read deadline: %v", remoteAddr, err)
-		return nil, false
+		return false
 	}
 
 	log.Printf("[%s] Authenticated", remoteAddr)
-	return decoder, true
+	return true
 }
 
 // receiveFIEs runs in a separate goroutine so that sending and receiving can proceed
@@ -155,22 +142,19 @@ func handleAgent(conn net.Conn, rate int, secret string) {
 		log.Printf("[%s] Connection closed", remoteAddr)
 	}()
 
-	decoder, ok := handleAuth(conn, secret)
-	if !ok {
+	if !handleAuth(conn, secret) {
 		return
 	}
 
-	encoder := json.NewEncoder(conn)
-
-	go receiveFIEs(decoder, remoteAddr)
-	sendPDs(encoder, remoteAddr, rate)
+	go receiveFIEs(conn, remoteAddr)
+	sendPDs(conn, remoteAddr, rate)
 }
 
-func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
+func receiveFIEs(conn net.Conn, remoteAddr string) {
 	for {
-		var fie api.ForwardingInfoElement
-		if err := decoder.Decode(&fie); err != nil {
-			if err != io.EOF {
+		var fie wire.ForwardingInfoElement
+		if err := framing.Receive(conn, 0, &fie); err != nil {
+			if !errors.Is(err, io.EOF) {
 				log.Printf("[%s] Decode error: %v", remoteAddr, err)
 			}
 			return
@@ -181,8 +165,8 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 		if fie.NearInfo == nil && fie.FarInfo == nil {
 			log.Printf("[%s] ✓ FIE for PD %d: %s → %s | (no probe response received)",
 				remoteAddr,
-				fie.ProbingDirectiveID,
-				fie.Agent.AgentID,
+				fie.ProbingDirectiveId,
+				fie.GetAgent().GetAgentId(),
 				fie.DestinationAddress,
 			)
 			continue
@@ -191,8 +175,8 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 		if fie.NearInfo == nil || fie.FarInfo == nil {
 			log.Printf("[%s] ✓ FIE for PD %d: %s → %s | (partial probe response: nearInfo=%v farInfo=%v)",
 				remoteAddr,
-				fie.ProbingDirectiveID,
-				fie.Agent.AgentID,
+				fie.ProbingDirectiveId,
+				fie.GetAgent().GetAgentId(),
 				fie.DestinationAddress,
 				fie.NearInfo != nil,
 				fie.FarInfo != nil,
@@ -200,25 +184,25 @@ func receiveFIEs(decoder *json.Decoder, remoteAddr string) {
 			continue
 		}
 
-		nearRTT := fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp)
-		farRTT := fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp)
+		nearRTT := fie.NearInfo.ReceivedTimestamp.AsTime().Sub(fie.NearInfo.SentTimestamp.AsTime())
+		farRTT := fie.FarInfo.ReceivedTimestamp.AsTime().Sub(fie.FarInfo.SentTimestamp.AsTime())
 
 		log.Printf("[%s] ✓ FIE for PD %d: %s → %s | Near(TTL%d, %v): %s | Far(TTL%d, %v): %s",
 			remoteAddr,
-			fie.ProbingDirectiveID,
-			fie.Agent.AgentID,
+			fie.ProbingDirectiveId,
+			fie.GetAgent().GetAgentId(),
 			fie.DestinationAddress,
-			fie.NearInfo.ProbeTTL,
+			fie.NearInfo.ProbeTtl,
 			nearRTT,
 			fie.NearInfo.ReplyAddress,
-			fie.FarInfo.ProbeTTL,
+			fie.FarInfo.ProbeTtl,
 			farRTT,
 			fie.FarInfo.ReplyAddress,
 		)
 	}
 }
 
-func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
+func sendPDs(conn net.Conn, remoteAddr string, rate int) {
 	ticker := time.NewTicker(time.Second / time.Duration(rate))
 	defer ticker.Stop()
 
@@ -227,7 +211,7 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		pd := generatePD(pdCounter)
 		pdCounter++
 
-		if err := encoder.Encode(pd); err != nil {
+		if err := framing.Send(conn, 0, pd); err != nil {
 			// Pipe errors indicate the agent disconnected cleanly; anything else is unexpected.
 			if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 				return
@@ -240,11 +224,13 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 
 		var protocol string
 		switch pd.Protocol {
-		case api.ICMP:
+		case wire.Protocol_PROTOCOL_UNSPECIFIED:
+			protocol = "UNSPECIFIED" // unreachable: generatePD only produces ICMP, ICMPv6, or UDP
+		case wire.Protocol_PROTOCOL_ICMP:
 			protocol = "ICMP"
-		case api.ICMPv6:
+		case wire.Protocol_PROTOCOL_ICMPV6:
 			protocol = "ICMPv6"
-		case api.UDP:
+		case wire.Protocol_PROTOCOL_UDP:
 			protocol = "UDP"
 		default:
 			protocol = "UNKNOWN" // unreachable: generatePD only produces ICMP, ICMPv6, or UDP
@@ -253,15 +239,19 @@ func sendPDs(encoder *json.Encoder, remoteAddr string, rate int) {
 		log.Printf("[%s] → PD #%d (PD ID %d): %s %s TTL %d",
 			remoteAddr,
 			pdCounter,
-			pd.ProbingDirectiveID,
+			pd.ProbingDirectiveId,
 			pd.DestinationAddress,
 			protocol,
-			pd.NearTTL,
+			pd.NearTtl,
 		)
 	}
 }
 
-func generatePD(counter int) *api.ProbingDirective {
+// generatePD builds a *wire.ProbingDirective directly rather than going
+// through model.ProbingDirective — this tool only ever serializes it via
+// framing.Send, so there's no reason to round-trip through the domain
+// type's net.IP/uint8 typing just to convert straight back to wire types.
+func generatePD(counter int) *wire.ProbingDirective {
 	destinations := []string{
 		// IPv4
 		"8.8.8.8",        // Google DNS
@@ -276,49 +266,55 @@ func generatePD(counter int) *api.ProbingDirective {
 		"2620:fe::fe",          // Quad9 DNS
 	}
 
-	dstIP := net.ParseIP(destinations[counter%len(destinations)])
+	dstAddr := destinations[counter%len(destinations)]
+	dstIP := net.ParseIP(dstAddr)
 
 	// TTL cycles from 5 to 20
 	ttlOffset := counter % 16
-	ttl := uint8(5 + ttlOffset) // #nosec G115 -- ttlOffset is 0-15, safe for uint8
+	ttl := uint32(5 + ttlOffset) //nolint:gosec // G115: ttlOffset is 0-15, safe for uint32
 
-	ipVersion := api.IPv4
+	ipVersion := wire.IPVersion_IP_VERSION_IPV4
 	if dstIP.To4() == nil {
-		ipVersion = api.IPv6
+		ipVersion = wire.IPVersion_IP_VERSION_IPV6
 	}
 
-	// ProbingDirectiveID is 1-indexed so that ID 0 is never used.
-	pd := &api.ProbingDirective{
-		ProbingDirectiveID: uint64(counter + 1), // #nosec G115 -- counter is test value, no overflow
-		AgentID:            "agent-1",
-		IPVersion:          ipVersion,
-		DestinationAddress: dstIP,
-		NearTTL:            ttl,
+	// ProbingDirectiveId is 1-indexed so that ID 0 is never used.
+	pd := &wire.ProbingDirective{
+		ProbingDirectiveId: uint64(counter + 1), //nolint:gosec // G115: counter is a local loop variable, no overflow
+		AgentId:            "agent-1",
+		IpVersion:          ipVersion,
+		DestinationAddress: dstAddr,
+		NearTtl:            ttl,
 	}
 
 	// Even counters use UDP (with port fields); odd counters use ICMP/ICMPv6 (no port fields).
 	useUDP := counter%2 == 0
 
-	if useUDP {
-		portOffset := counter % 100
-		pd.Protocol = api.UDP
-		pd.NextHeader = api.NextHeader{
-			UDPNextHeader: &api.UDPNextHeader{
-				SourcePort:      uint16(50000 + portOffset), // #nosec G115 -- portOffset is 0-99, safe for uint16
-				DestinationPort: uint16(33434 + portOffset), // #nosec G115 -- portOffset is 0-99, safe for uint16
+	switch {
+	case useUDP:
+		portOffset := uint32(counter % 100) //nolint:gosec // G115: counter%100 is 0-99, safe for uint32
+		pd.Protocol = wire.Protocol_PROTOCOL_UDP
+		pd.NextHeader = &wire.NextHeader{
+			Header: &wire.NextHeader_UdpNextHeader{
+				UdpNextHeader: &wire.UDPNextHeader{
+					SourcePort:      50000 + portOffset,
+					DestinationPort: 33434 + portOffset,
+				},
 			},
 		}
-	} else {
-		if ipVersion == api.IPv6 {
-			pd.Protocol = api.ICMPv6
-			pd.NextHeader = api.NextHeader{
-				ICMPv6NextHeader: &api.ICMPv6NextHeader{},
-			}
-		} else {
-			pd.Protocol = api.ICMP
-			pd.NextHeader = api.NextHeader{
-				ICMPNextHeader: &api.ICMPNextHeader{},
-			}
+	case ipVersion == wire.IPVersion_IP_VERSION_IPV6:
+		pd.Protocol = wire.Protocol_PROTOCOL_ICMPV6
+		pd.NextHeader = &wire.NextHeader{
+			Header: &wire.NextHeader_Icmpv6NextHeader{
+				Icmpv6NextHeader: &wire.ICMPv6NextHeader{},
+			},
+		}
+	default:
+		pd.Protocol = wire.Protocol_PROTOCOL_ICMP
+		pd.NextHeader = &wire.NextHeader{
+			Header: &wire.NextHeader_IcmpNextHeader{
+				IcmpNextHeader: &wire.ICMPNextHeader{},
+			},
 		}
 	}
 
