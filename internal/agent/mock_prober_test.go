@@ -11,13 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
 
 // -- test helpers -------------------------------------------------------------
 
-func makeProbingDirective(dest string, proto api.Protocol) *api.ProbingDirective {
-	return &api.ProbingDirective{
+func makeProbingDirective(dest string, proto wire.Protocol) *model.ProbingDirective {
+	return &model.ProbingDirective{
 		ProbingDirectiveID: 1,
 		DestinationAddress: net.ParseIP(dest),
 		Protocol:           proto,
@@ -33,7 +34,7 @@ func TestMockProber_SuccessfulProbe(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 	ctx := context.Background()
 	result, err := prober.Probe(ctx, pd, 10)
 
@@ -74,7 +75,7 @@ func TestMockProber_Timestamps(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("1.1.1.1", api.ICMP)
+	pd := makeProbingDirective("1.1.1.1", wire.Protocol_PROTOCOL_ICMP)
 	ctx := context.Background()
 
 	// Run multiple probes to eventually get a successful one.
@@ -120,7 +121,7 @@ func TestMockProber_TimeoutBehavior(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 	ctx := context.Background()
 
 	// Run many probes to verify the timeout rate is approximately 10%.
@@ -157,7 +158,7 @@ func TestMockProber_ContextCancellation(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -179,7 +180,7 @@ func TestMockProber_ContextTimeout(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 
 	// 1ms is shorter than the minimum 10ms probe delay.
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
@@ -202,7 +203,7 @@ func TestMockProber_ConcurrentProbes(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 	ctx := context.Background()
 
 	const numGoroutines = 10
@@ -245,11 +246,11 @@ func TestMockProber_DifferentProtocols(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		protocol api.Protocol
+		protocol wire.Protocol
 	}{
-		{name: "ICMP", protocol: api.ICMP},
-		{name: "UDP", protocol: api.UDP},
-		{name: "ICMPv6", protocol: api.ICMPv6},
+		{name: "ICMP", protocol: wire.Protocol_PROTOCOL_ICMP},
+		{name: "UDP", protocol: wire.Protocol_PROTOCOL_UDP},
+		{name: "ICMPv6", protocol: wire.Protocol_PROTOCOL_ICMPV6},
 	}
 
 	ctx := context.Background()
@@ -279,7 +280,7 @@ func TestMockProber_DifferentTTLs(t *testing.T) {
 	prober := NewMockProber(cfg)
 	defer func() { _ = prober.Close() }()
 
-	pd := makeProbingDirective("8.8.8.8", api.UDP)
+	pd := makeProbingDirective("8.8.8.8", wire.Protocol_PROTOCOL_UDP)
 	ctx := context.Background()
 
 	tests := []struct {

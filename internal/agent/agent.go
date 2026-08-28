@@ -25,7 +25,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +36,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
 
 var ErrInvalidDirective = errors.New("invalid probing directive")
@@ -88,7 +89,8 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		metrics: metrics,
 	}
 
-	tcpConn, err := net.Dial("tcp", a.config.OrchestratorAddr)
+	dialer := net.Dialer{KeepAlive: orchestratorKeepalivePeriod}
+	tcpConn, err := dialer.DialContext(ctx, "tcp", a.config.OrchestratorAddr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to orchestrator: %w", err)
 	}
@@ -106,6 +108,18 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		return fmt.Errorf("failed to set keepalive period: %w", err)
 	}
 
+	// Created before authentication (not just before the pipeline loops)
+	// so cancellation during the handshake is also honored promptly —
+	// this derived ctx cancels both on external shutdown and if any of
+	// the three loops below errors, and closing conn immediately unblocks
+	// whatever blocking read/write is in flight at that moment, rather
+	// than waiting for it to time out or for g.Wait() to return naturally.
+	g, ctx := errgroup.WithContext(ctx)
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopClose()
+
 	a.logger.Info("Connected to orchestrator",
 		slog.String("address", a.config.OrchestratorAddr))
 
@@ -118,10 +132,8 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		a.logger.Info("Authentication enabled — authenticated successfully")
 	}
 
-	pds := make(chan *api.ProbingDirective, a.config.PDsBufferSize)
-	fies := make(chan *api.ForwardingInfoElement, a.config.FIEsBufferSize)
-
-	g, ctx := errgroup.WithContext(ctx)
+	pds := make(chan *model.ProbingDirective, a.config.PDsBufferSize)
+	fies := make(chan *model.ForwardingInfoElement, a.config.FIEsBufferSize)
 
 	g.Go(func() error { return a.readerLoop(ctx, conn, pds) })
 	g.Go(func() error { return a.processorLoop(ctx, pds, fies) })
@@ -138,28 +150,17 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 // authenticate must be called immediately after connecting, before any other messages.
 func (a *agent) authenticate(conn net.Conn) error {
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
-
-	authReq := &api.AuthRequest{
-		AgentID: a.config.AgentID,
-		Secret:  a.config.Secret,
+	authReq := &wire.AuthRequest{
+		AgentId: a.config.AgentID,
+		Secret:  a.config.Secret, //nolint:gosec // G117: secret field is intentionally included in auth request
 	}
 
-	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set write deadline: %w", err)
-	}
-
-	if err := encoder.Encode(authReq); err != nil { //nolint:gosec // G117: secret field is intentionally included in auth request
+	if err := framing.Send(conn, 5*time.Second, authReq); err != nil {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
-	}
-
-	var authResp api.AuthResponse
-	if err := decoder.Decode(&authResp); err != nil {
+	var authResp wire.AuthResponse
+	if err := framing.Receive(conn, 5*time.Second, &authResp); err != nil {
 		return fmt.Errorf("failed to receive auth response: %w", err)
 	}
 
@@ -176,27 +177,30 @@ func (a *agent) authenticate(conn net.Conn) error {
 }
 
 // readerLoop receives and validates ProbingDirective messages from the orchestrator.
-// After MaxConsecutiveDecodeErrors consecutive JSON failures the connection is
+// After MaxConsecutiveDecodeErrors consecutive decode failures the connection is
 // terminated (set to 0 to disable). After maxConsecutiveReadTimeouts consecutive
 // read timeouts the connection is considered dead and reconnection is triggered.
 // Closing pds on return signals processorLoop to drain in-flight goroutines and exit.
-func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
+func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *model.ProbingDirective) error {
 	defer close(pds)
-	decoder := json.NewDecoder(conn)
 	consecutiveDecodeErrors := 0
 	consecutiveTimeouts := 0
 
 	for {
-		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
-			return fmt.Errorf("failed to set read deadline: %w", err)
-		}
-
-		var pd api.ProbingDirective
-		if err := decoder.Decode(&pd); err != nil {
+		var wirePD wire.ProbingDirective
+		if err := framing.Receive(conn, a.config.ReadDeadline, &wirePD); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// errors.As, not a direct type assertion: framing.Receive's
+			// clean pre-frame timeout is returned unwrapped in practice, so
+			// this matters mainly for a mid-payload timeout, which gets
+			// wrapped in ErrProtocolViolation — that case is already
+			// correctly fatal either way (a partial frame desyncs the
+			// stream regardless of why the read stopped), but errors.As
+			// is the strictly more correct check regardless.
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				consecutiveTimeouts++
 				a.logger.Debug("Read timeout, no data received",
 					slog.Int("consecutive", consecutiveTimeouts),
@@ -215,15 +219,22 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			continue
 		}
 
-		consecutiveDecodeErrors = 0
-		consecutiveTimeouts = 0
-		a.metrics.PDsReceivedTotal.Inc()
+		pd, err := model.ProbingDirectiveFromProto(&wirePD)
+		if err != nil {
+			a.logger.Warn("Invalid directive", slog.Any("err", err))
+			a.metrics.PDsInvalidTotal.Inc()
+			continue
+		}
 
 		if err := validatePD(&pd); err != nil {
 			a.logger.Warn("Invalid directive", slog.Any("err", err))
 			a.metrics.PDsInvalidTotal.Inc()
 			continue
 		}
+
+		consecutiveDecodeErrors = 0
+		consecutiveTimeouts = 0
+		a.metrics.PDsReceivedTotal.Inc()
 
 		a.logger.Debug("← PD received",
 			slog.Uint64("pd_id", pd.ProbingDirectiveID),
@@ -240,7 +251,7 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 	}
 }
 
-// handleDecodeError classifies a JSON decode error and decides whether to retry.
+// handleDecodeError classifies a decode error and decides whether to retry.
 // Timeouts are handled by the caller. Returns (shouldContinue, updatedErrorCount, errorToReturn).
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
 	// Check for context cancellation first, regardless of error type.
@@ -248,12 +259,16 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 		return false, consecutiveErrors, ctx.Err()
 	}
 
-	// Check for network errors (trigger reconnection)
-	if isNetworkError(err) {
+	// Check for network errors (trigger reconnection). This also covers
+	// framing.ErrProtocolViolation for a partial-frame read (n > 0): the
+	// stream is desynchronized in that case regardless of whether the
+	// underlying cause was a timeout, so it's treated as fatal here too,
+	// not retried like the clean/no-bytes-consumed timeout case above.
+	if isNetworkError(err) || errors.Is(err, framing.ErrProtocolViolation) {
 		return false, consecutiveErrors, fmt.Errorf("connection lost while reading: %w", err)
 	}
 
-	// Malformed JSON — log and potentially skip
+	// Malformed frame — log and potentially skip
 	consecutiveErrors++
 	a.metrics.DecodeErrorsTotal.Inc()
 
@@ -277,7 +292,7 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 // processorLoop dispatches incoming directives to processPD goroutines.
 // A WaitGroup ensures all in-flight goroutines finish before fies is closed,
 // preventing a send-on-closed-channel panic.
-func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) error {
+func (a *agent) processorLoop(ctx context.Context, pds <-chan *model.ProbingDirective, fies chan<- *model.ForwardingInfoElement) error {
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
@@ -302,9 +317,7 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 	}
 }
 
-func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
-	encoder := json.NewEncoder(conn)
-
+func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *model.ForwardingInfoElement) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -317,11 +330,13 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 			a.fiesDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 
-			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
-				return fmt.Errorf("failed to set write deadline: %w", err)
+			wireFIE, err := fie.ToProto()
+			if err != nil {
+				a.metrics.WriteErrorsTotal.Inc()
+				return fmt.Errorf("failed to convert FIE to wire format: %w", err)
 			}
 
-			if err := encoder.Encode(fie); err != nil {
+			if err := framing.Send(conn, a.config.WriteDeadline, wireFIE); err != nil {
 				a.metrics.WriteErrorsTotal.Inc()
 				if isNetworkError(err) {
 					return fmt.Errorf("connection lost while writing: %w", err)
@@ -342,7 +357,7 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 // processPD executes near and far probes in parallel and sends an FIE on success.
 // A nil probe result means the probe was already in-flight and the PD is silently dropped.
 // Timed-out probes produce a nil NearInfo or FarInfo in the FIE.
-func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) {
+func (a *agent) processPD(ctx context.Context, pd *model.ProbingDirective, fies chan<- *model.ForwardingInfoElement) {
 	defer a.metrics.PDGoroutines.Dec()
 
 	type probeResult struct {
@@ -378,6 +393,14 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
 	}
+	// Guard against a Prober implementation returning (nil, nil) instead
+	// of (nil, ErrDuplicatePD) for "already in-flight" — recordProbeOutcome
+	// dereferences unconditionally, and this runs under wg.Go, whose
+	// contract requires the function not to panic.
+	if nearRes.result == nil {
+		a.logger.Warn("Near probe returned no result", slog.Uint64("pd_id", pd.ProbingDirectiveID))
+		return
+	}
 	a.recordProbeOutcome(nearRes.result)
 
 	if farRes.err != nil {
@@ -392,10 +415,16 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 		a.metrics.ProbesTotal.WithLabelValues("error").Inc()
 		return
 	}
+	if farRes.result == nil {
+		a.logger.Warn("Far probe returned no result", slog.Uint64("pd_id", pd.ProbingDirectiveID))
+		return
+	}
 	a.recordProbeOutcome(farRes.result)
 
+	fie := a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL)
+
 	select {
-	case fies <- a.buildFIE(pd, nearRes.result, farRes.result, nearTTL, farTTL):
+	case fies <- fie:
 		a.fiesDepth.Add(1)
 		a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 	case <-ctx.Done():
@@ -429,23 +458,43 @@ func classifyIP(ip net.IP) string {
 	return "public"
 }
 
-// buildFIE constructs a FIE from probe results. Timed-out probes produce a nil NearInfo or FarInfo.
-func (a *agent) buildFIE(pd *api.ProbingDirective, nearRes, farRes *ProbeResult, nearTTL, farTTL uint8) *api.ForwardingInfoElement {
-	var nearInfo *api.Info
+// buildFIE constructs a FIE from probe results. Timed-out probes produce a
+// nil NearInfo or FarInfo. SourceAddress comes from whichever of
+// nearRes/farRes succeeded (ProbeResult.SourceAddress, from caracal's CSV
+// output — see prober.go's doc comment); if both time out, SourceAddress
+// is nil — that's a legitimate, expected value, not an error, since
+// model.ForwardingInfoElement.SourceAddress is optional precisely for
+// this case (a probe that gets no reply at all has no source address to
+// report).
+func (a *agent) buildFIE(pd *model.ProbingDirective, nearRes, farRes *ProbeResult, nearTTL, farTTL uint8) *model.ForwardingInfoElement {
+	var nearInfo *model.Info
 	if !nearRes.TimedOut {
 		nearInfo = probeResultToInfo(nearRes, nearTTL)
 	}
 
-	var farInfo *api.Info
+	var farInfo *model.Info
 	if !farRes.TimedOut {
 		farInfo = probeResultToInfo(farRes, farTTL)
 	}
 
-	return &api.ForwardingInfoElement{
-		Agent:               api.Agent{AgentID: a.config.AgentID},
+	// Only from a genuinely successful probe — a timed-out ProbeResult
+	// shouldn't carry a source address at all in practice, but this
+	// guards against one that does (matches the "from whichever succeeded"
+	// intent stated above, which the bare field reads below didn't).
+	var sourceAddress net.IP
+	if !nearRes.TimedOut {
+		sourceAddress = nearRes.SourceAddress
+	}
+	if sourceAddress == nil && !farRes.TimedOut {
+		sourceAddress = farRes.SourceAddress
+	}
+
+	return &model.ForwardingInfoElement{
+		Agent:               model.Agent{ID: a.config.AgentID},
 		ProbingDirectiveID:  pd.ProbingDirectiveID,
 		IPVersion:           pd.IPVersion,
 		Protocol:            pd.Protocol,
+		SourceAddress:       sourceAddress,
 		DestinationAddress:  pd.DestinationAddress,
 		NearInfo:            nearInfo,
 		FarInfo:             farInfo,
@@ -473,15 +522,19 @@ var createProber = func(cfg *Config, logger *slog.Logger, metrics *Metrics) (Pro
 	}
 }
 
-func validatePD(pd *api.ProbingDirective) error {
+// validatePD checks fields model.ProbingDirectiveFromProto doesn't already
+// validate: AgentID non-empty, NearTTL isn't 0 or 255 (0 is meaningless;
+// 255 would silently wrap farTTL := pd.NearTTL+1 to 0, since NearTTL is
+// uint8 — model's own TTL check only rejects values that don't fit in a
+// uint8 at all, i.e. >255, not these two specific in-range values), and
+// NextHeader present for the given protocol. DestinationAddress validity
+// is enforced by ProbingDirectiveFromProto itself before this is called.
+func validatePD(pd *model.ProbingDirective) error {
 	if pd == nil {
 		return fmt.Errorf("%w: directive is nil", ErrInvalidDirective)
 	}
 	if pd.AgentID == "" {
 		return fmt.Errorf("%w: agent ID is empty", ErrInvalidDirective)
-	}
-	if pd.DestinationAddress == nil {
-		return fmt.Errorf("%w: destination address is nil", ErrInvalidDirective)
 	}
 	if pd.NearTTL == 0 {
 		return fmt.Errorf("%w: TTL cannot be zero", ErrInvalidDirective)
@@ -490,13 +543,24 @@ func validatePD(pd *api.ProbingDirective) error {
 		return fmt.Errorf("%w: NearTTL 255 would overflow farTTL", ErrInvalidDirective)
 	}
 
+	// Separate ICMP/ICMPv6 cases (not combined) — a combined check would
+	// accept an ICMP-protocol PD carrying only an ICMPv6NextHeader, or vice
+	// versa. This exact bug predates the migration (same combined-case
+	// pattern existed in v1's validatePD) but is worth fixing regardless
+	// of origin.
 	switch pd.Protocol {
-	case api.ICMP, api.ICMPv6:
-		if pd.NextHeader.ICMPNextHeader == nil && pd.NextHeader.ICMPv6NextHeader == nil {
+	case wire.Protocol_PROTOCOL_UNSPECIFIED:
+		return fmt.Errorf("%w: protocol not set", ErrInvalidDirective)
+	case wire.Protocol_PROTOCOL_ICMP:
+		if pd.NextHeader.GetIcmpNextHeader() == nil {
 			return fmt.Errorf("%w: ICMP directive missing next header", ErrInvalidDirective)
 		}
-	case api.UDP:
-		if pd.NextHeader.UDPNextHeader == nil {
+	case wire.Protocol_PROTOCOL_ICMPV6:
+		if pd.NextHeader.GetIcmpv6NextHeader() == nil {
+			return fmt.Errorf("%w: ICMPv6 directive missing next header", ErrInvalidDirective)
+		}
+	case wire.Protocol_PROTOCOL_UDP:
+		if pd.NextHeader.GetUdpNextHeader() == nil {
 			return fmt.Errorf("%w: UDP directive missing next header", ErrInvalidDirective)
 		}
 	default:
@@ -506,8 +570,8 @@ func validatePD(pd *api.ProbingDirective) error {
 	return nil
 }
 
-func probeResultToInfo(result *ProbeResult, ttl uint8) *api.Info {
-	return &api.Info{
+func probeResultToInfo(result *ProbeResult, ttl uint8) *model.Info {
+	return &model.Info{
 		ProbeTTL:          ttl,
 		ReplyAddress:      result.ReplyAddress,
 		SentTimestamp:     result.SentTime,

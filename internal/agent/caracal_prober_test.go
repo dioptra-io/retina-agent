@@ -28,7 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -168,14 +169,19 @@ func (f *flushErrorWriter) Close() error {
 
 // -- test helper functions ----------------------------------------------------
 
-func makeProbe() *api.ProbingDirective {
-	return &api.ProbingDirective{
-		Protocol:           api.ICMP,
+// makeProbe returns a minimally valid *model.ProbingDirective for tests
+// that don't care about its specific field values beyond "a valid ICMP
+// directive".
+func makeProbe() *model.ProbingDirective {
+	return &model.ProbingDirective{
+		Protocol:           wire.Protocol_PROTOCOL_ICMP,
 		DestinationAddress: net.ParseIP("10.0.0.2"),
-		NextHeader: api.NextHeader{
-			ICMPNextHeader: &api.ICMPNextHeader{
-				FirstHalfWord:  1234,
-				SecondHalfWord: 80,
+		NextHeader: &wire.NextHeader{
+			Header: &wire.NextHeader_IcmpNextHeader{
+				IcmpNextHeader: &wire.ICMPNextHeader{
+					FirstHalfWord:  1234,
+					SecondHalfWord: 80,
+				},
 			},
 		},
 	}
@@ -251,18 +257,20 @@ func TestExtractHalfWords(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		directive *api.ProbingDirective
+		directive *model.ProbingDirective
 		expected1 uint16
 		expected2 uint16
 	}{
 		{
 			name: "UDP with ports",
-			directive: &api.ProbingDirective{
-				Protocol: api.UDP,
-				NextHeader: api.NextHeader{
-					UDPNextHeader: &api.UDPNextHeader{
-						SourcePort:      50000,
-						DestinationPort: 33434,
+			directive: &model.ProbingDirective{
+				Protocol: wire.Protocol_PROTOCOL_UDP,
+				NextHeader: &wire.NextHeader{
+					Header: &wire.NextHeader_UdpNextHeader{
+						UdpNextHeader: &wire.UDPNextHeader{
+							SourcePort:      50000,
+							DestinationPort: 33434,
+						},
 					},
 				},
 			},
@@ -271,12 +279,14 @@ func TestExtractHalfWords(t *testing.T) {
 		},
 		{
 			name: "ICMP with fields",
-			directive: &api.ProbingDirective{
-				Protocol: api.ICMP,
-				NextHeader: api.NextHeader{
-					ICMPNextHeader: &api.ICMPNextHeader{
-						FirstHalfWord:  1234,
-						SecondHalfWord: 5678,
+			directive: &model.ProbingDirective{
+				Protocol: wire.Protocol_PROTOCOL_ICMP,
+				NextHeader: &wire.NextHeader{
+					Header: &wire.NextHeader_IcmpNextHeader{
+						IcmpNextHeader: &wire.ICMPNextHeader{
+							FirstHalfWord:  1234,
+							SecondHalfWord: 5678,
+						},
 					},
 				},
 			},
@@ -285,12 +295,14 @@ func TestExtractHalfWords(t *testing.T) {
 		},
 		{
 			name: "ICMPv6 with fields",
-			directive: &api.ProbingDirective{
-				Protocol: api.ICMPv6,
-				NextHeader: api.NextHeader{
-					ICMPv6NextHeader: &api.ICMPv6NextHeader{
-						FirstHalfWord:  1111,
-						SecondHalfWord: 2222,
+			directive: &model.ProbingDirective{
+				Protocol: wire.Protocol_PROTOCOL_ICMPV6,
+				NextHeader: &wire.NextHeader{
+					Header: &wire.NextHeader_Icmpv6NextHeader{
+						Icmpv6NextHeader: &wire.ICMPv6NextHeader{
+							FirstHalfWord:  1111,
+							SecondHalfWord: 2222,
+						},
 					},
 				},
 			},
@@ -299,8 +311,8 @@ func TestExtractHalfWords(t *testing.T) {
 		},
 		{
 			name: "UDP with nil header",
-			directive: &api.ProbingDirective{
-				Protocol: api.UDP,
+			directive: &model.ProbingDirective{
+				Protocol: wire.Protocol_PROTOCOL_UDP,
 			},
 			expected1: 0,
 			expected2: 0,
@@ -326,13 +338,14 @@ func TestProtocolToString(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		protocol api.Protocol
+		protocol wire.Protocol
 		expected string
 	}{
-		{api.ICMP, "icmp"},
-		{api.ICMPv6, "icmp6"},
-		{api.UDP, "udp"},
-		{api.Protocol(99), "99"},
+		{wire.Protocol_PROTOCOL_UNSPECIFIED, "unspecified"},
+		{wire.Protocol_PROTOCOL_ICMP, "icmp"},
+		{wire.Protocol_PROTOCOL_ICMPV6, "icmp6"},
+		{wire.Protocol_PROTOCOL_UDP, "udp"},
+		{wire.Protocol(99), "99"},
 	}
 
 	for _, tt := range tests {
@@ -446,7 +459,7 @@ func TestBuildProbeKey(t *testing.T) {
 				if key.ttl != 10 {
 					t.Errorf("expected ttl=10, got %d", key.ttl)
 				}
-				if key.protocol != api.UDP {
+				if key.protocol != wire.Protocol_PROTOCOL_UDP {
 					t.Errorf("expected protocol=UDP, got %v", key.protocol)
 				}
 			},
@@ -460,7 +473,7 @@ func TestBuildProbeKey(t *testing.T) {
 			},
 			expectError: false,
 			checkKey: func(t *testing.T, key probeKey) {
-				if key.protocol != api.ICMP {
+				if key.protocol != wire.Protocol_PROTOCOL_ICMP {
 					t.Errorf("expected protocol=ICMP, got %v", key.protocol)
 				}
 			},
@@ -474,7 +487,7 @@ func TestBuildProbeKey(t *testing.T) {
 			},
 			expectError: false,
 			checkKey: func(t *testing.T, key probeKey) {
-				if key.protocol != api.ICMPv6 {
+				if key.protocol != wire.Protocol_PROTOCOL_ICMPV6 {
 					t.Errorf("expected protocol=ICMPv6, got %v", key.protocol)
 				}
 			},
@@ -566,13 +579,15 @@ func TestBuildProbeKey(t *testing.T) {
 func TestBuildProbeKeyFromDirective(t *testing.T) {
 	t.Parallel()
 
-	pd := &api.ProbingDirective{
-		Protocol:           api.ICMP,
+	pd := &model.ProbingDirective{
+		Protocol:           wire.Protocol_PROTOCOL_ICMP,
 		DestinationAddress: net.ParseIP("10.0.0.2"),
-		NextHeader: api.NextHeader{
-			ICMPNextHeader: &api.ICMPNextHeader{
-				FirstHalfWord:  1234,
-				SecondHalfWord: 5678,
+		NextHeader: &wire.NextHeader{
+			Header: &wire.NextHeader_IcmpNextHeader{
+				IcmpNextHeader: &wire.ICMPNextHeader{
+					FirstHalfWord:  1234,
+					SecondHalfWord: 5678,
+				},
 			},
 		},
 	}
@@ -592,7 +607,7 @@ func TestBuildProbeKeyFromDirective(t *testing.T) {
 	if key.ttl != 64 {
 		t.Errorf("expected ttl=64, got %d", key.ttl)
 	}
-	if key.protocol != api.ICMP {
+	if key.protocol != wire.Protocol_PROTOCOL_ICMP {
 		t.Errorf("expected protocol=ICMP, got %v", key.protocol)
 	}
 	if key.correlationSecond != timestamp {
@@ -638,7 +653,7 @@ func TestProbeEndToEnd(t *testing.T) {
 		firstHalfWord:     1234,
 		secondHalfWord:    80,
 		ttl:               64,
-		protocol:          api.ICMP,
+		protocol:          wire.Protocol_PROTOCOL_ICMP,
 		correlationSecond: fixedTimeSeconds,
 	}
 
@@ -712,7 +727,7 @@ func TestDuplicateProbe(t *testing.T) {
 		firstHalfWord:     1234,
 		secondHalfWord:    80,
 		ttl:               64,
-		protocol:          api.ICMP,
+		protocol:          wire.Protocol_PROTOCOL_ICMP,
 		correlationSecond: currentTime,
 	}
 
@@ -836,8 +851,8 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 	close(stderrChan)
 	stderr := &dynamicReadCloser{ch: stderrChan}
 
-	ctx_prober, cancel_prober := context.WithCancel(context.Background())
-	g, gctx := errgroup.WithContext(ctx_prober)
+	ctxProber, cancelProber := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctxProber)
 
 	prober := &caracalProber{
 		cmd:        nil,
@@ -848,7 +863,7 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 		inFlight:   make(map[probeKey]*inFlightProbe),
 		writeQueue: make(chan *probeRequest),
 		config:     cfg,
-		cancel:     cancel_prober,
+		cancel:     cancelProber,
 		g:          g,
 		logger:     testLogger(),
 		metrics:    testMetrics(),
@@ -878,7 +893,7 @@ func TestProbeContextCancelledWhileQueuing(t *testing.T) {
 	}
 
 	close(csvChan)
-	cancel_prober()
+	cancelProber()
 	_ = prober.g.Wait()
 
 	if !errors.Is(probeErr, context.Canceled) {
@@ -949,7 +964,7 @@ func TestCleanupStaleProbesNoStale(t *testing.T) {
 		firstHalfWord:     1234,
 		secondHalfWord:    80,
 		ttl:               64,
-		protocol:          api.ICMP,
+		protocol:          wire.Protocol_PROTOCOL_ICMP,
 		correlationSecond: time.Now().Unix(),
 	}
 
@@ -1011,7 +1026,7 @@ func TestProbeWithDifferentTTLs(t *testing.T) {
 			firstHalfWord:     1234,
 			secondHalfWord:    80,
 			ttl:               ttl,
-			protocol:          api.ICMP,
+			protocol:          wire.Protocol_PROTOCOL_ICMP,
 			correlationSecond: fixedTime,
 		}
 
@@ -1202,7 +1217,7 @@ func TestMatchAndDeliverResultChannelBlocked(t *testing.T) {
 		firstHalfWord:     1234,
 		secondHalfWord:    80,
 		ttl:               64,
-		protocol:          api.ICMP,
+		protocol:          wire.Protocol_PROTOCOL_ICMP,
 		correlationSecond: fixedTime,
 	}
 

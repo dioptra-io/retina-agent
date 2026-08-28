@@ -8,16 +8,17 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // -- mock types ---------------------------------------------------------------
@@ -92,7 +93,13 @@ func (e *errorWriteConn) Write(b []byte) (n int, err error) {
 	return 0, e.writeErr
 }
 
-// limitedWriteConn allows up to limit writes before returning io.ErrClosedPipe.
+// limitedWriteConn allows up to limit Write calls before returning
+// io.ErrClosedPipe. framing.Send now writes a frame's header+payload as
+// a single combined buffer via one Write call (previously two separate
+// calls, header then payload — that briefly required limit to be set to
+// 2x the desired frame count, until framing.Send was changed to combine
+// them into one call to avoid the extra TCP segment per message), so
+// one call here again corresponds to one complete frame.
 type limitedWriteConn struct {
 	*mockConn
 	limit int
@@ -109,10 +116,11 @@ func (l *limitedWriteConn) Write(b []byte) (n int, err error) {
 	return l.writeBuf.Write(b)
 }
 
-// errorDeadlineConn returns an error from SetReadDeadline. failOnCall controls which
-// invocation fails: 1 for the initial deadline set (before decode), 2 for the clearing
-// deadline (after successful auth) — handleAuth calls SetReadDeadline twice on the
-// success path, so a single failing mock can't exercise both branches at once.
+// errorDeadlineConn returns an error from SetReadDeadline. handleAuth now
+// makes exactly one framing.Receive call (which sets the read deadline
+// internally, once) — unlike the old JSON version, there's no separate
+// clear-deadline step afterward, so failOnCall only ever has one
+// meaningful value.
 type errorDeadlineConn struct {
 	*mockConn
 	failOnCall int
@@ -131,50 +139,104 @@ func (e *errorDeadlineConn) SetReadDeadline(t time.Time) error {
 
 // -- test helpers -------------------------------------------------------------
 
-// createTestFIE creates a ForwardingInfoElement for testing.
-func createTestFIE(pdID uint64) api.ForwardingInfoElement {
-	now := time.Now()
-	return api.ForwardingInfoElement{
-		Agent:              api.Agent{AgentID: "test-agent"},
-		ProbingDirectiveID: pdID,
-		DestinationAddress: net.ParseIP("8.8.8.8"),
-		NearInfo: &api.Info{
-			ProbeTTL:          10,
-			ReplyAddress:      net.ParseIP("10.0.0.1"),
-			SentTimestamp:     now,
-			ReceivedTimestamp: now.Add(10 * time.Millisecond),
-		},
-		FarInfo: &api.Info{
-			ProbeTTL:          11,
-			ReplyAddress:      net.ParseIP("10.0.0.2"),
-			SentTimestamp:     now,
-			ReceivedTimestamp: now.Add(15 * time.Millisecond),
-		},
-	}
-}
-
-// encodeFIE encodes a FIE to the connection's read buffer.
-func encodeFIE(t *testing.T, conn *mockConn, fie *api.ForwardingInfoElement) {
+// encodeFrame builds a length-prefixed protobuf frame matching what
+// framing.Send would produce.
+func encodeFrame(t *testing.T, msg proto.Message) []byte {
 	t.Helper()
-	encoder := json.NewEncoder(conn.readBuf)
-	if err := encoder.Encode(fie); err != nil {
-		t.Fatalf("Failed to encode FIE: %v", err)
+	payload, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("cannot marshal message: %v", err)
+	}
+	header := make([]byte, 4, 4+len(payload))
+	binary.BigEndian.PutUint32(header, uint32(len(payload))) //nolint:gosec // G115: a test payload never approaches uint32 range
+	return append(header, payload...)
+}
+
+// decodeFrame reads one length-prefixed protobuf frame from r and
+// unmarshals it into msg. Returns an error (often just "buffer exhausted")
+// rather than failing the test itself — callers looping until "no more
+// frames" should treat any returned error as done, matching how the old
+// decoder.Decode() error was used to end a loop, not just to fail a test.
+func decodeFrame(r *bytes.Buffer, msg proto.Message) error {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return err
+	}
+	length := binary.BigEndian.Uint32(header)
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return err
+	}
+	return proto.Unmarshal(payload, msg)
+}
+
+// createTestFIE creates a ForwardingInfoElement for testing.
+func createTestFIE(pdID uint64) *wire.ForwardingInfoElement {
+	now := timestamppb.Now()
+	return &wire.ForwardingInfoElement{
+		Agent:              &wire.Agent{AgentId: "test-agent"},
+		ProbingDirectiveId: pdID,
+		DestinationAddress: "8.8.8.8",
+		NearInfo: &wire.Info{
+			ProbeTtl:          10,
+			ReplyAddress:      "10.0.0.1",
+			SentTimestamp:     now,
+			ReceivedTimestamp: timestamppb.New(now.AsTime().Add(10 * time.Millisecond)),
+		},
+		FarInfo: &wire.Info{
+			ProbeTtl:          11,
+			ReplyAddress:      "10.0.0.2",
+			SentTimestamp:     now,
+			ReceivedTimestamp: timestamppb.New(now.AsTime().Add(15 * time.Millisecond)),
+		},
 	}
 }
 
-// writeAuthRequest encodes an AuthRequest to the connection's read buffer. handleAgent's
-// first read is now the auth handshake, so any test driving handleAgent (or handleAuth
-// directly) needs one of these ahead of whatever payload it expects sendPDs/receiveFIEs
-// to see afterward.
+// encodeFIE writes a length-prefixed FIE frame to the connection's read buffer.
+func encodeFIE(t *testing.T, conn *mockConn, fie *wire.ForwardingInfoElement) {
+	t.Helper()
+	if _, err := conn.readBuf.Write(encodeFrame(t, fie)); err != nil {
+		t.Fatalf("Failed to write FIE frame: %v", err)
+	}
+}
+
+// writeAuthRequest writes a length-prefixed AuthRequest frame to the
+// connection's read buffer. handleAgent's first read is the auth handshake,
+// so any test driving handleAgent (or handleAuth directly) needs one of
+// these ahead of whatever payload it expects sendPDs/receiveFIEs to see
+// afterward.
 func writeAuthRequest(t *testing.T, conn *mockConn, secret string) {
 	t.Helper()
-	encoder := json.NewEncoder(conn.readBuf)
-	if err := encoder.Encode(api.AuthRequest{Secret: secret}); err != nil { //nolint:gosec // G117: secret is the point of this struct, never logged
-		t.Fatalf("Failed to encode auth request: %v", err)
+	req := &wire.AuthRequest{Secret: secret} //nolint:gosec // G117: secret is the point of this struct, never logged
+	if _, err := conn.readBuf.Write(encodeFrame(t, req)); err != nil {
+		t.Fatalf("Failed to write auth request frame: %v", err)
 	}
 }
 
 // -- generatePD ---------------------------------------------------------------
+
+// assertNextHeaderPresent checks that pd's NextHeader matches its Protocol.
+// Split out of TestGeneratePD_ProtocolVariants to keep that test's own
+// cyclomatic complexity down.
+func assertNextHeaderPresent(t *testing.T, pd *wire.ProbingDirective) {
+	t.Helper()
+	switch pd.Protocol {
+	case wire.Protocol_PROTOCOL_UNSPECIFIED:
+		// not used by any test case here
+	case wire.Protocol_PROTOCOL_ICMP:
+		if pd.NextHeader.GetIcmpNextHeader() == nil {
+			t.Error("ICMP directive missing ICMPNextHeader")
+		}
+	case wire.Protocol_PROTOCOL_ICMPV6:
+		if pd.NextHeader.GetIcmpv6NextHeader() == nil {
+			t.Error("ICMPv6 directive missing ICMPv6NextHeader")
+		}
+	case wire.Protocol_PROTOCOL_UDP:
+		if pd.NextHeader.GetUdpNextHeader() == nil {
+			t.Error("UDP directive missing UDPNextHeader")
+		}
+	}
+}
 
 func TestGeneratePD_ProtocolVariants(t *testing.T) {
 	t.Parallel()
@@ -182,15 +244,15 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 	tests := []struct {
 		name         string
 		counter      int
-		wantTTL      uint8
+		wantTTL      uint32
 		wantIPv4     bool
-		wantProtocol api.Protocol
+		wantProtocol wire.Protocol
 	}{
-		{"IPv4 UDP", 0, 5, true, api.UDP},
-		{"IPv4 ICMP", 1, 6, true, api.ICMP},
-		{"IPv6 UDP", 6, 11, false, api.UDP},
-		{"IPv6 ICMPv6", 7, 12, false, api.ICMPv6},
-		{"TTL wrap", 18, 7, true, api.UDP},
+		{"IPv4 UDP", 0, 5, true, wire.Protocol_PROTOCOL_UDP},
+		{"IPv4 ICMP", 1, 6, true, wire.Protocol_PROTOCOL_ICMP},
+		{"IPv6 UDP", 6, 11, false, wire.Protocol_PROTOCOL_UDP},
+		{"IPv6 ICMPv6", 7, 12, false, wire.Protocol_PROTOCOL_ICMPV6},
+		{"TTL wrap", 18, 7, true, wire.Protocol_PROTOCOL_UDP},
 	}
 
 	for _, tt := range tests {
@@ -204,11 +266,11 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 				return
 			}
 
-			if pd.NearTTL != tt.wantTTL {
-				t.Errorf("NearTTL = %v, want %v", pd.NearTTL, tt.wantTTL)
+			if pd.NearTtl != tt.wantTTL {
+				t.Errorf("NearTtl = %v, want %v", pd.NearTtl, tt.wantTTL)
 			}
 
-			isIPv4 := pd.DestinationAddress.To4() != nil
+			isIPv4 := net.ParseIP(pd.DestinationAddress).To4() != nil
 			if isIPv4 != tt.wantIPv4 {
 				t.Errorf("IPv4 = %v, want %v", isIPv4, tt.wantIPv4)
 			}
@@ -217,22 +279,9 @@ func TestGeneratePD_ProtocolVariants(t *testing.T) {
 				t.Errorf("Protocol = %v, want %v", pd.Protocol, tt.wantProtocol)
 			}
 
-			switch pd.Protocol {
-			case api.ICMP:
-				if pd.NextHeader.ICMPNextHeader == nil {
-					t.Error("ICMP directive missing ICMPNextHeader")
-				}
-			case api.ICMPv6:
-				if pd.NextHeader.ICMPv6NextHeader == nil {
-					t.Error("ICMPv6 directive missing ICMPv6NextHeader")
-				}
-			case api.UDP:
-				if pd.NextHeader.UDPNextHeader == nil {
-					t.Error("UDP directive missing UDPNextHeader")
-				}
-			}
+			assertNextHeaderPresent(t, pd)
 
-			if pd.AgentID == "" || pd.DestinationAddress == nil || pd.ProbingDirectiveID == 0 {
+			if pd.AgentId == "" || pd.DestinationAddress == "" || pd.ProbingDirectiveId == 0 {
 				t.Error("Missing required fields")
 			}
 		})
@@ -245,10 +294,14 @@ func TestGeneratePD_Deterministic(t *testing.T) {
 	pd1 := generatePD(42)
 	pd2 := generatePD(42)
 
-	if !pd1.DestinationAddress.Equal(pd2.DestinationAddress) {
+	// DestinationAddress is a plain string on the wire type (unlike the old
+	// api.ProbingDirective's net.IP), so a direct comparison replaces
+	// net.IP.Equal — no normalization concerns here since both come from
+	// the same generatePD logic.
+	if pd1.DestinationAddress != pd2.DestinationAddress {
 		t.Error("generatePD not deterministic: addresses differ")
 	}
-	if pd1.NearTTL != pd2.NearTTL {
+	if pd1.NearTtl != pd2.NearTtl {
 		t.Error("generatePD not deterministic: TTLs differ")
 	}
 	if pd1.Protocol != pd2.Protocol {
@@ -266,21 +319,25 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 			return
 		}
 
-		if pd.NearTTL < 5 || pd.NearTTL > 20 {
-			t.Errorf("generatePD(%d): TTL %d out of range [5-20]", i, pd.NearTTL)
+		if pd.NearTtl < 5 || pd.NearTtl > 20 {
+			t.Errorf("generatePD(%d): TTL %d out of range [5-20]", i, pd.NearTtl)
 		}
 
-		if pd.DestinationAddress == nil {
-			t.Errorf("generatePD(%d): nil destination", i)
+		// DestinationAddress is a string now — empty string, not nil,
+		// signals "unset".
+		if pd.DestinationAddress == "" {
+			t.Errorf("generatePD(%d): empty destination", i)
 		}
 
-		if pd.Protocol != api.ICMP && pd.Protocol != api.ICMPv6 && pd.Protocol != api.UDP {
+		if pd.Protocol != wire.Protocol_PROTOCOL_ICMP &&
+			pd.Protocol != wire.Protocol_PROTOCOL_ICMPV6 &&
+			pd.Protocol != wire.Protocol_PROTOCOL_UDP {
 			t.Errorf("generatePD(%d): invalid protocol %v", i, pd.Protocol)
 		}
 
-		expectedID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
-		if pd.ProbingDirectiveID != expectedID {
-			t.Errorf("generatePD(%d): PD ID = %d, want %d", i, pd.ProbingDirectiveID, expectedID)
+		expectedID := uint64(i + 1)
+		if pd.ProbingDirectiveId != expectedID {
+			t.Errorf("generatePD(%d): PD ID = %d, want %d", i, pd.ProbingDirectiveId, expectedID)
 		}
 	}
 }
@@ -327,16 +384,12 @@ func TestHandleAuth_SuccessNoSecret(t *testing.T) {
 	conn := newMockConn()
 	writeAuthRequest(t, conn, "")
 
-	decoder, ok := handleAuth(conn, "")
-	if !ok {
+	if !handleAuth(conn, "") {
 		t.Fatal("handleAuth failed, want success")
 	}
-	if decoder == nil {
-		t.Fatal("handleAuth returned nil decoder on success")
-	}
 
-	var resp api.AuthResponse
-	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+	var resp wire.AuthResponse
+	if err := decodeFrame(conn.writeBuf, &resp); err != nil {
 		t.Fatalf("Failed to decode auth response: %v", err)
 	}
 	if !resp.Authenticated {
@@ -350,12 +403,8 @@ func TestHandleAuth_SuccessMatchingSecret(t *testing.T) {
 	conn := newMockConn()
 	writeAuthRequest(t, conn, "correct-secret")
 
-	decoder, ok := handleAuth(conn, "correct-secret")
-	if !ok {
+	if !handleAuth(conn, "correct-secret") {
 		t.Fatal("handleAuth failed, want success")
-	}
-	if decoder == nil {
-		t.Fatal("handleAuth returned nil decoder on success")
 	}
 }
 
@@ -365,16 +414,12 @@ func TestHandleAuth_WrongSecret(t *testing.T) {
 	conn := newMockConn()
 	writeAuthRequest(t, conn, "wrong-secret")
 
-	decoder, ok := handleAuth(conn, "correct-secret")
-	if ok {
+	if handleAuth(conn, "correct-secret") {
 		t.Fatal("handleAuth succeeded, want failure")
 	}
-	if decoder != nil {
-		t.Error("handleAuth returned non-nil decoder on failure")
-	}
 
-	var resp api.AuthResponse
-	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+	var resp wire.AuthResponse
+	if err := decodeFrame(conn.writeBuf, &resp); err != nil {
 		t.Fatalf("Failed to decode auth response: %v", err)
 	}
 	if resp.Authenticated {
@@ -386,14 +431,13 @@ func TestHandleAuth_DecodeError(t *testing.T) {
 	t.Parallel()
 
 	conn := newMockConn()
-	conn.readBuf.WriteString("not valid json")
+	// Garbage bytes: interpreted as a length-prefixed frame, this either
+	// declares a bogus (huge) length or fails to unmarshal as AuthRequest —
+	// either way, framing.Receive fails, same as malformed JSON did before.
+	conn.readBuf.WriteString("not a valid frame")
 
-	decoder, ok := handleAuth(conn, "some-secret")
-	if ok {
+	if handleAuth(conn, "some-secret") {
 		t.Fatal("handleAuth succeeded, want failure")
-	}
-	if decoder != nil {
-		t.Error("handleAuth returned non-nil decoder on failure")
 	}
 }
 
@@ -403,64 +447,40 @@ func TestHandleAuth_ResponseWriteError(t *testing.T) {
 	conn := &errorWriteConn{mockConn: newMockConn(), writeErr: errors.New("network error")}
 	writeAuthRequest(t, conn.mockConn, "")
 
-	decoder, ok := handleAuth(conn, "")
-	if ok {
+	if handleAuth(conn, "") {
 		t.Fatal("handleAuth succeeded, want failure")
-	}
-	if decoder != nil {
-		t.Error("handleAuth returned non-nil decoder on failure")
 	}
 }
 
 func TestHandleAuth_SetDeadlineError(t *testing.T) {
 	t.Parallel()
 
-	// Fails on the first SetReadDeadline call, made before the auth request is decoded.
+	// Fails on the only SetReadDeadline call handleAuth's single
+	// framing.Receive makes internally.
 	conn := &errorDeadlineConn{mockConn: newMockConn(), failOnCall: 1}
 	writeAuthRequest(t, conn.mockConn, "")
 
-	decoder, ok := handleAuth(conn, "")
-	if ok {
+	if handleAuth(conn, "") {
 		t.Fatal("handleAuth succeeded, want failure")
-	}
-	if decoder != nil {
-		t.Error("handleAuth returned non-nil decoder on failure")
-	}
-}
-
-func TestHandleAuth_ClearDeadlineError(t *testing.T) {
-	t.Parallel()
-
-	// Fails on the second SetReadDeadline call, made after a successful handshake to
-	// clear the deadline before handing the decoder off to the PD/FIE loop.
-	conn := &errorDeadlineConn{mockConn: newMockConn(), failOnCall: 2}
-	writeAuthRequest(t, conn.mockConn, "")
-
-	decoder, ok := handleAuth(conn, "")
-	if ok {
-		t.Fatal("handleAuth succeeded, want failure")
-	}
-	if decoder != nil {
-		t.Error("handleAuth returned non-nil decoder on failure")
 	}
 }
 
 // -- receiveFIEs --------------------------------------------------------------
 
+// TestReceiveFIEs_Success and its siblings below deliberately do not call
+// t.Parallel() — they read/reset the shared global fiesReceived counter
+// (via defer fiesReceived.Store(origReceived)), and running concurrently
+// with each other, or with TestReportStats_*, would race on it. Go runs
+// all non-parallel tests to completion before starting the parallel batch,
+// which is what keeps this safe.
 func TestReceiveFIEs_Success(t *testing.T) {
-	fie := createTestFIE(123)
+	conn := newMockConn()
+	encodeFIE(t, conn, createTestFIE(123))
 
-	var buf bytes.Buffer
-	encoder := json.NewEncoder(&buf)
-	if err := encoder.Encode(fie); err != nil {
-		t.Fatalf("Failed to encode FIE: %v", err)
-	}
-
-	decoder := json.NewDecoder(&buf)
 	origReceived := fiesReceived.Load()
 	defer fiesReceived.Store(origReceived)
 
-	receiveFIEs(decoder, "test-addr")
+	receiveFIEs(conn, "test-addr")
 
 	if fiesReceived.Load() != origReceived+1 {
 		t.Error("fiesReceived counter not incremented")
@@ -469,23 +489,21 @@ func TestReceiveFIEs_Success(t *testing.T) {
 
 func TestReceiveFIEs_BothNilInfo(t *testing.T) {
 	// FIE with both NearInfo and FarInfo nil — no probe response received at all.
-	fie := api.ForwardingInfoElement{
-		Agent:              api.Agent{AgentID: "test-agent"},
-		ProbingDirectiveID: 42,
-		DestinationAddress: net.ParseIP("8.8.8.8"),
+	fie := &wire.ForwardingInfoElement{
+		Agent:              &wire.Agent{AgentId: "test-agent"},
+		ProbingDirectiveId: 42,
+		DestinationAddress: "8.8.8.8",
 		NearInfo:           nil,
 		FarInfo:            nil,
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
-		t.Fatalf("Failed to encode FIE: %v", err)
-	}
+	conn := newMockConn()
+	encodeFIE(t, conn, fie)
 
 	origReceived := fiesReceived.Load()
 	defer fiesReceived.Store(origReceived)
 
-	receiveFIEs(json.NewDecoder(&buf), "test-addr")
+	receiveFIEs(conn, "test-addr")
 
 	if fiesReceived.Load() != origReceived+1 {
 		t.Error("fiesReceived counter not incremented")
@@ -494,29 +512,27 @@ func TestReceiveFIEs_BothNilInfo(t *testing.T) {
 
 func TestReceiveFIEs_NearInfoNil(t *testing.T) {
 	// FIE with NearInfo nil — far hop responded but near hop did not.
-	now := time.Now()
-	fie := api.ForwardingInfoElement{
-		Agent:              api.Agent{AgentID: "test-agent"},
-		ProbingDirectiveID: 42,
-		DestinationAddress: net.ParseIP("8.8.8.8"),
+	now := timestamppb.Now()
+	fie := &wire.ForwardingInfoElement{
+		Agent:              &wire.Agent{AgentId: "test-agent"},
+		ProbingDirectiveId: 42,
+		DestinationAddress: "8.8.8.8",
 		NearInfo:           nil,
-		FarInfo: &api.Info{
-			ProbeTTL:          11,
-			ReplyAddress:      net.ParseIP("10.0.0.2"),
+		FarInfo: &wire.Info{
+			ProbeTtl:          11,
+			ReplyAddress:      "10.0.0.2",
 			SentTimestamp:     now,
-			ReceivedTimestamp: now.Add(15 * time.Millisecond),
+			ReceivedTimestamp: timestamppb.New(now.AsTime().Add(15 * time.Millisecond)),
 		},
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
-		t.Fatalf("Failed to encode FIE: %v", err)
-	}
+	conn := newMockConn()
+	encodeFIE(t, conn, fie)
 
 	origReceived := fiesReceived.Load()
 	defer fiesReceived.Store(origReceived)
 
-	receiveFIEs(json.NewDecoder(&buf), "test-addr")
+	receiveFIEs(conn, "test-addr")
 
 	if fiesReceived.Load() != origReceived+1 {
 		t.Error("fiesReceived counter not incremented")
@@ -525,29 +541,27 @@ func TestReceiveFIEs_NearInfoNil(t *testing.T) {
 
 func TestReceiveFIEs_FarInfoNil(t *testing.T) {
 	// FIE with FarInfo nil — near hop responded but far hop did not.
-	now := time.Now()
-	fie := api.ForwardingInfoElement{
-		Agent:              api.Agent{AgentID: "test-agent"},
-		ProbingDirectiveID: 42,
-		DestinationAddress: net.ParseIP("8.8.8.8"),
-		NearInfo: &api.Info{
-			ProbeTTL:          10,
-			ReplyAddress:      net.ParseIP("10.0.0.1"),
+	now := timestamppb.Now()
+	fie := &wire.ForwardingInfoElement{
+		Agent:              &wire.Agent{AgentId: "test-agent"},
+		ProbingDirectiveId: 42,
+		DestinationAddress: "8.8.8.8",
+		NearInfo: &wire.Info{
+			ProbeTtl:          10,
+			ReplyAddress:      "10.0.0.1",
 			SentTimestamp:     now,
-			ReceivedTimestamp: now.Add(10 * time.Millisecond),
+			ReceivedTimestamp: timestamppb.New(now.AsTime().Add(10 * time.Millisecond)),
 		},
 		FarInfo: nil,
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(fie); err != nil {
-		t.Fatalf("Failed to encode FIE: %v", err)
-	}
+	conn := newMockConn()
+	encodeFIE(t, conn, fie)
 
 	origReceived := fiesReceived.Load()
 	defer fiesReceived.Store(origReceived)
 
-	receiveFIEs(json.NewDecoder(&buf), "test-addr")
+	receiveFIEs(conn, "test-addr")
 
 	if fiesReceived.Load() != origReceived+1 {
 		t.Error("fiesReceived counter not incremented")
@@ -557,15 +571,16 @@ func TestReceiveFIEs_FarInfoNil(t *testing.T) {
 func TestReceiveFIEs_EOF(t *testing.T) {
 	t.Parallel()
 
-	decoder := json.NewDecoder(strings.NewReader(""))
-	receiveFIEs(decoder, "test-addr")
+	// Default mockConn has an empty readBuf — Read returns io.EOF immediately.
+	receiveFIEs(newMockConn(), "test-addr")
 }
 
 func TestReceiveFIEs_DecodeError(t *testing.T) {
 	t.Parallel()
 
-	decoder := json.NewDecoder(strings.NewReader("invalid json"))
-	receiveFIEs(decoder, "test-addr")
+	conn := newMockConn()
+	conn.readBuf.WriteString("not a valid frame")
+	receiveFIEs(conn, "test-addr")
 }
 
 // -- sendPDs ------------------------------------------------------------------
@@ -573,16 +588,16 @@ func TestReceiveFIEs_DecodeError(t *testing.T) {
 func TestSendPDs_SendsPDsUntilWriteError(t *testing.T) {
 	t.Parallel()
 
+	// limit equals the desired frame count directly: framing.Send writes
+	// each frame's header+payload as a single combined Write call.
 	conn := &limitedWriteConn{mockConn: newMockConn(), limit: 5}
-	encoder := json.NewEncoder(conn)
 
-	sendPDs(encoder, "test-addr", 1000)
+	sendPDs(conn, "test-addr", 1000)
 
-	decoder := json.NewDecoder(conn.writeBuf)
 	count := 0
 	for {
-		var pd api.ProbingDirective
-		if err := decoder.Decode(&pd); err != nil {
+		var pd wire.ProbingDirective
+		if err := decodeFrame(conn.writeBuf, &pd); err != nil {
 			break
 		}
 		count++
@@ -596,9 +611,8 @@ func TestSendPDs_ExitsOnNetworkError(t *testing.T) {
 	t.Parallel()
 
 	conn := &errorWriteConn{mockConn: newMockConn(), writeErr: errors.New("network error")}
-	encoder := json.NewEncoder(conn)
 
-	sendPDs(encoder, "test-addr", 1000)
+	sendPDs(conn, "test-addr", 1000)
 
 	if conn.writeBuf.Len() != 0 {
 		t.Error("data written to buffer despite write error")
@@ -612,8 +626,7 @@ func TestHandleAgent_BasicFlow(t *testing.T) {
 
 	conn := newMockConn()
 	writeAuthRequest(t, conn, "")
-	fie := createTestFIE(1)
-	encodeFIE(t, conn, &fie)
+	encodeFIE(t, conn, createTestFIE(1))
 
 	done := make(chan bool)
 	go func() {
@@ -657,16 +670,16 @@ func TestHandleAgent_AuthFailureClosesConnection(t *testing.T) {
 		t.Fatal("Timeout waiting for handleAgent to reject bad auth")
 	}
 
-	var resp api.AuthResponse
-	if err := json.NewDecoder(conn.writeBuf).Decode(&resp); err != nil {
+	var resp wire.AuthResponse
+	if err := decodeFrame(conn.writeBuf, &resp); err != nil {
 		t.Fatalf("Failed to decode auth response: %v", err)
 	}
 	if resp.Authenticated {
 		t.Error("AuthResponse.Authenticated = true, want false")
 	}
 	// No PDs should follow a failed handshake.
-	var pd api.ProbingDirective
-	if err := json.NewDecoder(conn.writeBuf).Decode(&pd); err == nil {
+	var pd wire.ProbingDirective
+	if err := decodeFrame(conn.writeBuf, &pd); err == nil {
 		t.Error("PD written to buffer after failed auth, want none")
 	}
 }
@@ -676,8 +689,7 @@ func TestHandleAgent_CloseError(t *testing.T) {
 
 	conn := &errorCloseConn{mockConn: newMockConn()}
 	writeAuthRequest(t, conn.mockConn, "")
-	fie := createTestFIE(1)
-	encodeFIE(t, conn.mockConn, &fie)
+	encodeFIE(t, conn.mockConn, createTestFIE(1))
 
 	done := make(chan bool)
 	go func() {
@@ -704,9 +716,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 	writeAuthRequest(t, conn, "")
 
 	for i := 0; i < 10; i++ {
-		pdID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
-		fie := createTestFIE(pdID)
-		encodeFIE(t, conn, &fie)
+		encodeFIE(t, conn, createTestFIE(uint64(i+1)))
 	}
 
 	done := make(chan bool)
@@ -727,12 +737,10 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 		t.Fatal("Timeout waiting for handleAgent")
 	}
 
-	decoder := json.NewDecoder(conn.writeBuf)
-
-	// First message on the wire is now the auth response, not a PD — consume and check it
+	// First message on the wire is the auth response, not a PD — consume and check it
 	// before looking for the ICMPv6 directive among the PDs that follow.
-	var resp api.AuthResponse
-	if err := decoder.Decode(&resp); err != nil {
+	var resp wire.AuthResponse
+	if err := decodeFrame(conn.writeBuf, &resp); err != nil {
 		t.Fatalf("Failed to decode auth response: %v", err)
 	}
 	if !resp.Authenticated {
@@ -741,11 +749,11 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 
 	foundICMPv6 := false
 	for {
-		var pd api.ProbingDirective
-		if err := decoder.Decode(&pd); err != nil {
+		var pd wire.ProbingDirective
+		if err := decodeFrame(conn.writeBuf, &pd); err != nil {
 			break
 		}
-		if pd.Protocol == api.ICMPv6 {
+		if pd.Protocol == wire.Protocol_PROTOCOL_ICMPV6 {
 			foundICMPv6 = true
 			break
 		}
@@ -765,8 +773,7 @@ func TestHandleAgent_WriteError(t *testing.T) {
 	}
 
 	writeAuthRequest(t, conn.mockConn, "")
-	fie := createTestFIE(1)
-	encodeFIE(t, conn.mockConn, &fie)
+	encodeFIE(t, conn.mockConn, createTestFIE(1))
 
 	done := make(chan bool)
 	go func() {

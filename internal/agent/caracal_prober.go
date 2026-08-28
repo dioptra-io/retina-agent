@@ -30,7 +30,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -66,7 +67,7 @@ type probeKey struct {
 	firstHalfWord     uint16 // FirstHalfWord for ICMP/ICMPv6, SourcePort for UDP
 	secondHalfWord    uint16 // SecondHalfWord for ICMP/ICMPv6, DestinationPort for UDP
 	ttl               uint8
-	protocol          api.Protocol
+	protocol          wire.Protocol
 	correlationSecond int64 // Unix timestamp truncated to seconds; matched with ±2s tolerance in readerLoop
 }
 
@@ -76,7 +77,7 @@ type inFlightProbe struct {
 }
 
 type probeRequest struct {
-	pd       *api.ProbingDirective
+	pd       *model.ProbingDirective
 	ttl      uint8
 	resultCh chan *ProbeResult
 }
@@ -182,28 +183,37 @@ func closePipe(pipe io.Closer, name string, logger *slog.Logger) {
 	}
 }
 
-func extractHalfWords(pd *api.ProbingDirective) (uint16, uint16) {
+// extractHalfWords reads the ICMP/ICMPv6/UDP next-header variant via
+// protoc-gen-go's oneof getters (GetIcmpNextHeader() etc.), which are
+// nil-safe even if pd.NextHeader itself is nil.
+//
+// The uint32->uint16 casts below can silently wrap if a value exceeds
+// 65535 — wire.proto's fields are uint32 only because proto3 has no
+// uint16, not because the values are meant to exceed 16 bits (already
+// flagged, unresolved, when this schema was reviewed: validating the
+// range wasn't done since the value only ever comes from the same
+// orchestrator-controlled PD generation that already respects it).
+func extractHalfWords(pd *model.ProbingDirective) (uint16, uint16) {
 	switch pd.Protocol {
-	case api.ICMP:
-		if pd.NextHeader.ICMPNextHeader != nil {
-			return pd.NextHeader.ICMPNextHeader.FirstHalfWord,
-				pd.NextHeader.ICMPNextHeader.SecondHalfWord
+	case wire.Protocol_PROTOCOL_UNSPECIFIED:
+		// no next header for an unset protocol
+	case wire.Protocol_PROTOCOL_ICMP:
+		if h := pd.NextHeader.GetIcmpNextHeader(); h != nil {
+			return uint16(h.FirstHalfWord), uint16(h.SecondHalfWord) //nolint:gosec // G115: known, documented gap -- see doc comment above
 		}
-	case api.ICMPv6:
-		if pd.NextHeader.ICMPv6NextHeader != nil {
-			return pd.NextHeader.ICMPv6NextHeader.FirstHalfWord,
-				pd.NextHeader.ICMPv6NextHeader.SecondHalfWord
+	case wire.Protocol_PROTOCOL_ICMPV6:
+		if h := pd.NextHeader.GetIcmpv6NextHeader(); h != nil {
+			return uint16(h.FirstHalfWord), uint16(h.SecondHalfWord) //nolint:gosec // G115: known, documented gap -- see doc comment above
 		}
-	case api.UDP:
-		if pd.NextHeader.UDPNextHeader != nil {
-			return pd.NextHeader.UDPNextHeader.SourcePort,
-				pd.NextHeader.UDPNextHeader.DestinationPort
+	case wire.Protocol_PROTOCOL_UDP:
+		if h := pd.NextHeader.GetUdpNextHeader(); h != nil {
+			return uint16(h.SourcePort), uint16(h.DestinationPort) //nolint:gosec // G115: known, documented gap -- see doc comment above
 		}
 	}
 	return 0, 0
 }
 
-func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp int64) probeKey {
+func buildProbeKeyFromDirective(pd *model.ProbingDirective, ttl uint8, timestamp int64) probeKey {
 	firstHalf, secondHalf := extractHalfWords(pd)
 	return probeKey{
 		dstAddr:           normalizeIPAddress(pd.DestinationAddress.String()),
@@ -223,7 +233,7 @@ func buildProbeKeyFromDirective(pd *api.ProbingDirective, ttl uint8, timestamp i
 // Returns a ProbeResult with TimedOut=true on timeout; SentTime is approximated
 // as queue time and may differ from actual send time under backpressure.
 // Returns a non-nil error only if ctx is canceled.
-func (p *caracalProber) Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+func (p *caracalProber) Probe(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error) {
 	resultCh := make(chan *ProbeResult, 1)
 	now := time.Now()
 	key := buildProbeKeyFromDirective(pd, ttl, now.Unix())
@@ -358,6 +368,10 @@ func (p *caracalProber) readerLoop() error {
 //	[14] reply_mpls_labels   - MPLS labels (may be empty)
 //	[15] rtt                 - Round-trip time in units of 0.1ms
 //	[16] round               - Probe round number
+//
+// record[2] (probe_src_addr) feeds ProbeResult.SourceAddress — only
+// available here because a reply was received; see ProbeResult's doc
+// comment in prober.go for the both-timeout gap that leaves open.
 func (p *caracalProber) handleResult(record []string) error {
 	if len(record) < 17 {
 		return fmt.Errorf("invalid CSV record: expected 17 fields, got %d", len(record))
@@ -394,6 +408,7 @@ func parseProbeResult(record []string) (*ProbeResult, error) {
 		}
 	}
 
+	result.SourceAddress = net.ParseIP(record[2])
 	result.ReplyAddress = net.ParseIP(record[8])
 
 	if result.ReceivedTime.IsZero() || result.SentTime.IsZero() {
@@ -444,14 +459,14 @@ func buildProbeKey(record []string, sentTime time.Time) (probeKey, error) {
 		return probeKey{}, fmt.Errorf("invalid second half word: %s", record[5])
 	}
 
-	var protoType api.Protocol
+	var protoType wire.Protocol
 	switch protocol {
 	case 1:
-		protoType = api.ICMP
+		protoType = wire.Protocol_PROTOCOL_ICMP
 	case 17:
-		protoType = api.UDP
+		protoType = wire.Protocol_PROTOCOL_UDP
 	case 58:
-		protoType = api.ICMPv6
+		protoType = wire.Protocol_PROTOCOL_ICMPV6
 	default:
 		return probeKey{}, fmt.Errorf("unsupported protocol: %d", protocol)
 	}
@@ -562,14 +577,16 @@ func (p *caracalProber) Close() error {
 	return p.g.Wait()
 }
 
-// protocolToString converts api.Protocol to caracal's protocol string.
-func protocolToString(protocol api.Protocol) string {
+// protocolToString converts wire.Protocol to caracal's protocol string.
+func protocolToString(protocol wire.Protocol) string {
 	switch protocol {
-	case api.ICMP:
+	case wire.Protocol_PROTOCOL_UNSPECIFIED:
+		return "unspecified"
+	case wire.Protocol_PROTOCOL_ICMP:
 		return "icmp"
-	case api.ICMPv6:
+	case wire.Protocol_PROTOCOL_ICMPV6:
 		return "icmp6"
-	case api.UDP:
+	case wire.Protocol_PROTOCOL_UDP:
 		return "udp"
 	default:
 		return strconv.Itoa(int(protocol))
