@@ -7,6 +7,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dioptra-io/retina-commons v1.0.1-0.20260826144704-2be8f7eba49f h1:ssj5skx3pCiA/5/iUYNOf0BkaYg1kM6fuwKJ4gGp+94=
 github.com/dioptra-io/retina-commons v1.0.1-0.20260826144704-2be8f7eba49f/go.mod h1:qjQnU9msw/aZLt1J6WwiTzEM4fvN9V5UnrMX4zFyygc=
+github.com/dioptra-io/retina-commons v1.0.1-0.20260828124422-c68dfe358527 h1:+i5wEhVaOeUmM6MfWohpbsInpG/DDYQvM02tjdupM+0=
+github.com/dioptra-io/retina-commons v1.0.1-0.20260828124422-c68dfe358527/go.mod h1:qjQnU9msw/aZLt1J6WwiTzEM4fvN9V5UnrMX4zFyygc=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=

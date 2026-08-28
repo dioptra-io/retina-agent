@@ -3,7 +3,7 @@ module github.com/dioptra-io/retina-agent
 go 1.26.1
 
 require (
-	github.com/dioptra-io/retina-commons v1.0.1-0.20260826144704-2be8f7eba49f
+	github.com/dioptra-io/retina-commons v1.0.1-0.20260828124422-c68dfe358527
 	golang.org/x/sync v0.19.0
 )
 
