@@ -94,10 +94,12 @@ func (e *errorWriteConn) Write(b []byte) (n int, err error) {
 }
 
 // limitedWriteConn allows up to limit Write calls before returning
-// io.ErrClosedPipe. framing.Send issues two separate Write calls per
-// frame (header, then payload) — unlike the old one-JSON-object-per-Write
-// behavior, one complete frame here costs two calls, so limit must be set
-// to 2x the desired frame count, not 1x.
+// io.ErrClosedPipe. framing.Send now writes a frame's header+payload as
+// a single combined buffer via one Write call (previously two separate
+// calls, header then payload — that briefly required limit to be set to
+// 2x the desired frame count, until framing.Send was changed to combine
+// them into one call to avoid the extra TCP segment per message), so
+// one call here again corresponds to one complete frame.
 type limitedWriteConn struct {
 	*mockConn
 	limit int
@@ -586,9 +588,9 @@ func TestReceiveFIEs_DecodeError(t *testing.T) {
 func TestSendPDs_SendsPDsUntilWriteError(t *testing.T) {
 	t.Parallel()
 
-	// limit is 2x the desired frame count: framing.Send issues one Write
-	// call for the header and one for the payload, per frame.
-	conn := &limitedWriteConn{mockConn: newMockConn(), limit: 10}
+	// limit equals the desired frame count directly: framing.Send writes
+	// each frame's header+payload as a single combined Write call.
+	conn := &limitedWriteConn{mockConn: newMockConn(), limit: 5}
 
 	sendPDs(conn, "test-addr", 1000)
 

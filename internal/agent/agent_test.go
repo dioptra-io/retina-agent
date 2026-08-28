@@ -1004,9 +1004,11 @@ func TestWriterLoop_Success(t *testing.T) {
 
 	// writerLoop is called synchronously below (not in a goroutine), so
 	// accumulating into a plain buffer is simpler and safer than a
-	// channel here — framing.Send makes two separate Write calls per
-	// frame (header, then payload), and a channel with buffer 1 would
-	// deadlock on the second call with nothing around to drain the first.
+	// channel here — framing.Send now writes header+payload as a single
+	// combined Write call, but a fixed-buffer channel would still be a
+	// latent deadlock risk if that ever changed back (as it briefly did
+	// earlier), with nothing around to drain a second call. A plain
+	// buffer has no such assumption baked in either way.
 	var written bytes.Buffer
 	conn := &stubConn{
 		writeFunc: func(b []byte) (int, error) {
