@@ -24,8 +24,10 @@ type Config struct {
 	// Secret is the authentication credential shared between agent and orchestrator.
 	// If empty, authentication is disabled.
 	Secret string
-	// ReadDeadline is the timeout for receiving messages from orchestrator.
-	// Should be longer than expected message intervals.
+	// ReadDeadline is how often the reader wakes up while waiting for messages
+	// from the orchestrator, to check for shutdown. It is not an idle timeout:
+	// the connection is kept open through arbitrarily long silences, and a dead
+	// orchestrator is detected by TCP keepalive instead.
 	ReadDeadline time.Duration
 	// WriteDeadline is the timeout for sending messages to orchestrator.
 	WriteDeadline       time.Duration

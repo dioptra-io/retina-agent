@@ -42,20 +42,17 @@ import (
 
 var ErrInvalidDirective = errors.New("invalid probing directive")
 
-// orchestratorKeepalivePeriod is the interval between TCP keepalive probes
-// for the orchestrator connection. Keepalives ensure that a dead connection is
-// detected even when no data is being exchanged, triggering reconnection instead
-// of blocking indefinitely on a read timeout.
-const orchestratorKeepalivePeriod = 10 * time.Second
-
-// maxConsecutiveReadTimeouts is the number of consecutive read timeouts before
-// the connection is considered dead and reconnection is triggered. The counter
-// resets whenever a directive is received, so the connection is only dropped
-// after maxConsecutiveReadTimeouts x ReadDeadline without any incoming data
-// (~60s with the default ReadDeadline of 10s). Kept as
-// a constant rather than a config field since operators should tune ReadDeadline
-// instead.
-const maxConsecutiveReadTimeouts = 6
+// TCP keepalive settings for the orchestrator connection, matching the
+// orchestrator side. The orchestrator may legitimately stay silent for long
+// periods, so silence is never treated as failure; instead the kernel probes
+// the peer after orchestratorKeepaliveIdle without traffic, and a dead peer
+// (host down, network partition) is detected after orchestratorKeepaliveCount
+// unanswered probes (~60s), surfacing as a read error that triggers reconnection.
+const (
+	orchestratorKeepaliveIdle     = 30 * time.Second
+	orchestratorKeepaliveInterval = 10 * time.Second
+	orchestratorKeepaliveCount    = 3
+)
 
 type agent struct {
 	config  *Config
@@ -101,11 +98,13 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 		}
 	}()
 
-	if err := conn.SetKeepAlive(true); err != nil {
-		return fmt.Errorf("failed to enable keepalive: %w", err)
-	}
-	if err := conn.SetKeepAlivePeriod(orchestratorKeepalivePeriod); err != nil {
-		return fmt.Errorf("failed to set keepalive period: %w", err)
+	if err := conn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     orchestratorKeepaliveIdle,
+		Interval: orchestratorKeepaliveInterval,
+		Count:    orchestratorKeepaliveCount,
+	}); err != nil {
+		return fmt.Errorf("failed to configure keepalive: %w", err)
 	}
 
 	a.logger.Info("Connected to orchestrator",
@@ -179,14 +178,14 @@ func (a *agent) authenticate(conn net.Conn) error {
 
 // readerLoop receives and validates ProbingDirective messages from the orchestrator.
 // After MaxConsecutiveDecodeErrors consecutive JSON failures the connection is
-// terminated (set to 0 to disable). After maxConsecutiveReadTimeouts consecutive
-// read timeouts the connection is considered dead and reconnection is triggered.
+// terminated (set to 0 to disable). Read timeouts are not errors: ReadDeadline
+// only wakes the loop periodically to observe ctx cancellation, and a dead
+// orchestrator is detected by TCP keepalive, which surfaces as a read error.
 // Closing pds on return signals processorLoop to drain in-flight goroutines and exit.
 func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.ProbingDirective) error {
 	defer close(pds)
 	decoder := json.NewDecoder(conn)
 	consecutiveDecodeErrors := 0
-	consecutiveTimeouts := 0
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
@@ -200,19 +199,11 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
-				consecutiveTimeouts++
-				a.logger.Debug("Read timeout, no data received",
-					slog.Int("consecutive", consecutiveTimeouts),
-					slog.Int("max", maxConsecutiveReadTimeouts))
-				if consecutiveTimeouts >= maxConsecutiveReadTimeouts {
-					return fmt.Errorf("connection timed out after %d consecutive read timeouts", consecutiveTimeouts)
-				}
 				// json.Decoder caches read errors and never reads again, so
 				// rebuild it, keeping any bytes of a partially received PD.
 				decoder = json.NewDecoder(io.MultiReader(decoder.Buffered(), conn))
 				continue
 			}
-			consecutiveTimeouts = 0
 			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
 			consecutiveDecodeErrors = newCount
 			if !shouldContinue {
@@ -222,7 +213,6 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		}
 
 		consecutiveDecodeErrors = 0
-		consecutiveTimeouts = 0
 		a.metrics.PDsReceivedTotal.Inc()
 
 		if err := validatePD(&pd); err != nil {

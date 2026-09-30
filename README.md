@@ -87,7 +87,7 @@ go run test/mock_orchestrator.go
 | `--cleanup-interval` | `10s` | Prober stale probe cleanup interval |
 | `--pds-buffer` | `100` | Directives channel buffer size |
 | `--fies-buffer` | `100` | FIEs channel buffer size |
-| `--read-deadline` | `10s` | Read timeout for orchestrator connection |
+| `--read-deadline` | `10s` | Shutdown-check interval while the orchestrator is idle (not an idle timeout) |
 | `--write-deadline` | `5s` | Write timeout for orchestrator connection |
 | `--probe-timeout` | `5s` | Timeout for individual probe responses |
 | `--max-reconnect-backoff` | `5m` | Maximum wait time between reconnection attempts |
@@ -118,7 +118,7 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_CLEANUP_INTERVAL`              | `10s`             | Prober stale probe cleanup interval                              |
 | `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
 | `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
-| `RETINA_READ_DEADLINE`                 | `10s`             | Read timeout for orchestrator connection                         |
+| `RETINA_READ_DEADLINE`                 | `10s`             | Shutdown-check interval while the orchestrator is idle           |
 | `RETINA_WRITE_DEADLINE`                | `5s`              | Write timeout for orchestrator connection                        |
 | `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
 | `RETINA_MAX_RECONNECT_BACKOFF`         | `5m`              | Maximum wait between reconnection attempts                       |
@@ -149,6 +149,7 @@ The caracal prober uses a high-throughput pipeline:
 ### Error Handling
 
 - **Network errors**: Trigger reconnection with exponential backoff
+- **Idle orchestrator**: Not an error; the connection stays open indefinitely. A dead orchestrator is detected by TCP keepalive (30s idle, 3 probes 10s apart, ~60s) and triggers reconnection
 - **Decode errors**: Log and skip (reconnect after `--max-consecutive-decode-errors` consecutive)
 - **Probe timeouts**: Expected behavior, FIE sent with nil NearInfo/FarInfo
 - **Context cancellation**: Clean shutdown
