@@ -49,8 +49,10 @@ var ErrInvalidDirective = errors.New("invalid probing directive")
 const orchestratorKeepalivePeriod = 10 * time.Second
 
 // maxConsecutiveReadTimeouts is the number of consecutive read timeouts before
-// the connection is considered dead and reconnection is triggered. With the
-// default ReadDeadline of 10s, a dead connection is detected in ~60s. Kept as
+// the connection is considered dead and reconnection is triggered. The counter
+// resets whenever a directive is received, so the connection is only dropped
+// after maxConsecutiveReadTimeouts x ReadDeadline without any incoming data
+// (~60s with the default ReadDeadline of 10s). Kept as
 // a constant rather than a config field since operators should tune ReadDeadline
 // instead.
 const maxConsecutiveReadTimeouts = 6
@@ -196,7 +198,8 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				consecutiveTimeouts++
 				a.logger.Debug("Read timeout, no data received",
 					slog.Int("consecutive", consecutiveTimeouts),
@@ -204,6 +207,9 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 				if consecutiveTimeouts >= maxConsecutiveReadTimeouts {
 					return fmt.Errorf("connection timed out after %d consecutive read timeouts", consecutiveTimeouts)
 				}
+				// json.Decoder caches read errors and never reads again, so
+				// rebuild it, keeping any bytes of a partially received PD.
+				decoder = json.NewDecoder(io.MultiReader(decoder.Buffered(), conn))
 				continue
 			}
 			consecutiveTimeouts = 0
