@@ -105,7 +105,7 @@ func TestCSVWriterLoop(t *testing.T) {
 	close(fies)
 	done := make(chan error, 1)
 	go func() {
-		done <- a.writerLoopWithWriter(context.Background(), client, bufio.NewWriter(client), fies)
+		done <- a.writerLoopWithWriter(context.Background(), bufio.NewWriter(client), fies)
 	}()
 	line, err := bufio.NewReader(server).ReadString('\n')
 	if err != nil {

@@ -22,7 +22,7 @@ const (
 
 // decodePDRecord decodes the compact post-handshake PD representation:
 // id,destination,near_ttl,protocol,first_half_word,second_half_word.
-func decodePDRecord(line string, agentID string) (*api.ProbingDirective, error) {
+func decodePDRecord(line, agentID string) (*api.ProbingDirective, error) {
 	record, err := readCSVRecord(line)
 	if err != nil {
 		return nil, fmt.Errorf("invalid PD CSV: %w", err)

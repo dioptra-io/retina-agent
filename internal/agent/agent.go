@@ -136,7 +136,7 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 	g.Go(func() error { return a.readerLoopWithReader(ctx, conn, reader, pds) })
 	g.Go(func() error { return a.processorLoop(ctx, pds, fies) })
-	g.Go(func() error { return a.writerLoopWithWriter(ctx, conn, writer, fies) })
+	g.Go(func() error { return a.writerLoopWithWriter(ctx, writer, fies) })
 
 	if err := g.Wait(); err != nil && err != ctx.Err() {
 		a.logger.Error("Connection terminated", slog.Any("err", err))
@@ -430,8 +430,7 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 	}
 }
 
-func (a *agent) writerLoopWithWriter(ctx context.Context, conn net.Conn, writer *bufio.Writer, fies <-chan *api.ForwardingInfoElement) error {
-
+func (a *agent) writerLoopWithWriter(ctx context.Context, writer *bufio.Writer, fies <-chan *api.ForwardingInfoElement) error {
 	for {
 		select {
 		case <-ctx.Done():
