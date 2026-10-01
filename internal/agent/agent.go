@@ -24,6 +24,8 @@
 package agent
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -110,7 +112,9 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 	a.logger.Info("Connected to orchestrator",
 		slog.String("address", a.config.OrchestratorAddr))
 
-	if err := a.authenticate(conn); err != nil {
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+	if err := a.authenticateIO(conn, reader, writer); err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 	if a.config.Secret == "" {
@@ -124,9 +128,9 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return a.readerLoop(ctx, conn, pds) })
+	g.Go(func() error { return a.readerLoopWithReader(ctx, conn, reader, pds) })
 	g.Go(func() error { return a.processorLoop(ctx, pds, fies) })
-	g.Go(func() error { return a.writerLoop(ctx, conn, fies) })
+	g.Go(func() error { return a.writerLoopWithWriter(ctx, conn, writer, fies) })
 
 	if err := g.Wait(); err != nil && err != ctx.Err() {
 		a.logger.Error("Connection terminated", slog.Any("err", err))
@@ -139,8 +143,12 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 // authenticate must be called immediately after connecting, before any other messages.
 func (a *agent) authenticate(conn net.Conn) error {
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
+	return a.authenticateIO(conn, bufio.NewReader(conn), bufio.NewWriter(conn))
+}
+
+func (a *agent) authenticateIO(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) error {
+	encoder := json.NewEncoder(writer)
+	decoder := json.NewDecoder(singleByteReader{reader: reader})
 
 	authReq := &api.AuthRequest{
 		AgentID: a.config.AgentID,
@@ -152,6 +160,9 @@ func (a *agent) authenticate(conn net.Conn) error {
 	}
 
 	if err := encoder.Encode(authReq); err != nil { //nolint:gosec // G117: secret field is intentionally included in auth request
+		return fmt.Errorf("failed to send auth request: %w", err)
+	}
+	if err := writer.Flush(); err != nil {
 		return fmt.Errorf("failed to send auth request: %w", err)
 	}
 
@@ -176,8 +187,21 @@ func (a *agent) authenticate(conn net.Conn) error {
 	return nil
 }
 
+// singleByteReader prevents the JSON handshake decoder from reading ahead into
+// the first CSV record, which belongs to the post-handshake protocol.
+type singleByteReader struct {
+	reader io.Reader
+}
+
+func (r singleByteReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return r.reader.Read(p)
+}
+
 // readerLoop receives and validates ProbingDirective messages from the orchestrator.
-// After MaxConsecutiveDecodeErrors consecutive JSON failures the connection is
+// After MaxConsecutiveDecodeErrors consecutive decoding failures the connection is
 // terminated (set to 0 to disable). Read timeouts are not errors: ReadDeadline
 // only wakes the loop periodically to observe ctx cancellation, and a dead
 // orchestrator is detected by TCP keepalive, which surfaces as a read error.
@@ -191,7 +215,6 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
-
 		var pd api.ProbingDirective
 		if err := decoder.Decode(&pd); err != nil {
 			if ctx.Err() != nil {
@@ -199,11 +222,71 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
-				// json.Decoder caches read errors and never reads again, so
-				// rebuild it, keeping any bytes of a partially received PD.
 				decoder = json.NewDecoder(io.MultiReader(decoder.Buffered(), conn))
 				continue
 			}
+			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
+			consecutiveDecodeErrors = newCount
+			if !shouldContinue {
+				return handledErr
+			}
+			continue
+		}
+		consecutiveDecodeErrors = 0
+		a.metrics.PDsReceivedTotal.Inc()
+		if err := validatePD(&pd); err != nil {
+			a.logger.Warn("Invalid directive", slog.Any("err", err))
+			a.metrics.PDsInvalidTotal.Inc()
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case pds <- &pd:
+			a.pdsDepth.Add(1)
+			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
+		}
+	}
+}
+
+func (a *agent) readerLoopWithReader(ctx context.Context, conn net.Conn, reader *bufio.Reader, pds chan<- *api.ProbingDirective) error {
+	defer close(pds)
+	consecutiveDecodeErrors := 0
+	var pending []byte
+
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(a.config.ReadDeadline)); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+
+		fragment, err := reader.ReadSlice('\n')
+		pending = append(pending, fragment...)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
+			consecutiveDecodeErrors = newCount
+			if !shouldContinue {
+				return handledErr
+			}
+			continue
+		}
+		if len(bytes.TrimSpace(pending)) == 0 {
+			pending = pending[:0]
+			continue
+		}
+
+		pd, err := decodePDRecord(string(pending), a.config.AgentID)
+		pending = pending[:0]
+		if err != nil {
 			shouldContinue, newCount, handledErr := a.handleDecodeError(ctx, err, consecutiveDecodeErrors)
 			consecutiveDecodeErrors = newCount
 			if !shouldContinue {
@@ -215,7 +298,7 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		consecutiveDecodeErrors = 0
 		a.metrics.PDsReceivedTotal.Inc()
 
-		if err := validatePD(&pd); err != nil {
+		if err := validatePD(pd); err != nil {
 			a.logger.Warn("Invalid directive", slog.Any("err", err))
 			a.metrics.PDsInvalidTotal.Inc()
 			continue
@@ -229,14 +312,14 @@ func (a *agent) readerLoop(ctx context.Context, conn net.Conn, pds chan<- *api.P
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case pds <- &pd:
+		case pds <- pd:
 			a.pdsDepth.Add(1)
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
 		}
 	}
 }
 
-// handleDecodeError classifies a JSON decode error and decides whether to retry.
+// handleDecodeError classifies a wire decode error and decides whether to retry.
 // Timeouts are handled by the caller. Returns (shouldContinue, updatedErrorCount, errorToReturn).
 func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErrors int) (bool, int, error) {
 	// Check for context cancellation first, regardless of error type.
@@ -249,7 +332,7 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 		return false, consecutiveErrors, fmt.Errorf("connection lost while reading: %w", err)
 	}
 
-	// Malformed JSON — log and potentially skip
+	// Malformed record — log and potentially skip
 	consecutiveErrors++
 	a.metrics.DecodeErrorsTotal.Inc()
 
@@ -270,7 +353,8 @@ func (a *agent) handleDecodeError(ctx context.Context, err error, consecutiveErr
 	return true, consecutiveErrors, nil
 }
 
-// processorLoop dispatches incoming directives to processPD goroutines.
+// processorLoop dispatches incoming directives to processPD goroutines, at
+// most MaxInflightPDs at a time when that limit is set.
 // A WaitGroup ensures all in-flight goroutines finish before fies is closed,
 // preventing a send-on-closed-channel panic.
 func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirective, fies chan<- *api.ForwardingInfoElement) error {
@@ -279,6 +363,14 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 		wg.Wait()
 		close(fies)
 	}()
+
+	// slots bounds the number of in-flight PDs. While it is full this loop
+	// stops taking PDs, readerLoop blocks on the pds channel, and the
+	// orchestrator sees the backpressure on its side of the connection.
+	var slots chan struct{}
+	if a.config.MaxInflightPDs > 0 {
+		slots = make(chan struct{}, a.config.MaxInflightPDs)
+	}
 
 	for {
 		select {
@@ -290,8 +382,18 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 			}
 			a.pdsDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("pds").Set(float64(a.pdsDepth.Load()))
+			if slots != nil {
+				select {
+				case slots <- struct{}{}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			a.metrics.PDGoroutines.Inc()
 			wg.Go(func() {
+				if slots != nil {
+					defer func() { <-slots }()
+				}
 				a.processPD(ctx, pd, fies)
 			})
 		}
@@ -300,6 +402,32 @@ func (a *agent) processorLoop(ctx context.Context, pds <-chan *api.ProbingDirect
 
 func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.ForwardingInfoElement) error {
 	encoder := json.NewEncoder(conn)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case fie, ok := <-fies:
+			if !ok {
+				return nil
+			}
+			a.fiesDepth.Add(-1)
+			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
+			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
+				return fmt.Errorf("failed to set write deadline: %w", err)
+			}
+			if err := encoder.Encode(fie); err != nil {
+				a.metrics.WriteErrorsTotal.Inc()
+				if isNetworkError(err) {
+					return fmt.Errorf("connection lost while writing: %w", err)
+				}
+				return fmt.Errorf("failed to encode FIE: %w", err)
+			}
+			a.metrics.FIEsSentTotal.Inc()
+		}
+	}
+}
+
+func (a *agent) writerLoopWithWriter(ctx context.Context, conn net.Conn, writer *bufio.Writer, fies <-chan *api.ForwardingInfoElement) error {
 
 	for {
 		select {
@@ -317,7 +445,11 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 				return fmt.Errorf("failed to set write deadline: %w", err)
 			}
 
-			if err := encoder.Encode(fie); err != nil {
+			_, err := writer.WriteString(encodeFIERecord(fie))
+			if err == nil {
+				err = writer.Flush()
+			}
+			if err != nil {
 				a.metrics.WriteErrorsTotal.Inc()
 				if isNetworkError(err) {
 					return fmt.Errorf("connection lost while writing: %w", err)

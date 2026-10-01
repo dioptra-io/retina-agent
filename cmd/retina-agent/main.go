@@ -64,6 +64,7 @@ var (
 
 	pdsBufferSize  = flag.Int("pds-buffer", envOrDefaultInt("RETINA_PDS_BUFFER", 100), "Directives channel buffer size")
 	fiesBufferSize = flag.Int("fies-buffer", envOrDefaultInt("RETINA_FIES_BUFFER", 100), "FIEs channel buffer size")
+	maxInflightPDs = flag.Int("max-inflight-pds", envOrDefaultInt("RETINA_MAX_INFLIGHT_PDS", 0), "Maximum number of PDs processed at the same time; when reached the agent stops reading PDs until one finishes (0 for no limit)")
 
 	readDeadline        = flag.Duration("read-deadline", envOrDefaultDuration("RETINA_READ_DEADLINE", 10*time.Second), "Interval at which the reader checks for shutdown while the orchestrator is idle (not an idle timeout)")
 	writeDeadline       = flag.Duration("write-deadline", envOrDefaultDuration("RETINA_WRITE_DEADLINE", 5*time.Second), "Write timeout for orchestrator connection")
@@ -111,6 +112,7 @@ func main() {
 		CleanupInterval:            *cleanupInterval,
 		PDsBufferSize:              *pdsBufferSize,
 		FIEsBufferSize:             *fiesBufferSize,
+		MaxInflightPDs:             *maxInflightPDs,
 		ReadDeadline:               *readDeadline,
 		WriteDeadline:              *writeDeadline,
 		ProbeTimeout:               *probeTimeout,

@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1183,6 +1184,114 @@ func TestProcessorLoop_ProcessesPD(t *testing.T) {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
 		t.Error("processorLoop goroutine did not finish")
+	}
+}
+
+func TestProcessorLoop_MaxInflightPDs(t *testing.T) {
+	t.Parallel()
+
+	const limit = 2
+
+	var inflight, peak atomic.Int64
+	release := make(chan struct{})
+	a := &agent{
+		config: &Config{AgentID: "test", MaxInflightPDs: limit},
+		prober: &stubProber{probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+			n := inflight.Add(1)
+			for {
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			<-release
+			inflight.Add(-1)
+			return &ProbeResult{ReplyAddress: net.ParseIP("1.1.1.1"), SentTime: time.Now(), ReceivedTime: time.Now()}, nil
+		}},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	const total = 6
+	pds := make(chan *api.ProbingDirective, 1)
+	fies := make(chan *api.ForwardingInfoElement, total)
+
+	done := make(chan error, 1)
+	go func() { done <- a.processorLoop(context.Background(), pds, fies) }()
+
+	// limit PDs start, one more is held by the loop waiting for a slot and one
+	// sits in the channel buffer. The next send must block: this is what stalls
+	// readerLoop and, through it, the connection.
+	pd := &api.ProbingDirective{AgentID: "test", NearTTL: 5, DestinationAddress: []byte{1, 2, 3, 4}}
+	for range limit + 2 {
+		select {
+		case pds <- pd:
+		case <-time.After(time.Second):
+			t.Fatal("processorLoop stopped taking PDs before the limit was reached")
+		}
+	}
+	select {
+	case pds <- pd:
+		t.Fatal("processorLoop took a PD beyond the in-flight limit")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Each PD runs two probes (near and far).
+	if got := peak.Load(); got != 2*limit {
+		t.Errorf("peak concurrent probes = %d, want %d", got, 2*limit)
+	}
+
+	close(release)
+	for range total - (limit + 2) {
+		pds <- pd
+	}
+	close(pds)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("processorLoop = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("processorLoop did not finish")
+	}
+	if got := len(fies); got != total {
+		t.Errorf("FIEs produced = %d, want %d", got, total)
+	}
+}
+
+func TestProcessorLoop_MaxInflightPDs_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	a := &agent{
+		config: &Config{AgentID: "test", MaxInflightPDs: 1},
+		prober: &stubProber{probeFunc: func(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}},
+		logger:  testLogger(),
+		metrics: testMetrics(),
+	}
+
+	pds := make(chan *api.ProbingDirective, 2)
+	pd := &api.ProbingDirective{AgentID: "test", NearTTL: 5, DestinationAddress: []byte{1, 2, 3, 4}}
+	pds <- pd
+	pds <- pd // waits for the slot held by the first PD
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.processorLoop(ctx, pds, make(chan *api.ForwardingInfoElement, 2)) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("processorLoop = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("processorLoop did not return after cancellation")
 	}
 }
 

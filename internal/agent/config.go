@@ -33,7 +33,7 @@ type Config struct {
 	WriteDeadline       time.Duration
 	MaxReconnectBackoff time.Duration
 	// MaxConsecutiveDecodeErrors is the maximum number of consecutive
-	// JSON decoding errors before terminating the connection to the orchestrator.
+	// CSV decoding errors before terminating the connection to the orchestrator.
 	// Set to 0 to never terminate on decode errors (always skip and log).
 	MaxConsecutiveDecodeErrors int
 
@@ -55,6 +55,10 @@ type Config struct {
 
 	PDsBufferSize  int
 	FIEsBufferSize int
+	// MaxInflightPDs caps how many PDs are processed at the same time. When
+	// the cap is reached the agent stops reading PDs from the orchestrator
+	// until one finishes. Zero means no limit.
+	MaxInflightPDs int
 }
 
 // DefaultConfig returns a configuration with sensible defaults for production use.
@@ -173,6 +177,9 @@ func (c *Config) validateBuffers() error {
 	}
 	if c.FIEsBufferSize <= 0 {
 		return fmt.Errorf("FIEs buffer size must be positive, got: %d", c.FIEsBufferSize)
+	}
+	if c.MaxInflightPDs < 0 {
+		return fmt.Errorf("max in-flight PDs cannot be negative, got: %d", c.MaxInflightPDs)
 	}
 	return nil
 }
