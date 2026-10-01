@@ -174,15 +174,11 @@ Useful identities when something looks off:
 
 - **Orchestrator silent**: fine indefinitely; keepalive detects a dead peer in
   about a minute.
-- **Orchestrator stops reading FIEs** (its scheduler update channel or capture
-  channel is full): the agent's writer hits the 5 s write deadline → run ends →
-  reconnect, caracal restarted, all in-flight PDs lost.
-- **Same agent ID connected twice**: the orchestrator accepts auth and then
-  closes; this agent logs "authenticated successfully" followed by "connection
-  lost while reading: EOF" and backs off.
-- **Agent slow to read PDs**: the orchestrator buffers at most
-  `--pd-queue-size` PDs per agent. It then waits for at most
-  `--pd-push-timeout`; a timeout is counted in `pds_dropped_total`.
+- **Orchestrator stops reading FIEs** (its capture queue is full): the agent's writer waits, with no deadline. The FIE channel fills, in-flight PDs stay in flight, and at `--max-inflight-pds` the agent stops reading PDs. Nothing is dropped and the connection stays up.
+- **Same agent ID connected twice**: the orchestrator accepts auth and then closes the second connection; that agent logs "authenticated successfully" followed by "connection lost while reading: EOF" and backs off.
+- **Agent slow to read PDs**: the orchestrator has no send deadline and drops nothing. It stops issuing this agent's PDs until the agent reads again, then sends the overdue ones in order, each once. Other agents are not affected.
+- **PD batching**: the orchestrator buffers PDs and sends them when its buffer fills or every 100 ms by default, so PDs arrive in groups and up to that much after they were due.
+- **PD IDs are 32-bit**: a PD whose ID does not fit in `uint32` is counted as a decode error and skipped.
 
 ## 6. Repo map
 
