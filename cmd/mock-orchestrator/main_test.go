@@ -132,7 +132,7 @@ func (e *errorDeadlineConn) SetReadDeadline(t time.Time) error {
 // -- test helpers -------------------------------------------------------------
 
 // createTestFIE creates a ForwardingInfoElement for testing.
-func createTestFIE(pdID uint64) api.ForwardingInfoElement {
+func createTestFIE(pdID uint32) api.ForwardingInfoElement {
 	now := time.Now()
 	return api.ForwardingInfoElement{
 		Agent:              api.Agent{AgentID: "test-agent"},
@@ -278,7 +278,7 @@ func TestGeneratePD_CyclingLogic(t *testing.T) {
 			t.Errorf("generatePD(%d): invalid protocol %v", i, pd.Protocol)
 		}
 
-		expectedID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
+		expectedID := uint32(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
 		if pd.ProbingDirectiveID != expectedID {
 			t.Errorf("generatePD(%d): PD ID = %d, want %d", i, pd.ProbingDirectiveID, expectedID)
 		}
@@ -704,7 +704,7 @@ func TestHandleAgent_MultipleProtocols(t *testing.T) {
 	writeAuthRequest(t, conn, "")
 
 	for i := 0; i < 10; i++ {
-		pdID := uint64(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
+		pdID := uint32(i + 1) // #nosec G115 -- i is test loop counter, safe conversion
 		fie := createTestFIE(pdID)
 		encodeFIE(t, conn, &fie)
 	}

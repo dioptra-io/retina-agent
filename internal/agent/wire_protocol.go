@@ -31,7 +31,8 @@ func decodePDRecord(line string, agentID string) (*api.ProbingDirective, error) 
 		return nil, fmt.Errorf("invalid PD CSV: got %d fields, want %d", len(record), pdWireFields)
 	}
 
-	id, err := strconv.ParseUint(record[0], 10, 64)
+	// PD IDs are 32-bit.
+	id, err := strconv.ParseUint(record[0], 10, 32)
 	if err != nil {
 		return nil, fmt.Errorf("invalid probing directive ID %q: %w", record[0], err)
 	}
@@ -57,7 +58,7 @@ func decodePDRecord(line string, agentID string) (*api.ProbingDirective, error) 
 	}
 
 	pd := &api.ProbingDirective{
-		ProbingDirectiveID: id,
+		ProbingDirectiveID: uint32(id),
 		AgentID:            agentID,
 		DestinationAddress: destination,
 		NearTTL:            nearTTL,
@@ -88,7 +89,7 @@ func encodeFIERecord(fie *api.ForwardingInfoElement) string {
 	capture := fie.ProductionTimestamp.UTC()
 	var builder strings.Builder
 	builder.Grow(96)
-	builder.WriteString(strconv.FormatUint(fie.ProbingDirectiveID, 10))
+	builder.WriteString(strconv.FormatUint(uint64(fie.ProbingDirectiveID), 10))
 	builder.WriteByte(',')
 	builder.WriteString(strconv.FormatInt(capture.Unix(), 10))
 	appendFIEInfo(&builder, capture, fie.NearInfo)
@@ -99,7 +100,8 @@ func encodeFIERecord(fie *api.ForwardingInfoElement) string {
 
 func appendFIEInfo(builder *strings.Builder, capture time.Time, info *api.Info) {
 	builder.WriteByte(',')
-	if info == nil {
+	// A reply without an address is encoded as no reply.
+	if info == nil || info.ReplyAddress == nil {
 		builder.WriteString(`"",0`)
 		return
 	}

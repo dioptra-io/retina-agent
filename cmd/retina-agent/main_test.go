@@ -116,7 +116,6 @@ func validConfig() *agent.Config {
 		PDsBufferSize:              100,
 		FIEsBufferSize:             100,
 		ReadDeadline:               60 * time.Second,
-		WriteDeadline:              5 * time.Second,
 		ProbeTimeout:               5 * time.Second,
 		MaxReconnectBackoff:        5 * time.Minute,
 		WriteQueueSize:             1000,
@@ -357,7 +356,6 @@ func TestConfig_Validation(t *testing.T) {
 		{"empty orchestrator address", func(c *agent.Config) { c.OrchestratorAddr = "" }, true},
 		{"invalid prober type", func(c *agent.Config) { c.ProberType = "invalid-type" }, true},
 		{"zero read deadline", func(c *agent.Config) { c.ReadDeadline = 0 }, true},
-		{"zero write deadline", func(c *agent.Config) { c.WriteDeadline = 0 }, true},
 	}
 
 	for _, tt := range tests {

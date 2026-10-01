@@ -404,7 +404,6 @@ func TestRun_WithMockConnection(t *testing.T) {
 			AgentID:                    "test-agent",
 			MaxConsecutiveDecodeErrors: 10,
 			ReadDeadline:               time.Second,
-			WriteDeadline:              time.Second,
 		},
 		prober:  &stubProber{},
 		logger:  testLogger(),
@@ -975,25 +974,6 @@ func TestReaderLoop_RecoversAfterReadTimeout(t *testing.T) {
 }
 
 // -- writerLoop() -------------------------------------------------------------
-
-func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {
-	t.Parallel()
-
-	conn := &stubConn{
-		writeDeadlineFunc: func(time.Time) error {
-			return errors.New("deadline fail")
-		},
-	}
-	a := &agent{config: DefaultConfig(), logger: testLogger(), metrics: testMetrics()}
-
-	fies := make(chan *api.ForwardingInfoElement, 1)
-	fies <- &api.ForwardingInfoElement{}
-
-	err := a.writerLoop(context.Background(), conn, fies)
-	if err == nil || !strings.Contains(err.Error(), "failed to set write deadline") {
-		t.Errorf("writerLoop(deadline fail) = %v", err)
-	}
-}
 
 func TestWriterLoop_ChannelClosed(t *testing.T) {
 	t.Parallel()
@@ -2123,7 +2103,6 @@ func TestRun_AuthenticationFailure(t *testing.T) {
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
 		ReadDeadline:     5 * time.Second,
-		WriteDeadline:    5 * time.Second,
 		ProbeTimeout:     1 * time.Second,
 		WriteQueueSize:   100,
 		CleanupInterval:  1 * time.Second,
@@ -2204,7 +2183,6 @@ func TestRun_AuthenticationSuccess(t *testing.T) {
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
 		ReadDeadline:     5 * time.Second,
-		WriteDeadline:    5 * time.Second,
 		ProbeTimeout:     1 * time.Second,
 		WriteQueueSize:   100,
 		CleanupInterval:  1 * time.Second,
@@ -2281,7 +2259,6 @@ func TestRun_NoAuthentication(t *testing.T) {
 		PDsBufferSize:    10,
 		FIEsBufferSize:   10,
 		ReadDeadline:     5 * time.Second,
-		WriteDeadline:    5 * time.Second,
 		ProbeTimeout:     1 * time.Second,
 		WriteQueueSize:   100,
 		CleanupInterval:  1 * time.Second,

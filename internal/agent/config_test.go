@@ -119,8 +119,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ReadDeadline <= 0 {
 		t.Error("ReadDeadline should be positive")
 	}
-	if cfg.WriteDeadline <= 0 {
-		t.Error("WriteDeadline should be positive")
+	if cfg.MaxConsecutiveDecodeErrors != 0 {
+		t.Error("MaxConsecutiveDecodeErrors should be zero by default (never disconnect)")
 	}
 	if cfg.MaxReconnectBackoff <= 0 {
 		t.Error("MaxReconnectBackoff should be positive")
@@ -342,18 +342,6 @@ func TestValidate_Deadlines(t *testing.T) {
 			setup:   func(c *Config) { c.ReadDeadline = -1 * time.Second },
 			wantErr: true,
 			errMsg:  "read deadline",
-		},
-		{
-			name:    "zero write deadline",
-			setup:   func(c *Config) { c.WriteDeadline = 0 },
-			wantErr: true,
-			errMsg:  "write deadline",
-		},
-		{
-			name:    "negative write deadline",
-			setup:   func(c *Config) { c.WriteDeadline = -1 * time.Second },
-			wantErr: true,
-			errMsg:  "write deadline",
 		},
 	})
 }

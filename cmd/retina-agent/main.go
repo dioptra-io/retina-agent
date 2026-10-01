@@ -64,14 +64,13 @@ var (
 
 	pdsBufferSize  = flag.Int("pds-buffer", envOrDefaultInt("RETINA_PDS_BUFFER", 100), "Directives channel buffer size")
 	fiesBufferSize = flag.Int("fies-buffer", envOrDefaultInt("RETINA_FIES_BUFFER", 100), "FIEs channel buffer size")
-	maxInflightPDs = flag.Int("max-inflight-pds", envOrDefaultInt("RETINA_MAX_INFLIGHT_PDS", 0), "Maximum number of PDs processed at the same time; when reached the agent stops reading PDs until one finishes (0 for no limit)")
+	maxInflightPDs = flag.Int("max-inflight-pds", envOrDefaultInt("RETINA_MAX_INFLIGHT_PDS", 100_000), "Maximum number of PDs processed at the same time; when reached the agent stops reading PDs until one finishes (0 for no limit)")
 
 	readDeadline        = flag.Duration("read-deadline", envOrDefaultDuration("RETINA_READ_DEADLINE", 10*time.Second), "Interval at which the reader checks for shutdown while the orchestrator is idle (not an idle timeout)")
-	writeDeadline       = flag.Duration("write-deadline", envOrDefaultDuration("RETINA_WRITE_DEADLINE", 5*time.Second), "Write timeout for orchestrator connection")
 	probeTimeout        = flag.Duration("probe-timeout", envOrDefaultDuration("RETINA_PROBE_TIMEOUT", 5*time.Second), "Timeout for individual probe responses")
 	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", envOrDefaultDuration("RETINA_MAX_RECONNECT_BACKOFF", 5*time.Minute), "Maximum wait time between reconnection attempts")
 
-	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", envOrDefaultInt("RETINA_MAX_CONSECUTIVE_DECODE_ERRORS", 3), "Maximum consecutive decode errors before reconnecting (0 to disable)")
+	maxConsecutiveDecodeErrors = flag.Int("max-consecutive-decode-errors", envOrDefaultInt("RETINA_MAX_CONSECUTIVE_DECODE_ERRORS", 0), "Maximum consecutive decode errors before reconnecting (0 to disable)")
 
 	logLevel    = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	metricsAddr = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
@@ -114,7 +113,6 @@ func main() {
 		FIEsBufferSize:             *fiesBufferSize,
 		MaxInflightPDs:             *maxInflightPDs,
 		ReadDeadline:               *readDeadline,
-		WriteDeadline:              *writeDeadline,
 		ProbeTimeout:               *probeTimeout,
 		MaxReconnectBackoff:        *maxReconnectBackoff,
 		MaxConsecutiveDecodeErrors: *maxConsecutiveDecodeErrors,

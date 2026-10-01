@@ -290,7 +290,7 @@ func generatePD(counter int) *api.ProbingDirective {
 
 	// ProbingDirectiveID is 1-indexed so that ID 0 is never used.
 	pd := &api.ProbingDirective{
-		ProbingDirectiveID: uint64(counter + 1), // #nosec G115 -- counter is test value, no overflow
+		ProbingDirectiveID: uint32(counter + 1), // #nosec G115 -- counter is test value, no overflow
 		AgentID:            "agent-1",
 		IPVersion:          ipVersion,
 		DestinationAddress: dstIP,

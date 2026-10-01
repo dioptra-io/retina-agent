@@ -49,6 +49,7 @@ func TestDecodePDRecordRejectsInvalidRows(t *testing.T) {
 		`1,"1.1.1.1",256,1,0,0`,
 		`1,"1.1.1.1",3,99,0,0`,
 		`1,"1.1.1.1",3,1,0`,
+		`4294967296,"1.1.1.1",3,1,0,0`, // PD IDs are 32-bit
 	} {
 		if _, err := decodePDRecord(line+"\n", "agent"); err == nil {
 			t.Errorf("decodePDRecord(%q) succeeded", line)
@@ -98,7 +99,7 @@ func TestCSVWriterLoop(t *testing.T) {
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 	defer func() { _ = client.Close() }()
-	a := &agent{config: &Config{WriteDeadline: time.Second}, logger: testLogger(), metrics: testMetrics()}
+	a := &agent{config: &Config{}, logger: testLogger(), metrics: testMetrics()}
 	fies := make(chan *api.ForwardingInfoElement, 1)
 	fies <- &api.ForwardingInfoElement{ProbingDirectiveID: 9, ProductionTimestamp: time.Unix(10, 0)}
 	close(fies)

@@ -128,6 +128,12 @@ func Run(ctx context.Context, cfg *Config, logger *slog.Logger, metrics *Metrics
 
 	g, ctx := errgroup.WithContext(ctx)
 
+	// FIE writes have no deadline, so that the writer waits for as long as
+	// the orchestrator applies backpressure. Closing the connection is what
+	// unblocks it on shutdown.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
 	g.Go(func() error { return a.readerLoopWithReader(ctx, conn, reader, pds) })
 	g.Go(func() error { return a.processorLoop(ctx, pds, fies) })
 	g.Go(func() error { return a.writerLoopWithWriter(ctx, conn, writer, fies) })
@@ -305,7 +311,7 @@ func (a *agent) readerLoopWithReader(ctx context.Context, conn net.Conn, reader 
 		}
 
 		a.logger.Debug("← PD received",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.Uint64("pd_id", uint64(pd.ProbingDirectiveID)),
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("near_ttl", int(pd.NearTTL)))
 
@@ -412,9 +418,6 @@ func (a *agent) writerLoop(ctx context.Context, conn net.Conn, fies <-chan *api.
 			}
 			a.fiesDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
-			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
-				return fmt.Errorf("failed to set write deadline: %w", err)
-			}
 			if err := encoder.Encode(fie); err != nil {
 				a.metrics.WriteErrorsTotal.Inc()
 				if isNetworkError(err) {
@@ -441,10 +444,6 @@ func (a *agent) writerLoopWithWriter(ctx context.Context, conn net.Conn, writer 
 			a.fiesDepth.Add(-1)
 			a.metrics.ChannelDepth.WithLabelValues("fies").Set(float64(a.fiesDepth.Load()))
 
-			if err := conn.SetWriteDeadline(time.Now().Add(a.config.WriteDeadline)); err != nil {
-				return fmt.Errorf("failed to set write deadline: %w", err)
-			}
-
 			_, err := writer.WriteString(encodeFIERecord(fie))
 			if err == nil {
 				err = writer.Flush()
@@ -459,7 +458,7 @@ func (a *agent) writerLoopWithWriter(ctx context.Context, conn net.Conn, writer 
 
 			a.metrics.FIEsSentTotal.Inc()
 			a.logger.Debug("→ FIE sent",
-				slog.Uint64("pd_id", fie.ProbingDirectiveID),
+				slog.Uint64("pd_id", uint64(fie.ProbingDirectiveID)),
 				slog.String("dest", fie.DestinationAddress.String()),
 				slog.Bool("near_timeout", fie.NearInfo == nil),
 				slog.Bool("far_timeout", fie.FarInfo == nil))
@@ -499,7 +498,7 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			return // probe already in-flight for this destination/TTL/second
 		}
 		a.logger.Error("Near probe failed",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.Uint64("pd_id", uint64(pd.ProbingDirectiveID)),
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(nearTTL)),
 			slog.Any("err", nearRes.err))
@@ -513,7 +512,7 @@ func (a *agent) processPD(ctx context.Context, pd *api.ProbingDirective, fies ch
 			return // probe already in-flight for this destination/TTL/second
 		}
 		a.logger.Error("Far probe failed",
-			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.Uint64("pd_id", uint64(pd.ProbingDirectiveID)),
 			slog.String("dest", pd.DestinationAddress.String()),
 			slog.Int("ttl", int(farTTL)),
 			slog.Any("err", farRes.err))

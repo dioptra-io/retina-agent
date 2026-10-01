@@ -28,9 +28,7 @@ type Config struct {
 	// from the orchestrator, to check for shutdown. It is not an idle timeout:
 	// the connection is kept open through arbitrarily long silences, and a dead
 	// orchestrator is detected by TCP keepalive instead.
-	ReadDeadline time.Duration
-	// WriteDeadline is the timeout for sending messages to orchestrator.
-	WriteDeadline       time.Duration
+	ReadDeadline        time.Duration
 	MaxReconnectBackoff time.Duration
 	// MaxConsecutiveDecodeErrors is the maximum number of consecutive
 	// CSV decoding errors before terminating the connection to the orchestrator.
@@ -67,9 +65,9 @@ func DefaultConfig() *Config {
 		AgentID:                    "agent-1",
 		OrchestratorAddr:           "localhost:50050",
 		ReadDeadline:               10 * time.Second,
-		WriteDeadline:              5 * time.Second,
 		MaxReconnectBackoff:        5 * time.Minute,
-		MaxConsecutiveDecodeErrors: 3,
+		MaxConsecutiveDecodeErrors: 0,
+		MaxInflightPDs:             100_000,
 
 		ProberType:      ProberTypeMock,
 		WriteQueueSize:  1000,
@@ -113,9 +111,6 @@ func (c *Config) validateConnection() error {
 
 	if c.ReadDeadline <= 0 {
 		return fmt.Errorf("read deadline must be positive, got: %v", c.ReadDeadline)
-	}
-	if c.WriteDeadline <= 0 {
-		return fmt.Errorf("write deadline must be positive, got: %v", c.WriteDeadline)
 	}
 	if c.MaxReconnectBackoff <= 0 {
 		return fmt.Errorf("max reconnect backoff must be positive, got: %v", c.MaxReconnectBackoff)

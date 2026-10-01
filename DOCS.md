@@ -59,8 +59,7 @@ conn ──► readerLoop ──pds chan──► processorLoop ──fies chan�
   timeout is **not** an error: it only lets the loop notice shutdown. Partial
   records are retained across those timeout wakeups.
 - Real network errors (including EOF) end the run → reconnect.
-- Malformed CSV is counted; `--max-consecutive-decode-errors` (3) in a row ends
-  the run.
+- Malformed CSV is counted and skipped. The connection is kept by default; a positive `--max-consecutive-decode-errors` (default 0) ends the run after that many in a row.
 - Blank records are ignored. This is required at the JSON/CSV boundary because
   the handshake decoder may leave its terminating newline buffered.
 - `validatePD` drops PDs with empty agent ID, nil destination, TTL 0 or 255,
@@ -87,10 +86,7 @@ Runs the near and far probes concurrently and waits for both.
 
 ### writerLoop (`internal/agent/agent.go`)
 
-Encodes each FIE as compact CSV and flushes it with a `--write-deadline` (5 s).
-Any encode or flush
-error ends the run → reconnect. This is where orchestrator-side backpressure
-surfaces on the agent.
+Encodes each FIE as compact CSV and flushes it. There is no write deadline, so when the orchestrator stops reading the writer waits instead of disconnecting; the connection is closed on shutdown to unblock it. Any encode or flush error ends the run → reconnect.
 
 ## 3. Probers
 

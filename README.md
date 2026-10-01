@@ -84,12 +84,11 @@ compatible with this protocol version.
 | `--cleanup-interval` | `10s` | Prober stale probe cleanup interval |
 | `--pds-buffer` | `100` | Directives channel buffer size |
 | `--fies-buffer` | `100` | FIEs channel buffer size |
-| `--max-inflight-pds` | `0` | Maximum concurrently processed PDs; `0` is unlimited |
+| `--max-inflight-pds` | `100000` | Maximum concurrently processed PDs; `0` is unlimited |
 | `--read-deadline` | `10s` | Shutdown-check interval while the orchestrator is idle (not an idle timeout) |
-| `--write-deadline` | `5s` | Write timeout for orchestrator connection |
 | `--probe-timeout` | `5s` | Timeout for individual probe responses |
 | `--max-reconnect-backoff` | `5m` | Maximum wait time between reconnection attempts |
-| `--max-consecutive-decode-errors` | `3` | Max consecutive decode errors before reconnecting (0 to disable) |
+| `--max-consecutive-decode-errors` | `0` | Max consecutive decode errors before reconnecting (0 to disable) |
 | `--log-level` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `--metrics-addr` | `:9312` | Address to expose Prometheus metrics on |
 
@@ -116,12 +115,11 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_CLEANUP_INTERVAL`              | `10s`             | Prober stale probe cleanup interval                              |
 | `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
 | `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
-| `RETINA_MAX_INFLIGHT_PDS`              | `0`               | Maximum concurrently processed PDs; `0` is unlimited             |
+| `RETINA_MAX_INFLIGHT_PDS`              | `100000`          | Maximum concurrently processed PDs; `0` is unlimited             |
 | `RETINA_READ_DEADLINE`                 | `10s`             | Shutdown-check interval while the orchestrator is idle           |
-| `RETINA_WRITE_DEADLINE`                | `5s`              | Write timeout for orchestrator connection                        |
 | `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
 | `RETINA_MAX_RECONNECT_BACKOFF`         | `5m`              | Maximum wait between reconnection attempts                       |
-| `RETINA_MAX_CONSECUTIVE_DECODE_ERRORS` | `3`               | Max consecutive decode errors before reconnecting (0 to disable) |
+| `RETINA_MAX_CONSECUTIVE_DECODE_ERRORS` | `0`               | Max consecutive decode errors before reconnecting (0 to disable) |
 | `RETINA_LOG_LEVEL`                     | `info`            | Log level (`debug`, `info`, `warn`, `error`)                     |
 | `RETINA_METRICS_ADDR`                  | `:9312`           | Address to expose Prometheus metrics on                          |
 
