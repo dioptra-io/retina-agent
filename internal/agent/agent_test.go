@@ -899,6 +899,80 @@ func TestReaderLoop_SuccessfulRead(t *testing.T) {
 	}
 }
 
+// TestReaderLoop_RecoversAfterReadTimeout guards against json.Decoder caching
+// the first read timeout: data arriving after an idle gap longer than
+// ReadDeadline must still be decoded, including a PD split across the gap.
+func TestReaderLoop_RecoversAfterReadTimeout(t *testing.T) {
+	t.Parallel()
+
+	validJSON, _ := json.Marshal(&api.ProbingDirective{
+		AgentID:            "test",
+		NearTTL:            5,
+		DestinationAddress: []byte{1, 2, 3, 4},
+		Protocol:           api.ICMP,
+		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+	})
+	validJSON = append(validJSON, '\n')
+	half := len(validJSON) / 2
+
+	tests := []struct {
+		name   string
+		chunks [][]byte
+	}{
+		{"idle then PD", [][]byte{validJSON}},
+		{"PD split across timeout", [][]byte{validJSON[:half], validJSON[half:]}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const readDeadline = 20 * time.Millisecond
+			a := &agent{
+				config:  &Config{AgentID: "test-agent", ReadDeadline: readDeadline},
+				logger:  testLogger(),
+				metrics: testMetrics(),
+			}
+
+			server, client := net.Pipe()
+			defer func() { _ = server.Close() }()
+
+			go func() {
+				for _, chunk := range tt.chunks {
+					time.Sleep(3 * readDeadline)
+					if _, err := server.Write(chunk); err != nil {
+						return
+					}
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pds := make(chan *api.ProbingDirective, 1)
+			done := make(chan error, 1)
+			go func() { done <- a.readerLoop(ctx, client, pds) }()
+
+			select {
+			case pd, ok := <-pds:
+				if !ok {
+					t.Fatalf("readerLoop exited before receiving PD: %v", <-done)
+				}
+				if pd.NearTTL != 5 || pd.AgentID != "test" {
+					t.Errorf("readerLoop got %+v, want TTL=5 AgentID=test", pd)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("readerLoop did not send directive")
+			}
+
+			select {
+			case err := <-done:
+				t.Fatalf("readerLoop exited on a healthy connection: %v", err)
+			default:
+			}
+		})
+	}
+}
+
 // -- writerLoop() -------------------------------------------------------------
 
 func TestWriterLoop_SetWriteDeadlineFail(t *testing.T) {

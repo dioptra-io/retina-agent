@@ -65,7 +65,7 @@ var (
 	pdsBufferSize  = flag.Int("pds-buffer", envOrDefaultInt("RETINA_PDS_BUFFER", 100), "Directives channel buffer size")
 	fiesBufferSize = flag.Int("fies-buffer", envOrDefaultInt("RETINA_FIES_BUFFER", 100), "FIEs channel buffer size")
 
-	readDeadline        = flag.Duration("read-deadline", envOrDefaultDuration("RETINA_READ_DEADLINE", 10*time.Second), "Read timeout for orchestrator connection")
+	readDeadline        = flag.Duration("read-deadline", envOrDefaultDuration("RETINA_READ_DEADLINE", 10*time.Second), "Interval at which the reader checks for shutdown while the orchestrator is idle (not an idle timeout)")
 	writeDeadline       = flag.Duration("write-deadline", envOrDefaultDuration("RETINA_WRITE_DEADLINE", 5*time.Second), "Write timeout for orchestrator connection")
 	probeTimeout        = flag.Duration("probe-timeout", envOrDefaultDuration("RETINA_PROBE_TIMEOUT", 5*time.Second), "Timeout for individual probe responses")
 	maxReconnectBackoff = flag.Duration("max-reconnect-backoff", envOrDefaultDuration("RETINA_MAX_RECONNECT_BACKOFF", 5*time.Minute), "Maximum wait time between reconnection attempts")
