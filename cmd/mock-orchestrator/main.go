@@ -1,7 +1,8 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
-// Command mock-orchestrator simulates a network measurement orchestrator for testing retina-agent.
+// Command mock-orchestrator is a legacy JSON-data-phase test utility.
+// It is not compatible with the current compact-CSV data phase used after authentication.
 //
 // Usage:
 //

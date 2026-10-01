@@ -6,10 +6,19 @@ and the orchestrator side, see `retina-orchestrator/DOCS.md`.
 ## 1. What the agent does
 
 It dials the orchestrator over TCP, authenticates, and then exchanges
-newline-delimited JSON on that single connection:
+newline-delimited JSON for authentication, followed by compact CSV records on
+that single connection:
 
 - orchestrator → agent: `ProbingDirective` (PD)
 - agent → orchestrator: `ForwardingInfoElement` (FIE)
+
+After authentication, PD records contain
+`id,"destination",near_ttl,protocol,first_half_word,second_half_word`. FIE
+records contain `id,capture_unix,"near_address",near_delta,"far_address",far_delta`.
+The header half-words preserve ICMP/ICMPv6 correlation values or UDP ports.
+Each FIE delta is `capture_unix - received_timestamp` in whole seconds; missing
+observations use `"",0`. Sent timestamps are not transmitted, so the
+orchestrator reconstructs them equal to received timestamps.
 
 For every PD it sends two probes toward `destination_address` — one at
 `near_ttl`, one at `near_ttl + 1` — and reports which router answered each.
@@ -21,13 +30,13 @@ For every PD it sends two probes toward `destination_address` — one at
 `--metrics-addr` (default `:9312`, the same default as the orchestrator), then
 `runWithReconnect`.
 
-`runWithReconnect` ([main.go:223](cmd/retina-agent/main.go:223)) calls
+`runWithReconnect` (`cmd/retina-agent/main.go`) calls
 `agent.Run` in a loop. Any return other than shutdown counts as a lost
 connection: `reconnections_total` is incremented and it sleeps with exponential
 backoff (1 s, doubling, capped at `--max-reconnect-backoff` = 5 min; reset when
 the previous run lasted ≥ 1 s).
 
-`agent.Run` ([agent.go:68](internal/agent/agent.go:68)) per connection attempt:
+`agent.Run` (`internal/agent/agent.go`) per connection attempt:
 
 1. **Creates a new prober** (for caracal: spawns a new subprocess). It is closed
    — the subprocess killed — when `Run` returns, so every reconnect restarts
@@ -44,26 +53,28 @@ conn ──► readerLoop ──pds chan──► processorLoop ──fies chan�
                                  prober.Probe ×2 (near, far)
 ```
 
-### readerLoop ([agent.go:185](internal/agent/agent.go:185))
+### readerLoop (`internal/agent/agent.go`)
 
-- Sets a read deadline of `--read-deadline` (10 s) before each decode. A timeout
-  is **not** an error: it only lets the loop notice shutdown. Because
-  `json.Decoder` latches errors, the decoder is rebuilt from its buffered bytes
-  plus the connection.
+- Sets a read deadline of `--read-deadline` (10 s) before each CSV record. A
+  timeout is **not** an error: it only lets the loop notice shutdown. Partial
+  records are retained across those timeout wakeups.
 - Real network errors (including EOF) end the run → reconnect.
-- Malformed JSON is counted; `--max-consecutive-decode-errors` (3) in a row ends
+- Malformed CSV is counted; `--max-consecutive-decode-errors` (3) in a row ends
   the run.
+- Blank records are ignored. This is required at the JSON/CSV boundary because
+  the handshake decoder may leave its terminating newline buffered.
 - `validatePD` drops PDs with empty agent ID, nil destination, TTL 0 or 255,
   unsupported protocol, or missing next header (`pds_invalid_total`).
 - Closes `pds` on exit, which lets the processor finish.
 
-### processorLoop ([agent.go:276](internal/agent/agent.go:276))
+### processorLoop (`internal/agent/agent.go`)
 
-Spawns **one goroutine per PD with no upper bound** (`pd_goroutines` gauge). The
-`pds` channel (size `--pds-buffer`, 100) therefore never really backs up; the
-concurrency limit is whatever the prober imposes.
+Spawns one goroutine per active PD (`pd_goroutines` gauge). When
+`--max-inflight-pds` is positive, a semaphore enforces that limit; when it is
+zero, concurrency is unlimited. A full semaphore stops `processorLoop` from
+draining `pds`, which propagates TCP backpressure toward the orchestrator.
 
-### processPD ([agent.go:341](internal/agent/agent.go:341))
+### processPD (`internal/agent/agent.go`)
 
 Runs the near and far probes concurrently and waits for both.
 
@@ -74,9 +85,10 @@ Runs the near and far probes concurrently and waits for both.
 - `ProductionTimestamp` is the agent's clock at build time. `SourceAddress` is
   never set.
 
-### writerLoop ([agent.go:301](internal/agent/agent.go:301))
+### writerLoop (`internal/agent/agent.go`)
 
-Encodes each FIE with a `--write-deadline` (5 s) write deadline. Any encode
+Encodes each FIE as compact CSV and flushes it with a `--write-deadline` (5 s).
+Any encode or flush
 error ends the run → reconnect. This is where orchestrator-side backpressure
 surfaces on the agent.
 
@@ -91,7 +103,7 @@ blocks until reply, internal timeout (`TimedOut=true`, no error), duplicate
 Sleeps 10–100 ms, times out 10 % of the time, otherwise replies from the
 destination address itself (so near and far are identical).
 
-### caracalProber ([caracal_prober.go](internal/agent/caracal_prober.go))
+### caracalProber (`internal/agent/caracal_prober.go`)
 
 Wraps a long-lived `caracal` subprocess (`--prober-path`, extra args via
 repeatable `--prober-arg`). Probes go in as CSV on stdin, replies come back as
@@ -172,16 +184,16 @@ Useful identities when something looks off:
 - **Same agent ID connected twice**: the orchestrator accepts auth and then
   closes; this agent logs "authenticated successfully" followed by "connection
   lost while reading: EOF" and backs off.
-- **Agent slow to read PDs**: the orchestrator buffers at most `--pd-queue-size`
-  (100) PDs per agent and silently drops the rest; the agent just sees fewer
-  PDs.
+- **Agent slow to read PDs**: the orchestrator buffers at most
+  `--pd-queue-size` PDs per agent. It then waits for at most
+  `--pd-push-timeout`; a timeout is counted in `pds_dropped_total`.
 
 ## 6. Repo map
 
 | Path | Contents |
 | --- | --- |
 | `cmd/retina-agent/main.go` | flags, metrics server, reconnect loop |
-| `cmd/mock-orchestrator/` | stand-alone fake orchestrator for local testing |
+| `cmd/mock-orchestrator/` | legacy JSON-data-phase test utility; incompatible with the current CSV data phase |
 | `internal/agent/agent.go` | connection, auth, reader/processor/writer |
 | `internal/agent/caracal_prober.go` | caracal subprocess pipeline and correlation |
 | `internal/agent/mock_prober.go` | simulated prober |

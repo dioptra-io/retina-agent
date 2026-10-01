@@ -16,7 +16,7 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 ┌─────────────┐
 │Orchestrator │
 └──────┬──────┘
-       │ TCP (JSON over newline-delimited stream)
+       │ TCP (JSON handshake, then compact CSV lines)
        │
 ┌──────▼──────────────────────────────┐
 │         Retina Agent                │
@@ -38,7 +38,7 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 3. **Writer**: Sends `ForwardingInfoElement` results back to orchestrator
 
 **Key features:**
-- Non-blocking probe execution (thousands of concurrent probes, bounded by `--write-queue-size` and OS limits)
+- Concurrent probe execution, optionally bounded with `--max-inflight-pds`
 - Automatic reconnection with exponential backoff
 - Graceful shutdown on SIGINT/SIGTERM
 
@@ -46,7 +46,7 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 
 ### Prerequisites
 
-- Go 1.24.4
+- Go 1.26.1
 - For production: [caracal](https://github.com/dioptra-io/caracal) and raw socket privileges
 
 ### Installation
@@ -63,14 +63,11 @@ go build -o retina-agent ./cmd/retina-agent
 
 ## Testing End-to-End
 
-Use the mock orchestrator to test the complete pipeline:
-```bash
-# Terminal 1: Start mock orchestrator
-go run test/mock_orchestrator.go
-
-# Terminal 2: Start agent with mock prober
-./retina-agent --id agent-1 --address localhost:50050 --prober-type mock
-```
+Run this agent with `--prober-type mock` against a current
+`retina-orchestrator`. The mock prober exercises the complete TCP, CSV, and
+PD/FIE pipeline without emitting network probes. The older
+`cmd/mock-orchestrator` utility still uses the legacy JSON data phase and is not
+compatible with this protocol version.
 
 ## Configuration
 
@@ -87,6 +84,7 @@ go run test/mock_orchestrator.go
 | `--cleanup-interval` | `10s` | Prober stale probe cleanup interval |
 | `--pds-buffer` | `100` | Directives channel buffer size |
 | `--fies-buffer` | `100` | FIEs channel buffer size |
+| `--max-inflight-pds` | `0` | Maximum concurrently processed PDs; `0` is unlimited |
 | `--read-deadline` | `10s` | Shutdown-check interval while the orchestrator is idle (not an idle timeout) |
 | `--write-deadline` | `5s` | Write timeout for orchestrator connection |
 | `--probe-timeout` | `5s` | Timeout for individual probe responses |
@@ -110,14 +108,15 @@ CLI flags > environment variables > hardcoded defaults
 | Variable                               | Default           | Description                                                      |
 | -------------------------------------- | ----------------- | ---------------------------------------------------------------- |
 | `RETINA_SECRET`                        | *                 | Shared secret for orchestrator authentication, required          |
-| `RETINA_ID`                            | `agent-1`         | Agent identifier                                                 |
-| `RETINA_ADDRESS`                       | `localhost:50050` | Orchestrator address (host:port)                                 |
+| `RETINA_AGENT_ID`                      | `agent-1`         | Agent identifier                                                 |
+| `RETINA_ORCHESTRATOR_ADDR`             | `localhost:50050` | Orchestrator address (host:port)                                 |
 | `RETINA_PROBER_TYPE`                   | `caracal`         | Prober to use (`caracal` or `mock`)                              |
 | `RETINA_PROBER_PATH`                   | *(searches PATH)* | Path to prober executable                                        |
 | `RETINA_WRITE_QUEUE_SIZE`              | `1000`            | Prober write queue buffer size                                   |
 | `RETINA_CLEANUP_INTERVAL`              | `10s`             | Prober stale probe cleanup interval                              |
 | `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
 | `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
+| `RETINA_MAX_INFLIGHT_PDS`              | `0`               | Maximum concurrently processed PDs; `0` is unlimited             |
 | `RETINA_READ_DEADLINE`                 | `10s`             | Shutdown-check interval while the orchestrator is idle           |
 | `RETINA_WRITE_DEADLINE`                | `5s`              | Write timeout for orchestrator connection                        |
 | `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
@@ -127,6 +126,24 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_METRICS_ADDR`                  | `:9312`           | Address to expose Prometheus metrics on                          |
 
 ## How It Works
+
+### Agent/orchestrator wire protocol
+
+The authentication request and response remain newline-delimited JSON. After
+successful authentication, the connection switches to headerless CSV records:
+
+```text
+# orchestrator → agent
+probing_directive_id,"destination_address",near_ttl,protocol_number,first_half_word,second_half_word
+
+# agent → orchestrator
+probing_directive_id,unix_capture_timestamp,"near_address",near_capture_delta,"far_address",far_capture_delta
+```
+
+The two half-word fields carry ICMP/ICMPv6 correlation words or UDP source and
+destination ports. Missing near/far observations use `""` and delta `0`.
+Capture deltas are whole seconds from the FIE production timestamp to the
+corresponding received timestamp.
 
 ### Processing Model
 
