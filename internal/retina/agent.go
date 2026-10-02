@@ -17,21 +17,13 @@ type Config struct {
 	Orchestrator OrchestratorConfig `json:"orchestrator"`
 }
 
-// OrchestratorConfig configures the connection to the orchestrator.
-type OrchestratorConfig struct {
-	// Address is the TCP address of the orchestrator, in the form "host:port".
-	Address string `json:"address"`
-	// Secret is the shared secret presented in the handshake.
-	Secret string `json:"-"`
-}
-
 // Validate reports whether the configuration is usable.
 func (c *Config) Validate() error {
 	if c.ID == "" {
 		return fmt.Errorf("id cannot be empty")
 	}
-	if c.Orchestrator.Address == "" {
-		return fmt.Errorf("orchestrator: address cannot be empty")
+	if err := c.Orchestrator.validate(); err != nil {
+		return fmt.Errorf("orchestrator: %w", err)
 	}
 	return nil
 }
