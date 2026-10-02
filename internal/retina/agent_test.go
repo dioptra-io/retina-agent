@@ -136,18 +136,230 @@ func TestConfig_Validate(t *testing.T) {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	for name, change := range map[string]func(*Config){
-		"empty id":        func(c *Config) { c.ID = "" },
-		"empty address":   func(c *Config) { c.Orchestrator.Address = "" },
-		"no write buffer": func(c *Config) { c.Orchestrator.WriteBufferSize = 0 },
-		"no flush period": func(c *Config) { c.Orchestrator.FlushPeriod = 0 },
-		"no min backoff":  func(c *Config) { c.Orchestrator.ReconnectMinBackoff = 0 },
-		"max below min":   func(c *Config) { c.Orchestrator.ReconnectMaxBackoff = time.Millisecond },
+		"empty id":            func(c *Config) { c.ID = "" },
+		"empty address":       func(c *Config) { c.Orchestrator.Address = "" },
+		"no write buffer":     func(c *Config) { c.Orchestrator.WriteBufferSize = 0 },
+		"no flush period":     func(c *Config) { c.Orchestrator.FlushPeriod = 0 },
+		"no min backoff":      func(c *Config) { c.Orchestrator.ReconnectMinBackoff = 0 },
+		"max below min":       func(c *Config) { c.Orchestrator.ReconnectMaxBackoff = time.Millisecond },
+		"negative PD queue":   func(c *Config) { c.Prober.PDQueueSize = -1 },
+		"negative FIE queue":  func(c *Config) { c.Prober.FIEQueueSize = -1 },
+		"negative mock delay": func(c *Config) { c.Prober.Mock.Delay = -1 },
+		"no mock inflight":    func(c *Config) { c.Prober.Mock.MaxInflight = 0 },
+		"no caracal path":     func(c *Config) { c.Prober.Caracal = testCaracalConfig("") },
+		"no caracal buffer": func(c *Config) {
+			c.Prober.Caracal = testCaracalConfig("caracal")
+			c.Prober.Caracal.WriteBufferSize = 0
+		},
+		"no caracal timeout": func(c *Config) {
+			c.Prober.Caracal = testCaracalConfig("caracal")
+			c.Prober.Caracal.StopTimeout = 0
+		},
 	} {
 		config := testConfig("127.0.0.1:1")
 		change(config)
 		if err := config.Validate(); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+
+	// The mock prober's configuration is not looked at when caracal is used.
+	config := testConfig("127.0.0.1:1")
+	config.Prober.Caracal = testCaracalConfig("caracal")
+	config.Prober.Mock = MockProberConfig{}
+	if err := config.Validate(); err != nil {
+		t.Errorf("valid caracal config rejected: %v", err)
+	}
+}
+
+func TestNewAgent(t *testing.T) {
+	if _, err := NewAgent(nil, nil); err == nil {
+		t.Error("expected an error for a nil config")
+	}
+	if _, err := NewAgent(&Config{}, nil); err == nil {
+		t.Error("expected an error for an empty config")
+	}
+
+	// A nil logger is allowed, and the prober follows the configuration.
+	agent, err := NewAgent(testConfig("127.0.0.1:1"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := agent.prober.(*MockProber); !ok {
+		t.Errorf("got prober %T, want the mock prober", agent.prober)
+	}
+
+	config := testConfig("127.0.0.1:1")
+	config.Prober.Caracal = testCaracalConfig("caracal")
+	agent, err = NewAgent(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := agent.prober.(*CaracalProber); !ok {
+		t.Errorf("got prober %T, want the caracal prober", agent.prober)
+	}
+}
+
+func TestJitter(t *testing.T) {
+	backoff := time.Second
+	for range 1000 {
+		if wait := jitter(backoff); wait < 800*time.Millisecond || wait > 1200*time.Millisecond {
+			t.Fatalf("jitter(%v) = %v, want within 20%%", backoff, wait)
+		}
+	}
+}
+
+// runAgent runs an agent until the test ends, and checks that it then stops
+// cleanly.
+func runAgent(t *testing.T, config *Config) {
+	t.Helper()
+	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run: got %v, want nil", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+	})
+}
+
+// accept waits for the agent's next connection.
+func accept(t *testing.T, listener net.Listener) net.Conn {
+	t.Helper()
+	_ = listener.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("agent did not connect: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	return conn
+}
+
+func listen(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+// TestAgent_NoPDLostUnderBackpressure sends many more PDs than the queues
+// and the prober hold: the agent must slow the orchestrator down, and every
+// PD must come back as a FIE, in order.
+func TestAgent_NoPDLostUnderBackpressure(t *testing.T) {
+	listener := listen(t)
+	config := testConfig(listener.Addr().String())
+	config.Prober = ProberConfig{PDQueueSize: 1, FIEQueueSize: 1, Mock: MockProberConfig{MaxInflight: 2}}
+	runAgent(t, config)
+
+	const count = 300
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	go func() {
+		for id := 1; id <= count; id++ {
+			fmt.Fprintf(conn, "%d,%q,4,17,24000,33434\n", id, "198.51.100.9") //nolint
+		}
+	}()
+
+	for id := 1; id <= count; id++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("FIE %d: %v", id, err)
+		}
+		if !strings.HasPrefix(line, fmt.Sprintf("%d,", id)) {
+			t.Fatalf("FIE %d: got line %q", id, line)
+		}
+	}
+}
+
+func TestAgent_RetriesAfterRejectedHandshake(t *testing.T) {
+	listener := listen(t)
+	runAgent(t, testConfig(listener.Addr().String()))
+
+	rejected := accept(t, listener)
+	if _, err := bufio.NewReader(rejected).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(rejected, `{"authenticated":false,"message":"secret is not correct"}`) //nolint
+
+	// The agent comes back, and works once it is accepted.
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	fmt.Fprintf(conn, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "1,") {
+		t.Fatalf("got FIE line %q, error %v", line, err)
+	}
+}
+
+func TestAgent_ReconnectsAfterMalformedPD(t *testing.T) {
+	listener := listen(t)
+	runAgent(t, testConfig(listener.Addr().String()))
+
+	// A line that is not a PD ends the connection.
+	first := accept(t, listener)
+	reader := authenticate(t, first)
+	fmt.Fprintln(first, "this is not a PD") //nolint
+	if _, err := reader.ReadString('\n'); err == nil {
+		t.Fatal("the agent kept the connection after a malformed PD")
+	}
+
+	second := accept(t, listener)
+	reader = authenticate(t, second)
+	fmt.Fprintf(second, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "1,") {
+		t.Fatalf("got FIE line %q, error %v", line, err)
+	}
+}
+
+// TestAgent_StopsWhileProberIsBlocked stops an agent that has no connection
+// and whose prober is waiting for room in the FIE queue.
+func TestAgent_StopsWhileProberIsBlocked(t *testing.T) {
+	// Nothing listens on the address.
+	config := testConfig("127.0.0.1:1")
+	config.Prober.FIEQueueSize = 1
+	config.Prober.Mock.Delay = 0
+	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := uint32(1); id <= 5; id++ {
+		agent.pds <- PD{ID: id}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+
+	// The prober has filled the FIE queue and cannot write the next FIE.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(agent.fies) < 1 || len(agent.pds) > 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("the prober did not fill the FIE queue")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: got %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
 	}
 }
 

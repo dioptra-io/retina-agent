@@ -84,3 +84,35 @@ func TestMockProber_StopsTakingPDsAtLimit(t *testing.T) {
 		t.Fatal("no PD was taken after the FIEs were out")
 	}
 }
+
+// TestMockProber_KeepsOrderAroundTheRing sends many more PDs than the ring
+// of pending PDs holds, so that it wraps around many times.
+func TestMockProber_KeepsOrderAroundTheRing(t *testing.T) {
+	pds, fies := runMockProber(t, &MockProberConfig{MaxInflight: 7})
+
+	const count = 300
+	go func() {
+		for id := uint32(1); id <= count; id++ {
+			pds <- PD{ID: id}
+		}
+	}()
+	for id := uint32(1); id <= count; id++ {
+		select {
+		case fie := <-fies:
+			if fie.PDID != id {
+				t.Fatalf("got FIE %d, want %d", fie.PDID, id)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("FIE %d did not arrive", id)
+		}
+	}
+}
+
+// TestMockProber_StopsWhileWritingFIE cancels a prober that is waiting to
+// write a FIE nobody reads: the cleanup of runMockProber checks it returns.
+func TestMockProber_StopsWhileWritingFIE(t *testing.T) {
+	pds, _ := runMockProber(t, &MockProberConfig{MaxInflight: 1})
+
+	pds <- PD{ID: 1}
+	time.Sleep(50 * time.Millisecond)
+}
