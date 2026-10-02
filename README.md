@@ -1,204 +1,78 @@
 # Retina Agent
 
-Retina Agent executes coordinated network probes to infer forwarding behavior across distributed vantage points, producing forwarding information elements (FIEs) for topology analysis.
+Retina Agent receives probing directives (PDs) from the Retina orchestrator, probes with [caracal](https://github.com/dioptra-io/caracal), and reports forwarding info elements (FIEs).
+
+This is the `research-v1.1.0` branch, a rewrite of the agent. It differs from `main`. [DOCS.md](DOCS.md) describes how the code works.
 
 ## Overview
 
-The agent connects to an orchestrator via TCP, receives probing directives, executes network probes, and returns forwarding information elements (FIEs).
+For every PD the agent sends two probes toward the destination, one at the near TTL and one at the near TTL plus one, and reports which address answered each.
 
-**Part of the Retina system:**
-- **Generator**: Creates probing directives
-- **Orchestrator**: Distributes directives to agents, collects FIEs
-- **Agent**: Executes network probes (this component)
-
-## Architecture
 ```
-┌─────────────┐
-│Orchestrator │
-└──────┬──────┘
-       │ TCP (JSON handshake, then compact CSV lines)
-       │
-┌──────▼──────────────────────────────┐
-│         Retina Agent                │
-│                                     │
-│  ┌────────┐  ┌──────────┐  ┌──────┐ │
-│  │ Reader │─▶│Processor │─▶│Writer│ │
-│  └────────┘  └─────┬────┘  └──────┘ │
-│                    │                │
-│              ┌─────▼─────┐          │
-│              │  Prober   │          │
-│              │ (caracal) │          │
-│              └───────────┘          │
-└─────────────────────────────────────┘
+orchestrator ──TCP──► session ──PD queue──► prober ──stdin──► caracal
+orchestrator ◄──TCP── session ◄──FIE queue── prober ◄──stdout── caracal
 ```
 
-**Three-stage pipeline:**
-1. **Reader**: Receives `ProbingDirective` messages from orchestrator
-2. **Processor**: Executes two probes per directive (near TTL, far TTL) in parallel, sends FIE once both complete or time out
-3. **Writer**: Sends `ForwardingInfoElement` results back to orchestrator
+- One TCP connection to the orchestrator: a JSON line each way for the handshake, then PDs and FIEs as CSV lines.
+- One long-lived caracal process. It outlives connections: when the orchestrator is lost the agent reconnects with backoff, and what is queued is handled on the next connection.
+- Every PD the prober takes gets exactly one FIE, complete as soon as both probes are answered, or with what came once the probe timeout has passed.
+- No metrics endpoint. The agent logs its counters in a `Stats` line every 10 seconds and at shutdown.
 
-**Key features:**
-- Concurrent probe execution, optionally bounded with `--max-inflight-pds`
-- Automatic reconnection with exponential backoff
-- Graceful shutdown on SIGINT/SIGTERM
+## Build and run
 
-## Quick Start
+Go 1.26.1 is needed, and for real probing caracal v0.15.4 in `PATH` with raw socket privileges.
 
-### Prerequisites
-
-- Go 1.26.1
-- For production: [caracal](https://github.com/dioptra-io/caracal) and raw socket privileges
-
-### Installation
 ```bash
-git clone https://github.com/dioptra-io/retina-agent
-cd retina-agent
-go build -o retina-agent ./cmd/retina-agent
+go build -o retina-agent .
 ```
 
-### Running with Mock Prober
 ```bash
-./retina-agent --id agent-1 --address localhost:50050 --prober-type mock
+RETINA_SECRET=... ./retina-agent -id agent-1 -address localhost:50050
 ```
 
-## Testing End-to-End
-
-Run this agent with `--prober-type mock` against a current
-`retina-orchestrator`. The mock prober exercises the complete TCP, CSV, and
-PD/FIE pipeline without emitting network probes. The older
-`cmd/mock-orchestrator` utility still uses the legacy JSON data phase and is not
-compatible with this protocol version.
+The Dockerfile builds an image with the agent and caracal v0.15.4.
 
 ## Configuration
 
-### Main Flags
+| Setting | Default | Description |
+| --- | --- | --- |
+| `-id` | `agent-1` | Agent identifier presented to the orchestrator |
+| `-address` | `localhost:50050` | Orchestrator address, `host:port` |
+| `RETINA_SECRET` (environment) | empty | Shared secret presented in the handshake |
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--id` | `agent-1` | Agent identifier |
-| `--address` | `localhost:50050` | Orchestrator address (host:port) |
-| `--prober-type` | `caracal` | Prober: `caracal` or `mock` |
-| `--prober-path` | (searches PATH) | Path to prober executable |
-| `--prober-arg` | | Additional argument to pass to the prober (repeatable) |
-| `--write-queue-size` | `1000` | Prober write queue buffer size |
-| `--cleanup-interval` | `10s` | Prober stale probe cleanup interval |
-| `--pds-buffer` | `100` | Directives channel buffer size |
-| `--fies-buffer` | `100` | FIEs channel buffer size |
-| `--max-inflight-pds` | `100000` | Maximum concurrently processed PDs; `0` is unlimited |
-| `--mock-probing-rate` | `0` | Mock prober only: maximum probes per second; `0` is unlimited |
-| `--mock-always-timeout` | `false` | Mock prober only: every probe waits `--probe-timeout` and reports a timeout |
-| `--read-deadline` | `10s` | Shutdown-check interval while the orchestrator is idle (not an idle timeout) |
-| `--probe-timeout` | `5s` | Timeout for individual probe responses |
-| `--max-reconnect-backoff` | `5m` | Maximum wait time between reconnection attempts |
-| `--max-consecutive-decode-errors` | `0` | Max consecutive decode errors before reconnecting (0 to disable) |
-| `--log-level` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
-| `--metrics-addr` | `:9312` | Address to expose Prometheus metrics on |
+These are the only settings that can be changed without rebuilding. Every other value (timeouts, queue sizes, caracal's options, the stats period) is set in the one config literal in [main.go](main.go). Flags for them, and the `RETINA_*` environment variables of the previous agent, are not implemented yet.
 
-See `--help` for all options.
+## Testing
 
-### Environment Variables
-
-All flags can be configured via environment variables. These act as defaults and are overridden by CLI flags.
-
-Precedence:
-
-```
-CLI flags > environment variables > hardcoded defaults
+```bash
+make test
 ```
 
-| Variable                               | Default           | Description                                                      |
-| -------------------------------------- | ----------------- | ---------------------------------------------------------------- |
-| `RETINA_SECRET`                        | *                 | Shared secret for orchestrator authentication, required          |
-| `RETINA_AGENT_ID`                      | `agent-1`         | Agent identifier                                                 |
-| `RETINA_ORCHESTRATOR_ADDR`             | `localhost:50050` | Orchestrator address (host:port)                                 |
-| `RETINA_PROBER_TYPE`                   | `caracal`         | Prober to use (`caracal` or `mock`)                              |
-| `RETINA_PROBER_PATH`                   | *(searches PATH)* | Path to prober executable                                        |
-| `RETINA_WRITE_QUEUE_SIZE`              | `1000`            | Prober write queue buffer size                                   |
-| `RETINA_CLEANUP_INTERVAL`              | `10s`             | Prober stale probe cleanup interval                              |
-| `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
-| `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
-| `RETINA_MAX_INFLIGHT_PDS`              | `100000`          | Maximum concurrently processed PDs; `0` is unlimited             |
-| `RETINA_MOCK_PROBING_RATE`             | `0`               | Mock prober only: maximum probes per second; `0` is unlimited    |
-| `RETINA_MOCK_ALWAYS_TIMEOUT`           | `false`           | Mock prober only: every probe waits the probe timeout and times out |
-| `RETINA_READ_DEADLINE`                 | `10s`             | Shutdown-check interval while the orchestrator is idle           |
-| `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
-| `RETINA_MAX_RECONNECT_BACKOFF`         | `5m`              | Maximum wait between reconnection attempts                       |
-| `RETINA_MAX_CONSECUTIVE_DECODE_ERRORS` | `0`               | Max consecutive decode errors before reconnecting (0 to disable) |
-| `RETINA_LOG_LEVEL`                     | `info`            | Log level (`debug`, `info`, `warn`, `error`)                     |
-| `RETINA_METRICS_ADDR`                  | `:9312`           | Address to expose Prometheus metrics on                          |
+```bash
+make smoke
+```
 
-## How It Works
+`make smoke` builds the agent and runs it between `scripts/mock-orchestrator.sh` and `scripts/mock-caracal.sh`, once on a single connection and once with the connection dropped part of the way. It passes when every PD comes back as a FIE. Arguments for the mock orchestrator go in `SMOKE_ARGS`, and the `MOCK_CARACAL_*` variables configure the mock caracal's replies:
 
-### Agent/orchestrator wire protocol
+```bash
+make smoke SMOKE_ARGS="--count 2000 --seed 7"
+```
 
-The authentication request and response remain newline-delimited JSON. After
-successful authentication, the connection switches to headerless CSV records:
+The scripts need bash 5, and the mock orchestrator an OpenBSD-style `nc`. Nothing is probed for real: the mock caracal sends no packets.
+
+## Wire protocol
+
+The handshake is one JSON line each way (`{"agent_id":...,"secret":...}`, answered by `{"authenticated":...,"message":...}`). After it:
 
 ```text
 # orchestrator → agent
-probing_directive_id,"destination_address",near_ttl,protocol_number,first_half_word,second_half_word
+id,"destination",near_ttl,protocol,first_half_word,second_half_word
 
 # agent → orchestrator
-probing_directive_id,unix_capture_timestamp,"near_address",near_capture_delta,"far_address",far_capture_delta
+id,capture_unix,"near_address",near_delta,"far_address",far_delta
 ```
 
-The two half-word fields carry ICMP/ICMPv6 correlation words or UDP source and
-destination ports. Missing near/far observations use `""` and delta `0`.
-Capture deltas are whole seconds from the FIE production timestamp to the
-corresponding received timestamp.
-
-### Processing Model
-
-For each `ProbingDirective`:
-
-1. **Launch two probes concurrently**:
-   - Near probe: TTL = `directive.NearTTL`
-   - Far probe: TTL = `directive.NearTTL + 1`
-2. **Correlate results** by destination, protocol, header fields, TTL, and send timestamp
-3. **Always send a FIE**: if a probe times out, the corresponding `NearInfo` or `FarInfo` field is nil
-
-### Caracal Integration
-
-The caracal prober uses a high-throughput pipeline:
-- Multiple goroutines queue probe requests (non-blocking)
-- Single writer goroutine sends to caracal stdin (CSV format)
-- Single reader goroutine receives from caracal stdout (CSV format)
-- Results correlated back to waiting goroutines via shared map
-
-### Error Handling
-
-- **Network errors**: Trigger reconnection with exponential backoff
-- **Idle orchestrator**: Not an error; the connection stays open indefinitely. A dead orchestrator is detected by TCP keepalive (30s idle, 3 probes 10s apart, ~60s) and triggers reconnection
-- **Decode errors**: Log and skip (reconnect after `--max-consecutive-decode-errors` consecutive)
-- **Probe timeouts**: Expected behavior, FIE sent with nil NearInfo/FarInfo
-- **Context cancellation**: Clean shutdown
-
-## Development
-
-### Adding a New Prober
-
-1. Implement the `Prober` interface:
-```go
-type Prober interface {
-    Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
-    Close() error
-}
-```
-
-2. Add to `createProber()` in `agent.go`:
-```go
-case "myprober":
-    return NewMyProber(cfg), nil
-```
-
-3. Use it:
-```bash
-./retina-agent --prober-type myprober
-```
-
-## Observability
-
-Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering pipeline throughput (directives received, FIEs sent), probe outcomes (success/timeout/error rates, RTT distribution), connectivity (reconnections, decode errors), and caracal internals (queue depth, in-flight probes, correlation failures). See `internal/agent/metrics.go` for the full list.
+The protocol is the IP protocol number: 1 (ICMP), 17 (UDP) or 58 (ICMPv6). The half-words are the UDP source and destination ports; for ICMP only the first tells flows apart. A probe without a reply is reported as `"",0`. The deltas are whole seconds between a reply's capture and `capture_unix`.
 
 ## License
 
