@@ -51,7 +51,7 @@ func run() error {
 			PDQueueSize:               1024,
 			FIEQueueSize:              1024,
 			DiscardQueuedOnDisconnect: false,
-			Caracal: &retina.CaracalProberConfig{
+			Caracal: retina.CaracalProberConfig{
 				Path: "caracal",
 
 				// Caracal's options. An empty or zero value leaves the

@@ -16,6 +16,21 @@ import (
 	"time"
 )
 
+// testFake is the configuration of the fake prober most tests use.
+var testFake = fakeProberConfig{Delay: 200 * time.Millisecond, MaxInflight: 16}
+
+// newTestAgent creates an agent that probes with a fake prober, so that no
+// caracal is started.
+func newTestAgent(t *testing.T, config *Config, fake fakeProberConfig) *Agent {
+	t.Helper()
+	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.prober = newFakeProber(&fake)
+	return agent
+}
+
 // testConfig returns a valid configuration for an agent of the orchestrator
 // at address.
 func testConfig(address string) *Config {
@@ -33,7 +48,7 @@ func testConfig(address string) *Config {
 		Prober: ProberConfig{
 			PDQueueSize:  16,
 			FIEQueueSize: 16,
-			Mock:         MockProberConfig{Delay: 200 * time.Millisecond, MaxInflight: 16},
+			Caracal:      *testCaracalConfig("caracal"),
 		},
 	}
 }
@@ -63,10 +78,7 @@ func TestAgent_ReconnectsAndStops(t *testing.T) {
 		}
 	}()
 
-	agent, err := NewAgent(testConfig(listener.Addr().String()), slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, testConfig(listener.Addr().String()), testFake)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(ctx) }()
@@ -112,10 +124,7 @@ func TestAgent_StopsWhileConnected(t *testing.T) {
 		_, _ = reader.ReadString('\n')
 	}()
 
-	agent, err := NewAgent(testConfig(listener.Addr().String()), slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, testConfig(listener.Addr().String()), testFake)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(ctx) }()
@@ -137,48 +146,26 @@ func TestConfig_Validate(t *testing.T) {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	for name, change := range map[string]func(*Config){
-		"empty id":            func(c *Config) { c.ID = "" },
-		"empty address":       func(c *Config) { c.Orchestrator.Address = "" },
-		"no write buffer":     func(c *Config) { c.Orchestrator.WriteBufferSize = 0 },
-		"no flush period":     func(c *Config) { c.Orchestrator.FlushPeriod = 0 },
-		"no min backoff":      func(c *Config) { c.Orchestrator.ReconnectMinBackoff = 0 },
-		"max below min":       func(c *Config) { c.Orchestrator.ReconnectMaxBackoff = time.Millisecond },
-		"negative PD queue":   func(c *Config) { c.Prober.PDQueueSize = -1 },
-		"negative FIE queue":  func(c *Config) { c.Prober.FIEQueueSize = -1 },
-		"negative stats":      func(c *Config) { c.StatsPeriod = -1 },
-		"negative mock delay": func(c *Config) { c.Prober.Mock.Delay = -1 },
-		"no mock inflight":    func(c *Config) { c.Prober.Mock.MaxInflight = 0 },
-		"no caracal path":     func(c *Config) { c.Prober.Caracal = testCaracalConfig("") },
-		"negative caracal option": func(c *Config) {
-			c.Prober.Caracal = testCaracalConfig("caracal")
-			c.Prober.Caracal.BatchSize = -1
-		},
-		"no caracal probe timeout": func(c *Config) {
-			c.Prober.Caracal = testCaracalConfig("caracal")
-			c.Prober.Caracal.ProbeTimeout = 0
-		},
-		"no caracal buffer": func(c *Config) {
-			c.Prober.Caracal = testCaracalConfig("caracal")
-			c.Prober.Caracal.WriteBufferSize = 0
-		},
-		"no caracal timeout": func(c *Config) {
-			c.Prober.Caracal = testCaracalConfig("caracal")
-			c.Prober.Caracal.StopTimeout = 0
-		},
+		"empty id":                 func(c *Config) { c.ID = "" },
+		"empty address":            func(c *Config) { c.Orchestrator.Address = "" },
+		"no write buffer":          func(c *Config) { c.Orchestrator.WriteBufferSize = 0 },
+		"no flush period":          func(c *Config) { c.Orchestrator.FlushPeriod = 0 },
+		"no min backoff":           func(c *Config) { c.Orchestrator.ReconnectMinBackoff = 0 },
+		"max below min":            func(c *Config) { c.Orchestrator.ReconnectMaxBackoff = time.Millisecond },
+		"negative PD queue":        func(c *Config) { c.Prober.PDQueueSize = -1 },
+		"negative FIE queue":       func(c *Config) { c.Prober.FIEQueueSize = -1 },
+		"negative stats":           func(c *Config) { c.StatsPeriod = -1 },
+		"no caracal path":          func(c *Config) { c.Prober.Caracal.Path = "" },
+		"negative caracal option":  func(c *Config) { c.Prober.Caracal.BatchSize = -1 },
+		"no caracal probe timeout": func(c *Config) { c.Prober.Caracal.ProbeTimeout = 0 },
+		"no caracal buffer":        func(c *Config) { c.Prober.Caracal.WriteBufferSize = 0 },
+		"no caracal timeout":       func(c *Config) { c.Prober.Caracal.StopTimeout = 0 },
 	} {
 		config := testConfig("127.0.0.1:1")
 		change(config)
 		if err := config.Validate(); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
-	}
-
-	// The mock prober's configuration is not looked at when caracal is used.
-	config := testConfig("127.0.0.1:1")
-	config.Prober.Caracal = testCaracalConfig("caracal")
-	config.Prober.Mock = MockProberConfig{}
-	if err := config.Validate(); err != nil {
-		t.Errorf("valid caracal config rejected: %v", err)
 	}
 }
 
@@ -190,18 +177,8 @@ func TestNewAgent(t *testing.T) {
 		t.Error("expected an error for an empty config")
 	}
 
-	// A nil logger is allowed, and the prober follows the configuration.
+	// A nil logger is allowed.
 	agent, err := NewAgent(testConfig("127.0.0.1:1"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := agent.prober.(*MockProber); !ok {
-		t.Errorf("got prober %T, want the mock prober", agent.prober)
-	}
-
-	config := testConfig("127.0.0.1:1")
-	config.Prober.Caracal = testCaracalConfig("caracal")
-	agent, err = NewAgent(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,12 +198,9 @@ func TestJitter(t *testing.T) {
 
 // runAgent runs an agent until the test ends, and checks that it then stops
 // cleanly.
-func runAgent(t *testing.T, config *Config) {
+func runAgent(t *testing.T, config *Config, fake fakeProberConfig) {
 	t.Helper()
-	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, config, fake)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(ctx) }()
@@ -272,8 +246,8 @@ func listen(t *testing.T) net.Listener {
 func TestAgent_NoPDLostUnderBackpressure(t *testing.T) {
 	listener := listen(t)
 	config := testConfig(listener.Addr().String())
-	config.Prober = ProberConfig{PDQueueSize: 1, FIEQueueSize: 1, Mock: MockProberConfig{MaxInflight: 2}}
-	runAgent(t, config)
+	config.Prober.PDQueueSize, config.Prober.FIEQueueSize = 1, 1
+	runAgent(t, config, fakeProberConfig{MaxInflight: 2})
 
 	const count = 300
 	conn := accept(t, listener)
@@ -297,7 +271,7 @@ func TestAgent_NoPDLostUnderBackpressure(t *testing.T) {
 
 func TestAgent_RetriesAfterRejectedHandshake(t *testing.T) {
 	listener := listen(t)
-	runAgent(t, testConfig(listener.Addr().String()))
+	runAgent(t, testConfig(listener.Addr().String()), testFake)
 
 	rejected := accept(t, listener)
 	if _, err := bufio.NewReader(rejected).ReadString('\n'); err != nil {
@@ -319,7 +293,7 @@ func TestAgent_RetriesAfterRejectedHandshake(t *testing.T) {
 // FIE.
 func TestAgent_SkipsMalformedPD(t *testing.T) {
 	listener := listen(t)
-	runAgent(t, testConfig(listener.Addr().String()))
+	runAgent(t, testConfig(listener.Addr().String()), testFake)
 
 	conn := accept(t, listener)
 	reader := authenticate(t, conn)
@@ -338,11 +312,7 @@ func TestAgent_SendsLastFIEsAtShutdown(t *testing.T) {
 	config := testConfig(listener.Addr().String())
 	config.Orchestrator.FlushPeriod = time.Hour
 	config.Orchestrator.ShutdownFlushTimeout = time.Second
-	config.Prober.Mock.Delay = 10 * time.Millisecond
-	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, config, fakeProberConfig{Delay: 10 * time.Millisecond, MaxInflight: 16})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(ctx) }()
@@ -380,12 +350,12 @@ func TestAgent_LogsStats(t *testing.T) {
 	listener := listen(t)
 	config := testConfig(listener.Addr().String())
 	config.StatsPeriod = 10 * time.Millisecond
-	config.Prober.Mock.Delay = 0
 	var logs bytes.Buffer
 	agent, err := NewAgent(config, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	agent.prober = newFakeProber(&fakeProberConfig{MaxInflight: 16})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(ctx) }()
@@ -426,11 +396,7 @@ func TestAgent_StopsWhileProberIsBlocked(t *testing.T) {
 	// Nothing listens on the address.
 	config := testConfig("127.0.0.1:1")
 	config.Prober.FIEQueueSize = 1
-	config.Prober.Mock.Delay = 0
-	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, config, fakeProberConfig{MaxInflight: 16})
 	for id := uint32(1); id <= 5; id++ {
 		agent.pds <- PD{ID: id}
 	}
@@ -477,14 +443,11 @@ func TestAgent_ProbesAndKeepsFIEsAcrossReconnect(t *testing.T) {
 	}
 	defer func() { _ = listener.Close() }()
 
-	agent, err := NewAgent(testConfig(listener.Addr().String()), slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, testConfig(listener.Addr().String()), testFake)
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(t.Context()) }()
 
-	// The first connection is dropped right after its PDs, before the mock
+	// The first connection is dropped right after its PDs, before the fake
 	// prober's delay has passed.
 	first, err := listener.Accept()
 	if err != nil {
@@ -533,10 +496,7 @@ func TestAgent_DiscardsQueuesOnDisconnect(t *testing.T) {
 
 	config := testConfig(listener.Addr().String())
 	config.Prober.DiscardQueuedOnDisconnect = true
-	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, config, testFake)
 	done := make(chan error, 1)
 	go func() { done <- agent.Run(t.Context()) }()
 
@@ -582,10 +542,7 @@ func (failingProber) Run(context.Context, <-chan PD, chan<- FIE) error {
 
 func TestAgent_StopsWhenProberFails(t *testing.T) {
 	// Nothing listens on the address: the agent is between connections.
-	agent, err := NewAgent(testConfig("127.0.0.1:1"), slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := newTestAgent(t, testConfig("127.0.0.1:1"), testFake)
 	agent.prober = failingProber{}
 
 	done := make(chan error, 1)

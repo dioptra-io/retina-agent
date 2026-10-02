@@ -26,10 +26,8 @@ type ProberConfig struct {
 	// if they are produced after the next connection is made.
 	DiscardQueuedOnDisconnect bool `json:"discard_queued_on_disconnect"`
 
-	// Caracal configures the caracal prober. When it is nil the mock prober
-	// is used, with the Mock configuration.
-	Caracal *CaracalProberConfig `json:"caracal"`
-	Mock    MockProberConfig     `json:"mock"`
+	// Caracal configures the caracal prober.
+	Caracal CaracalProberConfig `json:"caracal"`
 }
 
 func (c *ProberConfig) validate() error {
@@ -39,14 +37,8 @@ func (c *ProberConfig) validate() error {
 	if c.FIEQueueSize < 0 {
 		return fmt.Errorf("FIE queue size cannot be negative: got %d", c.FIEQueueSize)
 	}
-	if c.Caracal != nil {
-		if err := c.Caracal.validate(); err != nil {
-			return fmt.Errorf("caracal: %w", err)
-		}
-		return nil
-	}
-	if err := c.Mock.validate(); err != nil {
-		return fmt.Errorf("mock: %w", err)
+	if err := c.Caracal.validate(); err != nil {
+		return fmt.Errorf("caracal: %w", err)
 	}
 	return nil
 }

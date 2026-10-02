@@ -9,15 +9,15 @@ import (
 	"time"
 )
 
-// runMockProber runs a mock prober until the test ends, and returns its
+// runFakeProber runs a fake prober until the test ends, and returns its
 // channels.
-func runMockProber(t *testing.T, config *MockProberConfig) (chan<- PD, <-chan FIE) {
+func runFakeProber(t *testing.T, config *fakeProberConfig) (chan<- PD, <-chan FIE) {
 	t.Helper()
 	pds := make(chan PD)
 	fies := make(chan FIE)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewMockProber(config).Run(ctx, pds, fies) }()
+	go func() { done <- newFakeProber(config).Run(ctx, pds, fies) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -32,9 +32,9 @@ func runMockProber(t *testing.T, config *MockProberConfig) (chan<- PD, <-chan FI
 	return pds, fies
 }
 
-func TestMockProber_AnswersInOrderAfterDelay(t *testing.T) {
+func TestFakeProber_AnswersInOrderAfterDelay(t *testing.T) {
 	delay := 100 * time.Millisecond
-	pds, fies := runMockProber(t, &MockProberConfig{Delay: delay, MaxInflight: 8})
+	pds, fies := runFakeProber(t, &fakeProberConfig{Delay: delay, MaxInflight: 8})
 
 	start := time.Now()
 	for id := uint32(1); id <= 3; id++ {
@@ -42,7 +42,7 @@ func TestMockProber_AnswersInOrderAfterDelay(t *testing.T) {
 	}
 	for id := uint32(1); id <= 3; id++ {
 		fie := <-fies
-		if fie.PDID != id || fie.Near != mockNear || fie.Far != mockFar || fie.CaptureUnix == 0 {
+		if fie.PDID != id || fie.Near != fakeNear || fie.Far != fakeFar || fie.CaptureUnix == 0 {
 			t.Fatalf("FIE %d: got %+v", id, fie)
 		}
 	}
@@ -51,8 +51,8 @@ func TestMockProber_AnswersInOrderAfterDelay(t *testing.T) {
 	}
 }
 
-func TestMockProber_NoReply(t *testing.T) {
-	pds, fies := runMockProber(t, &MockProberConfig{MaxInflight: 1, NoReply: true})
+func TestFakeProber_NoReply(t *testing.T) {
+	pds, fies := runFakeProber(t, &fakeProberConfig{MaxInflight: 1, NoReply: true})
 
 	pds <- PD{ID: 9}
 	if fie := <-fies; fie.PDID != 9 || fie.Near.IsValid() || fie.Far.IsValid() {
@@ -60,8 +60,8 @@ func TestMockProber_NoReply(t *testing.T) {
 	}
 }
 
-func TestMockProber_StopsTakingPDsAtLimit(t *testing.T) {
-	pds, fies := runMockProber(t, &MockProberConfig{Delay: 200 * time.Millisecond, MaxInflight: 2})
+func TestFakeProber_StopsTakingPDsAtLimit(t *testing.T) {
+	pds, fies := runFakeProber(t, &fakeProberConfig{Delay: 200 * time.Millisecond, MaxInflight: 2})
 
 	pds <- PD{ID: 1}
 	pds <- PD{ID: 2}
@@ -85,10 +85,10 @@ func TestMockProber_StopsTakingPDsAtLimit(t *testing.T) {
 	}
 }
 
-// TestMockProber_KeepsOrderAroundTheRing sends many more PDs than the ring
+// TestFakeProber_KeepsOrderAroundTheRing sends many more PDs than the ring
 // of pending PDs holds, so that it wraps around many times.
-func TestMockProber_KeepsOrderAroundTheRing(t *testing.T) {
-	pds, fies := runMockProber(t, &MockProberConfig{MaxInflight: 7})
+func TestFakeProber_KeepsOrderAroundTheRing(t *testing.T) {
+	pds, fies := runFakeProber(t, &fakeProberConfig{MaxInflight: 7})
 
 	const count = 300
 	go func() {
@@ -108,10 +108,10 @@ func TestMockProber_KeepsOrderAroundTheRing(t *testing.T) {
 	}
 }
 
-// TestMockProber_StopsWhileWritingFIE cancels a prober that is waiting to
-// write a FIE nobody reads: the cleanup of runMockProber checks it returns.
-func TestMockProber_StopsWhileWritingFIE(t *testing.T) {
-	pds, _ := runMockProber(t, &MockProberConfig{MaxInflight: 1})
+// TestFakeProber_StopsWhileWritingFIE cancels a prober that is waiting to
+// write a FIE nobody reads: the cleanup of runFakeProber checks it returns.
+func TestFakeProber_StopsWhileWritingFIE(t *testing.T) {
+	pds, _ := runFakeProber(t, &fakeProberConfig{MaxInflight: 1})
 
 	pds <- PD{ID: 1}
 	time.Sleep(50 * time.Millisecond)

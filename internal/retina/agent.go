@@ -77,15 +77,10 @@ func NewAgent(config *Config, logger *slog.Logger) (*Agent, error) {
 		logger = slog.Default()
 	}
 
-	var prober Prober = NewMockProber(&config.Prober.Mock)
-	if config.Prober.Caracal != nil {
-		prober = NewCaracalProber(config.Prober.Caracal, logger)
-	}
-
 	return &Agent{
 		config: config,
 		logger: logger,
-		prober: prober,
+		prober: NewCaracalProber(&config.Prober.Caracal, logger),
 		pds:    make(chan PD, config.Prober.PDQueueSize),
 		fies:   make(chan FIE, config.Prober.FIEQueueSize),
 	}, nil

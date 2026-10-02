@@ -44,11 +44,7 @@ When the agent is stopped while connected, it sends the FIEs waiting in the queu
 
 ## 3. Probers
 
-`Prober` (`internal/retina/prober.go`) has one method, `Run(ctx, pds, fies)`: take PDs, write one FIE per PD. The agent uses the caracal prober when `Prober.Caracal` is set, as `main.go` does, and the mock prober otherwise.
-
-### MockProber (`mock_prober.go`)
-
-Answers every PD after a fixed delay with made-up addresses, and holds at most `MaxInflight` PDs. It is used by the tests; it cannot be selected from the command line.
+`Prober` (`internal/retina/prober.go`) has one method, `Run(ctx, pds, fies)`: take PDs, write one FIE per PD. The agent always uses the caracal prober. To run without probing, `scripts/mock-caracal.sh` stands in for caracal itself. The tests of the agent use a fake prober that lives in the test files.
 
 ### CaracalProber (`caracal_prober.go`)
 
@@ -113,7 +109,6 @@ The fields from `pds_probed` on come from the caracal prober. `replies_unmatched
 | `internal/retina/prober.go` | `Prober` interface, `ProberConfig` |
 | `internal/retina/caracal_prober.go` | caracal process, probe writing, reply parsing |
 | `internal/retina/caracal_table.go` | matching of replies to PDs, expiry |
-| `internal/retina/mock_prober.go` | prober for tests |
 | `internal/retina/types.go` | `PD`, `FIE` |
 | `scripts/mock-caracal.sh` | stand-in for caracal that sends no packets |
 | `scripts/mock-orchestrator.sh` | stand-in for the orchestrator, for one agent |
