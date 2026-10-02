@@ -151,7 +151,7 @@ func TestConfig_Validate(t *testing.T) {
 		"no caracal path":     func(c *Config) { c.Prober.Caracal = testCaracalConfig("") },
 		"negative caracal option": func(c *Config) {
 			c.Prober.Caracal = testCaracalConfig("caracal")
-			c.Prober.Caracal.NPackets = -1
+			c.Prober.Caracal.BatchSize = -1
 		},
 		"no caracal probe timeout": func(c *Config) {
 			c.Prober.Caracal = testCaracalConfig("caracal")

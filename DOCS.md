@@ -52,7 +52,7 @@ Answers every PD after a fixed delay with made-up addresses, and holds at most `
 
 ### CaracalProber (`caracal_prober.go`)
 
-Starts one caracal process (`Path`, looked up in `PATH`) with the options of `CaracalProberConfig`, which are typed fields named after caracal's options; a zero value leaves the option out. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
+Starts one caracal process (`Path`, looked up in `PATH`) with the four options of `CaracalProberConfig`: `--probing-rate`, `--batch-size`, `--log-level` and `--rate-limiting-method`. A zero value leaves the option out. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
 
 | Loop | Role |
 | --- | --- |

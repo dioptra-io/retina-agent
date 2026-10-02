@@ -215,27 +215,18 @@ func TestMockCaracal(t *testing.T) {
 }
 
 func TestCaracalProberConfig_Args(t *testing.T) {
-	config := testCaracalConfig("caracal")
-	if got, want := strings.Join(config.args(), " "), "--probing-rate 10000"; got != want {
-		t.Errorf("got %q, want %q", got, want)
-	}
-	// Every option left out: caracal runs with its defaults.
-	if args := (&CaracalProberConfig{}).args(); len(args) != 0 {
-		t.Errorf("got %q, want no arguments", args)
-	}
-
-	config = &CaracalProberConfig{
-		ProbingRate: 500, Interface: "eth0", BatchSize: 64, LogLevel: "debug", NPackets: 2, MaxProbes: 1000,
-		SourceAddressV4: "192.0.2.1", SourceAddressV6: "2001:db8::1", SnifferWaitTime: 3, RateLimitingMethod: "sleep",
-		FilterFromPrefixFileExcl: "excl.txt", FilterFromPrefixFileIncl: "incl.txt", FilterMinTTL: 2, FilterMaxTTL: 32,
-		CaracalID: 7, MetaRound: "9", NoIntegrityCheck: true,
-	}
-	want := "--probing-rate 500 --interface eth0 --batch-size 64 --log-level debug --n-packets 2 --max-probes 1000" +
-		" --source-address-v4 192.0.2.1 --source-address-v6 2001:db8::1 --sniffer-wait-time 3 --rate-limiting-method sleep" +
-		" --filter-from-prefix-file-excl excl.txt --filter-from-prefix-file-incl incl.txt --filter-min-ttl 2 --filter-max-ttl 32" +
-		" --caracal-id 7 --meta-round 9 --no-integrity-check"
-	if got := strings.Join(config.args(), " "); got != want {
-		t.Errorf("got %q, want %q", got, want)
+	const fixed = "--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255"
+	for want, config := range map[string]*CaracalProberConfig{
+		"--probing-rate 10000 " + fixed: testCaracalConfig("caracal"),
+		// Every option left out: caracal uses its defaults for them.
+		fixed: {},
+		"--probing-rate 500 --batch-size 64 --log-level debug --rate-limiting-method sleep " + fixed: {
+			ProbingRate: 500, BatchSize: 64, LogLevel: "debug", RateLimitingMethod: "sleep",
+		},
+	} {
+		if got := strings.Join(config.args(), " "); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
 	}
 }
 

@@ -33,9 +33,29 @@ const caracalReadBufferSize = 64 * 1024
 // timeout.
 const caracalExpiryPeriod = 100 * time.Millisecond
 
+// caracalFixedArgs are the options caracal is always started with. They are
+// the defaults of caracal v0.15.4, passed all the same so that a later
+// caracal with other defaults behaves as this one: one packet per probe,
+// which the matching of replies relies on, one second of capture after the
+// input ends, the round column at 1, and TTL filters that let every TTL
+// through.
+//
+// The rest of caracal's options cannot be given their default and are left
+// out: caracal probes from the default interface and its addresses, with a
+// random caracal ID, without a limit on the number of probes or a prefix
+// filter, and drops the replies that fail its integrity check.
+var caracalFixedArgs = []string{
+	"--n-packets", "1",
+	"--sniffer-wait-time", "1",
+	"--meta-round", "1",
+	"--filter-min-ttl", "0",
+	"--filter-max-ttl", "255",
+}
+
 // CaracalProberConfig configures the caracal prober. The first group of
 // fields are caracal's own options, named after them; a zero value leaves
-// the option out, so that caracal uses its default.
+// the option out, so that caracal uses its default. Caracal is also given
+// caracalFixedArgs.
 type CaracalProberConfig struct {
 	// Path is the caracal executable. A name without a slash is looked up in
 	// PATH.
@@ -44,46 +64,15 @@ type CaracalProberConfig struct {
 	// ProbingRate is the rate caracal sends at, in packets per second
 	// (--probing-rate). Caracal's own default is 100.
 	ProbingRate int `json:"probing_rate"`
-	// Interface is the interface the packets are sent from (--interface).
-	Interface string `json:"interface"`
 	// BatchSize is the number of packets sent between two checks of the rate
 	// (--batch-size).
 	BatchSize int `json:"batch_size"`
 	// LogLevel is caracal's minimum log level: trace, debug, info, warning,
 	// error or fatal (--log-level).
 	LogLevel string `json:"log_level"`
-	// NPackets is the number of packets sent per probe (--n-packets).
-	NPackets int `json:"n_packets"`
-	// MaxProbes is the number of probes after which caracal stops
-	// (--max-probes). The agent stops with it.
-	MaxProbes int `json:"max_probes"`
-	// SourceAddressV4 and SourceAddressV6 are the source addresses of the
-	// packets (--source-address-v4, --source-address-v6).
-	SourceAddressV4 string `json:"source_address_v4"`
-	SourceAddressV6 string `json:"source_address_v6"`
-	// SnifferWaitTime is the time in seconds caracal waits for replies after
-	// its input ends (--sniffer-wait-time).
-	SnifferWaitTime int `json:"sniffer_wait_time"`
 	// RateLimitingMethod is how caracal limits its rate: auto, active, sleep
 	// or none (--rate-limiting-method).
 	RateLimitingMethod string `json:"rate_limiting_method"`
-	// FilterFromPrefixFileExcl and FilterFromPrefixFileIncl are files of
-	// prefixes not to probe, and of the only prefixes to probe
-	// (--filter-from-prefix-file-excl, --filter-from-prefix-file-incl).
-	FilterFromPrefixFileExcl string `json:"filter_from_prefix_file_excl"`
-	FilterFromPrefixFileIncl string `json:"filter_from_prefix_file_incl"`
-	// FilterMinTTL and FilterMaxTTL make caracal skip probes with a TTL
-	// below or above them (--filter-min-ttl, --filter-max-ttl).
-	FilterMinTTL int `json:"filter_min_ttl"`
-	FilterMaxTTL int `json:"filter_max_ttl"`
-	// CaracalID is the identifier encoded in the probes (--caracal-id).
-	CaracalID int `json:"caracal_id"`
-	// MetaRound is the value of the round column of the output
-	// (--meta-round).
-	MetaRound string `json:"meta_round"`
-	// NoIntegrityCheck makes caracal keep the replies it cannot tell to be
-	// answers to its own probes (--no-integrity-check).
-	NoIntegrityCheck bool `json:"no_integrity_check"`
 
 	// ProbeTimeout is how long the replies to a PD's probes are waited for,
 	// from when the probes are sent to caracal. A PD whose two probes are
@@ -103,19 +92,11 @@ func (c *CaracalProberConfig) validate() error {
 	if c.Path == "" {
 		return fmt.Errorf("path cannot be empty")
 	}
-	for name, value := range map[string]int{
-		"probing rate":      c.ProbingRate,
-		"batch size":        c.BatchSize,
-		"n packets":         c.NPackets,
-		"max probes":        c.MaxProbes,
-		"sniffer wait time": c.SnifferWaitTime,
-		"filter min ttl":    c.FilterMinTTL,
-		"filter max ttl":    c.FilterMaxTTL,
-		"caracal id":        c.CaracalID,
-	} {
-		if value < 0 {
-			return fmt.Errorf("%s cannot be negative: got %d", name, value)
-		}
+	if c.ProbingRate < 0 {
+		return fmt.Errorf("probing rate cannot be negative: got %d", c.ProbingRate)
+	}
+	if c.BatchSize < 0 {
+		return fmt.Errorf("batch size cannot be negative: got %d", c.BatchSize)
 	}
 	if c.ProbeTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive: got %v", c.ProbeTimeout)
@@ -143,25 +124,10 @@ func (c *CaracalProberConfig) args() []string {
 		}
 	}
 	number("--probing-rate", c.ProbingRate)
-	text("--interface", c.Interface)
 	number("--batch-size", c.BatchSize)
 	text("--log-level", c.LogLevel)
-	number("--n-packets", c.NPackets)
-	number("--max-probes", c.MaxProbes)
-	text("--source-address-v4", c.SourceAddressV4)
-	text("--source-address-v6", c.SourceAddressV6)
-	number("--sniffer-wait-time", c.SnifferWaitTime)
 	text("--rate-limiting-method", c.RateLimitingMethod)
-	text("--filter-from-prefix-file-excl", c.FilterFromPrefixFileExcl)
-	text("--filter-from-prefix-file-incl", c.FilterFromPrefixFileIncl)
-	number("--filter-min-ttl", c.FilterMinTTL)
-	number("--filter-max-ttl", c.FilterMaxTTL)
-	number("--caracal-id", c.CaracalID)
-	text("--meta-round", c.MetaRound)
-	if c.NoIntegrityCheck {
-		args = append(args, "--no-integrity-check")
-	}
-	return args
+	return append(args, caracalFixedArgs...)
 }
 
 // CaracalProber is a prober that sends its probes with a caracal process.
