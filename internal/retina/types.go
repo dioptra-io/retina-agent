@@ -18,6 +18,17 @@ type PD struct {
 	SecondHalfWord uint16
 }
 
+// probeable reports whether the PD can be probed: its protocol is one the
+// agent probes with, and its far TTL, the near TTL plus one, fits in a TTL.
+func (pd *PD) probeable() bool {
+	switch pd.Protocol {
+	case 1, 17, 58:
+		return pd.NearTTL < 255
+	default:
+		return false
+	}
+}
+
 // FIE is a forwarding info element, as the agent reports it to the
 // orchestrator.
 type FIE struct {

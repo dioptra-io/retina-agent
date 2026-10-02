@@ -59,20 +59,13 @@ var caracalFixedArgs = []string{
 // CaracalProberConfig configures the caracal prober. The first group of
 // fields are caracal's own options, named after them; a zero value leaves
 // the option out, so that caracal uses its default. Caracal is also given
-// caracalFixedArgs.
+// caracalFixedArgs, and its rate, which follows from the prober's max PD
+// rate.
 type CaracalProberConfig struct {
 	// Path is the caracal executable. A name without a slash is looked up in
 	// PATH.
 	Path string `json:"path"`
 
-	// MaxPDRate is the most PDs per second caracal probes. A PD makes two
-	// packets, so caracal is given twice this as its rate in packets per
-	// second (--probing-rate). Left out, caracal's own default is 100
-	// packets per second, which is 50 PDs per second.
-	//
-	// It is a ceiling: PDs that come faster wait inside caracal, and their
-	// probe timeout runs while they wait.
-	MaxPDRate int `json:"max_pd_rate"`
 	// BatchSize is the number of packets sent between two checks of the rate
 	// (--batch-size).
 	BatchSize int `json:"batch_size"`
@@ -103,9 +96,6 @@ func (c *CaracalProberConfig) validate() error {
 	if c.Path == "" {
 		return fmt.Errorf("path cannot be empty")
 	}
-	if c.MaxPDRate < 0 {
-		return fmt.Errorf("max PD rate cannot be negative: got %d", c.MaxPDRate)
-	}
 	if c.BatchSize < 0 {
 		return fmt.Errorf("batch size cannot be negative: got %d", c.BatchSize)
 	}
@@ -121,8 +111,13 @@ func (c *CaracalProberConfig) validate() error {
 	return nil
 }
 
-// args returns the arguments caracal is started with.
-func (c *CaracalProberConfig) args() []string {
+// args returns the arguments caracal is started with, for an agent that
+// hands it at most maxPDRate PDs per second.
+//
+// A PD makes two packets. Caracal's own rate (--probing-rate) is set a tenth
+// above what the agent hands it, so that caracal never holds probes back in
+// normal operation, and only spreads out the PDs that reach it in a burst.
+func (c *CaracalProberConfig) args(maxPDRate int) []string {
 	var args []string
 	text := func(option, value string) {
 		if value != "" {
@@ -134,7 +129,7 @@ func (c *CaracalProberConfig) args() []string {
 			args = append(args, option, strconv.Itoa(value))
 		}
 	}
-	number("--probing-rate", 2*c.MaxPDRate)
+	number("--probing-rate", 2*maxPDRate*11/10)
 	number("--batch-size", c.BatchSize)
 	text("--log-level", c.LogLevel)
 	text("--rate-limiting-method", c.RateLimitingMethod)
@@ -155,9 +150,10 @@ func (c *CaracalProberConfig) args() []string {
 // answered. A separate loop looks for the PDs whose timeout has passed, and
 // sends their FIEs with the replies that came.
 type CaracalProber struct {
-	config *CaracalProberConfig
-	logger *slog.Logger
-	table  *caracalTable
+	config    *CaracalProberConfig
+	maxPDRate int
+	logger    *slog.Logger
+	table     *caracalTable
 	// pdsUnprobeable counts the PDs that were not probed, and
 	// repliesUndecodable the lines of caracal's output that were not replies.
 	pdsUnprobeable     atomic.Uint64
@@ -169,13 +165,14 @@ type CaracalProber struct {
 	idleSince atomic.Int64
 }
 
-// NewCaracalProber creates a caracal prober. The caracal process is started
-// by Run.
-func NewCaracalProber(config *CaracalProberConfig, logger *slog.Logger) *CaracalProber {
+// NewCaracalProber creates a caracal prober for an agent that hands it at
+// most maxPDRate PDs per second. The caracal process is started by Run.
+func NewCaracalProber(config *CaracalProberConfig, maxPDRate int, logger *slog.Logger) *CaracalProber {
 	return &CaracalProber{
-		config: config,
-		logger: logger,
-		table:  newCaracalTable(config.ProbeTimeout),
+		config:    config,
+		maxPDRate: maxPDRate,
+		logger:    logger,
+		table:     newCaracalTable(config.ProbeTimeout),
 	}
 }
 
@@ -184,7 +181,7 @@ func NewCaracalProber(config *CaracalProberConfig, logger *slog.Logger) *Caracal
 func (p *CaracalProber) Run(ctx context.Context, pds <-chan PD, fies chan<- FIE) error {
 	// Canceling the command's context kills caracal.
 	group, groupCtx := errgroup.WithContext(ctx)
-	cmd := exec.CommandContext(groupCtx, p.config.Path, p.config.args()...) //nolint:gosec // G204: the path is the operator's configuration
+	cmd := exec.CommandContext(groupCtx, p.config.Path, p.config.args(p.maxPDRate)...) //nolint:gosec // G204: the path is the operator's configuration
 	cmd.WaitDelay = p.config.StopTimeout
 
 	stdin, err := cmd.StdinPipe()

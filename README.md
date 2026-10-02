@@ -38,6 +38,8 @@ The Dockerfile builds an image with the agent and caracal v0.15.4.
 | --- | --- | --- |
 | `-id` | `agent-1` | Agent identifier presented to the orchestrator |
 | `-address` | `localhost:50050` | Orchestrator address, `host:port` |
+| `-max-pd-rate` | `10000` | Most PDs taken from the orchestrator and probed per second |
+| `-max-in-flight-pds` | `40000` | Most PDs held at once, from receiving a PD to sending its FIE (0 for no limit) |
 | `RETINA_SECRET` (environment) | empty | Shared secret presented in the handshake |
 
 These are the only settings that can be changed without rebuilding. Every other value (timeouts, queue sizes, caracal's options, the stats period) is set in the one config literal in [main.go](main.go). Flags for them, and the `RETINA_*` environment variables of the previous agent, are not implemented yet.

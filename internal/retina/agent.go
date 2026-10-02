@@ -15,6 +15,18 @@ import (
 	"time"
 )
 
+// pdLimiterBurst is how much unused rate the PD limiter keeps: after a
+// pause, the PDs of this long are let through at once.
+const pdLimiterBurst = 100 * time.Millisecond
+
+// pdLimiterSlack is how far ahead of its rate the PD limiter lets PDs run
+// before it waits, so that it waits once per group of PDs, not once per PD.
+const pdLimiterSlack = 5 * time.Millisecond
+
+// inFlightPollPeriod is how often an agent at its limit of PDs in flight
+// looks whether there is room again.
+const inFlightPollPeriod = 5 * time.Millisecond
+
 // stableSession is how long a connection must last for the reconnect backoff
 // to start over.
 const stableSession = 10 * time.Second
@@ -62,7 +74,47 @@ type Agent struct {
 	connections  atomic.Uint64
 	pdsReceived  atomic.Uint64
 	pdsMalformed atomic.Uint64
+	pdsInvalid   atomic.Uint64
 	fiesSent     atomic.Uint64
+	// limiter paces the PDs taken from the orchestrator.
+	limiter pdLimiter
+	// inFlight counts the PDs the agent holds: it goes up when a PD is
+	// received and down when its FIE is taken to be written to the
+	// orchestrator, or when either is discarded. inFlightMax is the highest
+	// it has been.
+	inFlight    atomic.Int64
+	inFlightMax atomic.Int64
+}
+
+// pdLimiter lets PDs through at a set rate. It is used by one goroutine at a
+// time.
+type pdLimiter struct {
+	// interval is the time one PD takes at the rate.
+	interval time.Duration
+	// next is when the next PD is due.
+	next time.Time
+}
+
+// wait takes the turn of one PD, and waits if the PDs are ahead of the rate.
+// It returns false if done is closed first.
+func (l *pdLimiter) wait(done <-chan struct{}) bool {
+	now := time.Now()
+	if earliest := now.Add(-pdLimiterBurst); l.next.Before(earliest) {
+		l.next = earliest
+	}
+	l.next = l.next.Add(l.interval)
+	ahead := l.next.Sub(now)
+	if ahead < pdLimiterSlack {
+		return true
+	}
+	timer := time.NewTimer(ahead)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-done:
+		return false
+	}
 }
 
 // NewAgent creates an agent from the given configuration.
@@ -78,11 +130,12 @@ func NewAgent(config *Config, logger *slog.Logger) (*Agent, error) {
 	}
 
 	return &Agent{
-		config: config,
-		logger: logger,
-		prober: NewCaracalProber(&config.Prober.Caracal, logger),
-		pds:    make(chan PD, config.Prober.PDQueueSize),
-		fies:   make(chan FIE, config.Prober.FIEQueueSize),
+		config:  config,
+		logger:  logger,
+		prober:  NewCaracalProber(&config.Prober.Caracal, config.Prober.MaxPDRate, logger),
+		pds:     make(chan PD, config.Prober.PDQueueSize),
+		fies:    make(chan FIE, config.Prober.FIEQueueSize),
+		limiter: pdLimiter{interval: time.Second / time.Duration(config.Prober.MaxPDRate)},
 	}, nil
 }
 
@@ -217,6 +270,7 @@ func (a *Agent) sendFIEs(conn *OrchestratorConn, end func(error), done <-chan st
 	for {
 		select {
 		case fie := <-a.fies:
+			a.inFlight.Add(-1)
 			if err := conn.SendFIE(&fie); err != nil {
 				end(err)
 				return
@@ -228,12 +282,17 @@ func (a *Agent) sendFIEs(conn *OrchestratorConn, end func(error), done <-chan st
 	}
 }
 
-// receivePDs hands the orchestrator's PDs to the prober. A full PD queue
-// blocks it, which slows the orchestrator down. A line that is not a PD is
-// logged and skipped. It returns when done is closed, and ends the session
-// when the connection fails.
+// receivePDs hands the orchestrator's PDs to the prober, no faster than the
+// max PD rate and only while the agent holds fewer PDs than its limit of PDs
+// in flight. PDs it does not take stay with the orchestrator, which is slowed
+// down. A full PD queue blocks it too. A line that is not a PD, and a PD that
+// cannot be probed, are logged and skipped. It returns when done is closed,
+// and ends the session when the connection fails.
 func (a *Agent) receivePDs(conn *OrchestratorConn, end func(error), done <-chan struct{}) {
 	for {
+		if !a.waitForRoom(done) {
+			return
+		}
 		pd, err := conn.ReceivePD()
 		if errors.Is(err, ErrMalformedPD) {
 			a.pdsMalformed.Add(1)
@@ -244,13 +303,41 @@ func (a *Agent) receivePDs(conn *OrchestratorConn, end func(error), done <-chan 
 			end(err)
 			return
 		}
+		if !pd.probeable() {
+			a.pdsInvalid.Add(1)
+			a.logger.Warn("Skipping PD that cannot be probed", slog.Uint64("pd_id", uint64(pd.ID)), slog.Int("protocol", int(pd.Protocol)), slog.Int("near_ttl", int(pd.NearTTL)))
+			continue
+		}
+		if !a.limiter.wait(done) {
+			return
+		}
 		a.pdsReceived.Add(1)
+		// Only this goroutine raises the count, so the max needs no more
+		// than a load and a store.
+		if inFlight := a.inFlight.Add(1); inFlight > a.inFlightMax.Load() {
+			a.inFlightMax.Store(inFlight)
+		}
 		select {
 		case a.pds <- pd:
 		case <-done:
+			a.inFlight.Add(-1)
 			return
 		}
 	}
+}
+
+// waitForRoom waits while the agent is at its limit of PDs in flight. It
+// returns false if done is closed first.
+func (a *Agent) waitForRoom(done <-chan struct{}) bool {
+	limit := int64(a.config.Prober.MaxInFlightPDs)
+	for limit > 0 && a.inFlight.Load() >= limit {
+		select {
+		case <-time.After(inFlightPollPeriod):
+		case <-done:
+			return false
+		}
+	}
+	return true
 }
 
 // sendLastFIEs sends the FIEs that wait in the queue and those already
@@ -262,6 +349,7 @@ func (a *Agent) sendLastFIEs(conn *OrchestratorConn) {
 	for err == nil {
 		select {
 		case fie := <-a.fies:
+			a.inFlight.Add(-1)
 			if err = conn.SendFIE(&fie); err == nil {
 				a.fiesSent.Add(1)
 			}
@@ -294,9 +382,12 @@ func (a *Agent) logStats(ctx context.Context) {
 			slog.Uint64("connections", a.connections.Load()),
 			slog.Uint64("pds_received", a.pdsReceived.Load()),
 			slog.Uint64("pds_malformed", a.pdsMalformed.Load()),
+			slog.Uint64("pds_invalid", a.pdsInvalid.Load()),
 			slog.Uint64("fies_sent", a.fiesSent.Load()),
 			slog.Int("pd_queue", len(a.pds)),
 			slog.Int("fie_queue", len(a.fies)),
+			slog.Int64("in_flight", a.inFlight.Load()),
+			slog.Int64("in_flight_max", a.inFlightMax.Load()),
 		}
 		if prober, ok := a.prober.(statsProber); ok {
 			attrs = append(attrs, prober.stats()...)
@@ -308,7 +399,8 @@ func (a *Agent) logStats(ctx context.Context) {
 	}
 }
 
-// discardQueues drops the PDs and FIEs waiting in the queues.
+// discardQueues drops the PDs and FIEs waiting in the queues. Each was a PD
+// in flight.
 func (a *Agent) discardQueues() {
 	for {
 		select {
@@ -317,6 +409,7 @@ func (a *Agent) discardQueues() {
 		default:
 			return
 		}
+		a.inFlight.Add(-1)
 	}
 }
 

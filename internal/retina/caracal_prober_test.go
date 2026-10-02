@@ -34,7 +34,6 @@ func requireMockCaracal(t *testing.T) {
 func testCaracalConfig(path string) *CaracalProberConfig {
 	return &CaracalProberConfig{
 		Path:            path,
-		MaxPDRate:       5_000,
 		ProbeTimeout:    300 * time.Millisecond,
 		WriteBufferSize: 4096,
 		StopTimeout:     time.Second,
@@ -61,7 +60,7 @@ func runCaracalProber(t *testing.T, config *CaracalProberConfig) (chan<- PD, <-c
 	fies := make(chan FIE, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewCaracalProber(config, slog.New(slog.DiscardHandler)).Run(ctx, pds, fies) }()
+	go func() { done <- NewCaracalProber(config, 5_000, slog.New(slog.DiscardHandler)).Run(ctx, pds, fies) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -216,17 +215,16 @@ func TestMockCaracal(t *testing.T) {
 
 func TestCaracalProberConfig_Args(t *testing.T) {
 	const fixed = "--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255"
-	for want, config := range map[string]*CaracalProberConfig{
-		"--probing-rate 10000 " + fixed: testCaracalConfig("caracal"),
-		// Every option left out: caracal uses its defaults for them.
-		fixed: {},
-		"--probing-rate 500 --batch-size 64 --log-level debug --rate-limiting-method sleep " + fixed: {
-			MaxPDRate: 250, BatchSize: 64, LogLevel: "debug", RateLimitingMethod: "sleep",
-		},
-	} {
-		if got := strings.Join(config.args(), " "); got != want {
-			t.Errorf("got %q, want %q", got, want)
-		}
+
+	// The rate is that of two packets per PD, and a tenth more.
+	config := testCaracalConfig("caracal")
+	if got, want := strings.Join(config.args(5_000), " "), "--probing-rate 11000 "+fixed; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	config = &CaracalProberConfig{BatchSize: 64, LogLevel: "debug", RateLimitingMethod: "sleep"}
+	want := "--probing-rate 550 --batch-size 64 --log-level debug --rate-limiting-method sleep " + fixed
+	if got := strings.Join(config.args(250), " "); got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -247,7 +245,7 @@ func TestCaracalProber_FailsWhenCaracalStops(t *testing.T) {
 		// Caracal's output only ends when caracal stops.
 		"closes output": testCaracalConfig(fakeCaracal(t, "exec cat > /dev/null")),
 	} {
-		prober := NewCaracalProber(config, slog.New(slog.DiscardHandler))
+		prober := NewCaracalProber(config, 5_000, slog.New(slog.DiscardHandler))
 		done := make(chan error, 1)
 		go func() { done <- prober.Run(t.Context(), make(chan PD), make(chan FIE)) }()
 		select {
@@ -430,7 +428,7 @@ func TestCaracalProber_FlushesFullBuffer(t *testing.T) {
 // caracal that writes two lines that are not replies and answers nothing.
 func TestCaracalProber_Stats(t *testing.T) {
 	config := testCaracalConfig(fakeCaracal(t, `echo garbage; echo "1,2,3"; cat > /dev/null`))
-	prober := NewCaracalProber(config, slog.New(slog.DiscardHandler))
+	prober := NewCaracalProber(config, 5_000, slog.New(slog.DiscardHandler))
 	pds := make(chan PD)
 	fies := make(chan FIE, 4)
 	ctx, cancel := context.WithCancel(context.Background())

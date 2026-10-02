@@ -24,8 +24,9 @@ Usage:
   smoke-test.sh [MOCK ORCHESTRATOR OPTION...]
 
 Environment:
-  RETINA_AGENT   the agent binary (default: ./retina-agent)
-  SMOKE_ADDRESS  the address the two meet on (default: 127.0.0.1:50977)
+  RETINA_AGENT      the agent binary (default: ./retina-agent)
+  SMOKE_AGENT_ARGS  more arguments for the agent, for example "-max-pd-rate 1000"
+  SMOKE_ADDRESS     the address the two meet on (default: 127.0.0.1:50977)
 EOF
 }
 
@@ -53,7 +54,8 @@ export PATH=${bin_dir}:${PATH}
 orchestrator_pid=$!
 
 # The agent logs to its standard output: keep it out of the FIEs.
-"${agent}" -id smoke-agent -address "${address}" >&2 &
+# shellcheck disable=SC2086 # The arguments are split on purpose.
+"${agent}" -id smoke-agent -address "${address}" ${SMOKE_AGENT_ARGS:-} >&2 &
 agent_pid=$!
 trap 'kill "${agent_pid}" "${orchestrator_pid}" 2>/dev/null || true; rm -r "${bin_dir}"' EXIT
 

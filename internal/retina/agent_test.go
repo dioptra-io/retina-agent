@@ -48,6 +48,7 @@ func testConfig(address string) *Config {
 		Prober: ProberConfig{
 			PDQueueSize:  16,
 			FIEQueueSize: 16,
+			MaxPDRate:    100_000,
 			Caracal:      *testCaracalConfig("caracal"),
 		},
 	}
@@ -155,6 +156,8 @@ func TestConfig_Validate(t *testing.T) {
 		"negative PD queue":        func(c *Config) { c.Prober.PDQueueSize = -1 },
 		"negative FIE queue":       func(c *Config) { c.Prober.FIEQueueSize = -1 },
 		"negative stats":           func(c *Config) { c.StatsPeriod = -1 },
+		"no PD rate":               func(c *Config) { c.Prober.MaxPDRate = 0 },
+		"negative in flight":       func(c *Config) { c.Prober.MaxInFlightPDs = -1 },
 		"no caracal path":          func(c *Config) { c.Prober.Caracal.Path = "" },
 		"negative caracal option":  func(c *Config) { c.Prober.Caracal.BatchSize = -1 },
 		"no caracal probe timeout": func(c *Config) { c.Prober.Caracal.ProbeTimeout = 0 },
@@ -362,10 +365,12 @@ func TestAgent_LogsStats(t *testing.T) {
 
 	conn := accept(t, listener)
 	reader := authenticate(t, conn)
-	fmt.Fprintln(conn, "this is not a PD")                       //nolint
+	fmt.Fprintln(conn, "this is not a PD") //nolint
+	// TCP is not a protocol the agent probes with.
+	fmt.Fprintf(conn, "9,%q,4,6,24000,33434\n", "198.51.100.9")  //nolint
 	fmt.Fprintf(conn, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatal(err)
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "1,") {
+		t.Fatalf("got FIE line %q, error %v", line, err)
 	}
 	time.Sleep(50 * time.Millisecond)
 	cancel()
@@ -384,7 +389,7 @@ func TestAgent_LogsStats(t *testing.T) {
 		t.Fatalf("got %d stats lines, want the periodic ones and the last one", len(stats))
 	}
 	last := stats[len(stats)-1]
-	want := "connections=1 pds_received=1 pds_malformed=1 fies_sent=1 pd_queue=0 fie_queue=0"
+	want := "connections=1 pds_received=1 pds_malformed=1 pds_invalid=1 fies_sent=1 pd_queue=0 fie_queue=0 in_flight=0 in_flight_max=1"
 	if !strings.Contains(last, want) {
 		t.Errorf("last stats line %q does not have %q", last, want)
 	}
@@ -554,5 +559,105 @@ func TestAgent_StopsWhenProberFails(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after the prober failed")
+	}
+}
+
+// TestAgent_LimitsPDRate sends PDs much faster than the max PD rate: beyond
+// the burst, the agent takes them at its rate.
+func TestAgent_LimitsPDRate(t *testing.T) {
+	listener := listen(t)
+	config := testConfig(listener.Addr().String())
+	config.Prober.MaxPDRate = 500
+	agent := newTestAgent(t, config, fakeProberConfig{MaxInflight: 16})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	// The burst is a tenth of a second, 50 PDs, and the 200 others take 0.4 s.
+	const count = 250
+	start := time.Now()
+	go func() {
+		for id := 1; id <= count; id++ {
+			fmt.Fprintf(conn, "%d,%q,4,17,24000,33434\n", id, "198.51.100.9") //nolint
+		}
+	}()
+	for id := 1; id <= count; id++ {
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatalf("FIE %d: %v", id, err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 350*time.Millisecond || elapsed > 2*time.Second {
+		t.Errorf("%d PDs took %v at 500 PDs per second, want about 0.4s", count, elapsed)
+	}
+}
+
+// TestAgent_LimitsPDsInFlight keeps the FIEs from being read: the agent must
+// stop receiving PDs at its limit of PDs in flight, and go on once FIEs
+// leave.
+func TestAgent_LimitsPDsInFlight(t *testing.T) {
+	listener := listen(t)
+	config := testConfig(listener.Addr().String())
+	config.Prober.MaxInFlightPDs = 5
+	config.Prober.PDQueueSize = 100
+	// A prober that holds every PD for a while stands for FIEs that cannot
+	// leave.
+	agent := newTestAgent(t, config, fakeProberConfig{Delay: 500 * time.Millisecond, MaxInflight: 100})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	const count = 20
+	for id := 1; id <= count; id++ {
+		fmt.Fprintf(conn, "%d,%q,4,17,24000,33434\n", id, "198.51.100.9") //nolint
+	}
+
+	// While the prober holds the first PDs, no more than the limit is taken.
+	time.Sleep(250 * time.Millisecond)
+	if received := agent.pdsReceived.Load(); received != 5 {
+		t.Fatalf("the agent took %d PDs, want it to stop at its limit of 5", received)
+	}
+
+	// Every PD is done in the end, and the limit was never passed.
+	for id := 1; id <= count; id++ {
+		if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, fmt.Sprintf("%d,", id)) {
+			t.Fatalf("FIE %d: got line %q, error %v", id, line, err)
+		}
+	}
+	if highest := agent.inFlightMax.Load(); highest != 5 {
+		t.Errorf("up to %d PDs were in flight, want 5", highest)
+	}
+	deadline := time.Now().Add(time.Second)
+	for agent.inFlight.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d PDs are still counted in flight", agent.inFlight.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAgent_DiscardedPDsAreNotInFlight checks that what is discarded at a
+// disconnect no longer counts as in flight.
+func TestAgent_DiscardedPDsAreNotInFlight(t *testing.T) {
+	agent := newTestAgent(t, testConfig("127.0.0.1:1"), testFake)
+	for id := uint32(1); id <= 3; id++ {
+		agent.pds <- PD{ID: id}
+		agent.fies <- FIE{PDID: id + 10}
+	}
+	agent.inFlight.Store(6)
+	agent.discardQueues()
+	if left := agent.inFlight.Load(); left != 0 || len(agent.pds) != 0 || len(agent.fies) != 0 {
+		t.Errorf("after the discard %d PDs are in flight, with %d PDs and %d FIEs queued", left, len(agent.pds), len(agent.fies))
 	}
 }

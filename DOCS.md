@@ -28,11 +28,16 @@ conn ──► receivePDs ──pds chan──► Prober.Run ──fies chan─�
 
 `runSession` dials (`ConnectTimeout` 5 s), does the handshake (`HandshakeTimeout` 5 s) and then runs three loops until the first error:
 
-- `receivePDs` reads PD lines into the PD queue (`PDQueueSize` 1024). A full queue blocks the read, which slows the orchestrator down; nothing is dropped. Blank lines are ignored. A line that is not a PD is logged, counted and skipped. A line longer than the read buffer, and any read error, ends the session.
+- `receivePDs` reads PD lines into the PD queue (`PDQueueSize` 1024). It takes them no faster than `MaxPDRate` and only while fewer than `MaxInFlightPDs` are in flight (see below); a full queue blocks it too. PDs it does not take stay with the orchestrator, which is slowed down; nothing is dropped. Blank lines are ignored. A line that is not a PD, and a PD that cannot be probed (a protocol other than 1, 17 or 58, or near TTL 255), are logged, counted and skipped. A line longer than the read buffer, and any read error, ends the session.
 - `sendFIEs` takes FIEs from the FIE queue (`FIEQueueSize` 1024) and writes them to a buffer (`WriteBufferSize` 64 KB).
 - `flushOrchestrator` sends the buffer every `FlushPeriod` (100 ms); it is also sent whenever it fills up.
 
 Neither direction has a deadline: an idle orchestrator is fine, and one that stops reading makes the agent wait. A dead orchestrator is detected by TCP keepalive (30 s idle, 3 probes 10 s apart), which matches the orchestrator's own values.
+
+### The two limits on PDs
+
+- `MaxPDRate` (10,000, flag `-max-pd-rate`) is the sustained rate PDs are taken at. After a pause, a tenth of a second of PDs is taken at once. Caracal's own rate is set a tenth above it (22,000 packets per second), so caracal does not hold probes back in normal operation and only spreads out a burst.
+- `MaxInFlightPDs` (40,000, flag `-max-in-flight-pds`, zero for no limit) bounds the PDs the agent holds: a counter goes up when a PD is received and down when its FIE is taken to be written to the orchestrator. At the limit the agent stops receiving. This is what bounds memory, and stops the probing, when the orchestrator reads FIEs slower than it sends PDs.
 
 ### What survives a lost connection
 
@@ -48,7 +53,7 @@ When the agent is stopped while connected, it sends the FIEs waiting in the queu
 
 ### CaracalProber (`caracal_prober.go`)
 
-Starts one caracal process (`Path`, looked up in `PATH`) with the four options of `CaracalProberConfig`: `--probing-rate`, `--batch-size`, `--log-level` and `--rate-limiting-method`. The rate is configured as `MaxPDRate` (10,000), in PDs per second; a PD makes two packets, so caracal gets twice the value as `--probing-rate`. A zero value leaves an option out. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
+Starts one caracal process (`Path`, looked up in `PATH`) with the three options of `CaracalProberConfig` (`--batch-size`, `--log-level`, `--rate-limiting-method`; a zero value leaves one out) and a `--probing-rate` derived from the prober's `MaxPDRate`: two packets per PD, plus a tenth. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
 
 | Loop | Role |
 | --- | --- |
@@ -57,7 +62,7 @@ Starts one caracal process (`Path`, looked up in `PATH`) with the four options o
 | `expirePDs` | every 100 ms sends the FIEs of the PDs whose `ProbeTimeout` (2 s) has passed, with the replies that came |
 | `logOutput` | logs caracal's standard error with `source=caracal` |
 
-A PD with a protocol other than 1, 17 or 58, or with near TTL 255, is logged and gets no FIE. If caracal exits, the prober returns an error and the agent stops.
+If caracal exits, the prober returns an error and the agent stops.
 
 ### The table (`caracal_table.go`)
 
@@ -72,8 +77,8 @@ A reply does not say which line it answers: it carries the probe's protocol, des
 
 Consequences:
 
-- When PDs arrive faster than `MaxPDRate`, probes wait inside caracal and can time out before they are sent. The agent has no rate limiter and no cap on PDs in flight.
-- The table has no size limit: it holds what arrived within one probe timeout.
+- The agent takes PDs no faster than `MaxPDRate`, so probes do not queue in caracal's input while their timeout runs. Without that limit the wait is bounded by what the input pipe holds (about 2,300 probes), which only exceeds the timeout at rates below about 600 PDs per second.
+- The table holds at most `MaxInFlightPDs` records.
 - When the reply to a probe shared by two PDs is lost, one of the two PDs is reported incomplete.
 
 ## 4. Stats log line
@@ -83,9 +88,10 @@ There are no metrics. Every `StatsPeriod` (10 s, zero disables it) and once more
 | Field | Meaning |
 | --- | --- |
 | `connections` | connections that passed the handshake |
-| `pds_received`, `pds_malformed` | PDs received, and lines that were not PDs |
+| `pds_received`, `pds_malformed`, `pds_invalid` | PDs received, lines that were not PDs, and PDs that cannot be probed |
 | `fies_sent` | FIEs written to a connection |
 | `pd_queue`, `fie_queue` | current sizes of the two queues |
+| `in_flight`, `in_flight_max` | PDs the agent holds now, and the most it has held |
 | `pds_probed`, `pds_unprobeable` | PDs registered in the table, and PDs that could not be probed |
 | `pds_in_flight` | PDs currently waiting for their FIE |
 | `replies_matched`, `replies_unmatched` | replies given to a PD, and replies no PD waited for |
@@ -97,7 +103,7 @@ The fields from `pds_probed` on come from the caracal prober. `replies_unmatched
 ## 5. Interaction with the orchestrator
 
 - **Orchestrator silent**: fine indefinitely; keepalive detects a dead peer in about a minute.
-- **Orchestrator stops reading FIEs**: the agent's writes wait. The FIE queue fills, the prober pauses, the PD queue fills, and the agent stops reading PDs. Nothing is dropped and the connection stays up.
+- **Orchestrator stops reading FIEs, or reads them slowly**: the agent's writes wait and the FIE queue fills. The PDs in flight keep their replies. Once `MaxInFlightPDs` are held the agent stops reading PDs, which slows the orchestrator down. Nothing is dropped and the connection stays up.
 - **Agent slow to read PDs**: the orchestrator has no send deadline and drops nothing; it sends the overdue PDs once the agent reads again.
 - **PD batching**: the orchestrator sends PDs in groups, so they arrive in bursts.
 

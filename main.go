@@ -51,12 +51,13 @@ func run() error {
 			PDQueueSize:               1024,
 			FIEQueueSize:              1024,
 			DiscardQueuedOnDisconnect: false,
+			MaxPDRate:                 10_000, // caracal sends at most 22,000 packets per second
+			MaxInFlightPDs:            40_000, // twice what is probed within one probe timeout
 			Caracal: retina.CaracalProberConfig{
 				Path: "caracal",
 
 				// Caracal's options. An empty or zero value leaves the
 				// option out, so that caracal uses its default.
-				MaxPDRate:          10_000, // 20,000 packets per second
 				BatchSize:          128,
 				LogLevel:           "info",
 				RateLimitingMethod: "auto",
@@ -70,6 +71,8 @@ func run() error {
 	}
 	flag.StringVar(&config.ID, "id", config.ID, "Unique identifier of this agent")
 	flag.StringVar(&config.Orchestrator.Address, "address", config.Orchestrator.Address, "Address of the orchestrator")
+	flag.IntVar(&config.Prober.MaxPDRate, "max-pd-rate", config.Prober.MaxPDRate, "Maximum number of PDs taken from the orchestrator and probed per second")
+	flag.IntVar(&config.Prober.MaxInFlightPDs, "max-in-flight-pds", config.Prober.MaxInFlightPDs, "Maximum number of PDs held at once, from receiving a PD to sending its FIE (0 for no limit)")
 	flag.Parse()
 
 	stop := context.AfterFunc(ctx, func() { logger.Info("Shut down signal detected") })
