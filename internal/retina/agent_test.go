@@ -5,6 +5,7 @@ package retina
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -144,6 +145,7 @@ func TestConfig_Validate(t *testing.T) {
 		"max below min":       func(c *Config) { c.Orchestrator.ReconnectMaxBackoff = time.Millisecond },
 		"negative PD queue":   func(c *Config) { c.Prober.PDQueueSize = -1 },
 		"negative FIE queue":  func(c *Config) { c.Prober.FIEQueueSize = -1 },
+		"negative stats":      func(c *Config) { c.StatsPeriod = -1 },
 		"negative mock delay": func(c *Config) { c.Prober.Mock.Delay = -1 },
 		"no mock inflight":    func(c *Config) { c.Prober.Mock.MaxInflight = 0 },
 		"no caracal path":     func(c *Config) { c.Prober.Caracal = testCaracalConfig("") },
@@ -312,23 +314,109 @@ func TestAgent_RetriesAfterRejectedHandshake(t *testing.T) {
 	}
 }
 
-func TestAgent_ReconnectsAfterMalformedPD(t *testing.T) {
+// TestAgent_SkipsMalformedPD checks that a line that is not a PD does not
+// end the connection: the PD sent after it on the same connection gets its
+// FIE.
+func TestAgent_SkipsMalformedPD(t *testing.T) {
 	listener := listen(t)
 	runAgent(t, testConfig(listener.Addr().String()))
 
-	// A line that is not a PD ends the connection.
-	first := accept(t, listener)
-	reader := authenticate(t, first)
-	fmt.Fprintln(first, "this is not a PD") //nolint
-	if _, err := reader.ReadString('\n'); err == nil {
-		t.Fatal("the agent kept the connection after a malformed PD")
-	}
-
-	second := accept(t, listener)
-	reader = authenticate(t, second)
-	fmt.Fprintf(second, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	fmt.Fprintln(conn, "this is not a PD")                       //nolint
+	fmt.Fprintf(conn, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
 	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "1,") {
 		t.Fatalf("got FIE line %q, error %v", line, err)
+	}
+}
+
+// TestAgent_SendsLastFIEsAtShutdown stops an agent that holds FIEs the
+// periodic flush has not sent: they must reach the orchestrator before the
+// connection is closed.
+func TestAgent_SendsLastFIEsAtShutdown(t *testing.T) {
+	listener := listen(t)
+	config := testConfig(listener.Addr().String())
+	config.Orchestrator.FlushPeriod = time.Hour
+	config.Orchestrator.ShutdownFlushTimeout = time.Second
+	config.Prober.Mock.Delay = 10 * time.Millisecond
+	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	const count = 3
+	for id := 1; id <= count; id++ {
+		fmt.Fprintf(conn, "%d,%q,4,17,24000,33434\n", id, "198.51.100.9") //nolint
+	}
+	// The FIEs are buffered once the agent has written them all.
+	deadline := time.Now().Add(5 * time.Second)
+	for agent.fiesSent.Load() < count {
+		if time.Now().After(deadline) {
+			t.Fatal("the agent did not produce the FIEs")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	for id := 1; id <= count; id++ {
+		line, err := reader.ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, fmt.Sprintf("%d,", id)) {
+			t.Fatalf("FIE %d: got line %q, error %v", id, line, err)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Run: got %v, want nil", err)
+	}
+}
+
+// TestAgent_LogsStats checks the stats log line: the periodic one, and the
+// last one, written at shutdown, which has the final counters.
+func TestAgent_LogsStats(t *testing.T) {
+	listener := listen(t)
+	config := testConfig(listener.Addr().String())
+	config.StatsPeriod = 10 * time.Millisecond
+	config.Prober.Mock.Delay = 0
+	var logs bytes.Buffer
+	agent, err := NewAgent(config, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+
+	conn := accept(t, listener)
+	reader := authenticate(t, conn)
+	fmt.Fprintln(conn, "this is not a PD")                       //nolint
+	fmt.Fprintf(conn, "1,%q,4,17,24000,33434\n", "198.51.100.9") //nolint
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: got %v, want nil", err)
+	}
+
+	// Run has returned: nothing writes to the logs any more.
+	var stats []string
+	for line := range strings.Lines(logs.String()) {
+		if strings.Contains(line, "msg=Stats") {
+			stats = append(stats, line)
+		}
+	}
+	if len(stats) < 2 {
+		t.Fatalf("got %d stats lines, want the periodic ones and the last one", len(stats))
+	}
+	last := stats[len(stats)-1]
+	want := "connections=1 pds_received=1 pds_malformed=1 fies_sent=1 pd_queue=0 fie_queue=0"
+	if !strings.Contains(last, want) {
+		t.Errorf("last stats line %q does not have %q", last, want)
 	}
 }
 

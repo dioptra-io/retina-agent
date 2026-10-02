@@ -34,17 +34,18 @@ func run() error {
 	config := &retina.Config{
 		ID: "agent-1",
 		Orchestrator: retina.OrchestratorConfig{
-			Address:             "localhost:50050",
-			Secret:              os.Getenv("RETINA_SECRET"),
-			ConnectTimeout:      5 * time.Second,
-			HandshakeTimeout:    5 * time.Second,
-			KeepAliveIdle:       30 * time.Second,
-			KeepAliveInterval:   10 * time.Second,
-			KeepAliveCount:      3,
-			WriteBufferSize:     64 * 1024,
-			FlushPeriod:         100 * time.Millisecond,
-			ReconnectMinBackoff: time.Second,
-			ReconnectMaxBackoff: 30 * time.Second,
+			Address:              "localhost:50050",
+			Secret:               os.Getenv("RETINA_SECRET"),
+			ConnectTimeout:       5 * time.Second,
+			HandshakeTimeout:     5 * time.Second,
+			KeepAliveIdle:        30 * time.Second,
+			KeepAliveInterval:    10 * time.Second,
+			KeepAliveCount:       3,
+			WriteBufferSize:      64 * 1024,
+			FlushPeriod:          100 * time.Millisecond,
+			ShutdownFlushTimeout: time.Second,
+			ReconnectMinBackoff:  time.Second,
+			ReconnectMaxBackoff:  30 * time.Second,
 		},
 		Prober: retina.ProberConfig{
 			PDQueueSize:               1024,
@@ -78,6 +79,7 @@ func run() error {
 				StopTimeout:     2 * time.Second,
 			},
 		},
+		StatsPeriod: 10 * time.Second,
 	}
 	flag.StringVar(&config.ID, "id", config.ID, "Unique identifier of this agent")
 	flag.StringVar(&config.Orchestrator.Address, "address", config.Orchestrator.Address, "Address of the orchestrator")

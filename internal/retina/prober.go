@@ -6,6 +6,7 @@ package retina
 import (
 	"context"
 	"fmt"
+	"log/slog"
 )
 
 // ProberConfig configures the prober and the queues between it and the
@@ -59,4 +60,10 @@ type Prober interface {
 	// The prober bounds its own PDs in flight. While it is at its limit, or
 	// while fies is full, it stops taking from pds.
 	Run(ctx context.Context, pds <-chan PD, fies chan<- FIE) error
+}
+
+// statsProber is a prober that has counters for the agent's stats log line.
+type statsProber interface {
+	// stats returns the counters, as totals since the prober started.
+	stats() []slog.Attr
 }

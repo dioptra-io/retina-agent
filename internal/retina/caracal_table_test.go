@@ -285,3 +285,28 @@ func TestCaracalTable_ManyRounds(t *testing.T) {
 		t.Errorf("got %d FIEs, want %d", fies, 50*20)
 	}
 }
+
+func TestCaracalTable_Stats(t *testing.T) {
+	table := newCaracalTable(2 * time.Second)
+
+	// PD 1 gets both replies, PD 2 only its near one, and one reply is for
+	// no PD.
+	issue(table, tablePD(1, 4), 0)
+	issue(table, tablePD(2, 9), 0)
+	at := tableStart.Add(time.Second)
+	table.match(tableReply(4, 1), at)
+	table.match(tableReply(5, 2), at)
+	table.match(tableReply(9, 3), at)
+	table.match(tableReply(20, 4), at)
+
+	want := caracalTableStats{registered: 2, matched: 3, unmatched: 1, complete: 1}
+	if got := table.snapshot(); got != want || got.inFlight() != 1 {
+		t.Fatalf("got %+v with %d in flight, want %+v with 1 in flight", got, got.inFlight(), want)
+	}
+
+	table.expire(tableStart.Add(3*time.Second), nil)
+	want.incomplete = 1
+	if got := table.snapshot(); got != want || got.inFlight() != 0 {
+		t.Fatalf("after expiry: got %+v with %d in flight, want %+v with none", got, got.inFlight(), want)
+	}
+}

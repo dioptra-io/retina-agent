@@ -5,6 +5,7 @@ package retina
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -108,8 +109,13 @@ func TestOrchestratorConn_ReceivePDRejectsBadLines(t *testing.T) {
 	} {
 		orchestrator, conn := dialOrchestrator(t)
 		fmt.Fprintln(orchestrator, line) //nolint
-		if _, err := conn.ReceivePD(); err == nil {
-			t.Errorf("expected an error for PD line %q", line)
+		// The good line behind it is still read.
+		fmt.Fprintln(orchestrator, `8,"198.51.100.9",4,17,24000,33434`) //nolint
+		if _, err := conn.ReceivePD(); !errors.Is(err, ErrMalformedPD) {
+			t.Errorf("PD line %q: got error %v, want ErrMalformedPD", line, err)
+		}
+		if pd, err := conn.ReceivePD(); err != nil || pd.ID != 8 {
+			t.Errorf("after PD line %q: got PD %+v, error %v", line, pd, err)
 		}
 	}
 }
@@ -145,8 +151,8 @@ func TestOrchestratorConn_ReceivePDRejectsOverlongLine(t *testing.T) {
 
 	// Longer than the read buffer: an error, not an endless read.
 	fmt.Fprintln(orchestrator, strings.Repeat("9", 100_000)) //nolint
-	if _, err := conn.ReceivePD(); err == nil {
-		t.Fatal("expected an error for an overlong line")
+	if _, err := conn.ReceivePD(); err == nil || errors.Is(err, ErrMalformedPD) {
+		t.Fatalf("got error %v, want a connection error for an overlong line", err)
 	}
 }
 

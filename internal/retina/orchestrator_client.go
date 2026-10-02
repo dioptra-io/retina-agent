@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -17,6 +18,10 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
+
+// ErrMalformedPD is the error of ReceivePD for a line that is not a PD. The
+// line is consumed: the next call reads the line after it.
+var ErrMalformedPD = errors.New("malformed PD")
 
 // OrchestratorConfig configures the connection to the orchestrator.
 type OrchestratorConfig struct {
@@ -43,6 +48,10 @@ type OrchestratorConfig struct {
 	// FIE reaches the orchestrator at most this long after SendFIE, sooner
 	// when the buffer fills up.
 	FlushPeriod time.Duration `json:"flush_period"`
+	// ShutdownFlushTimeout bounds the sending of the last FIEs when the agent
+	// shuts down: the FIEs that are queued or buffered at that time. Zero
+	// means no limit.
+	ShutdownFlushTimeout time.Duration `json:"shutdown_flush_timeout"`
 	// ReconnectMinBackoff is the wait before reconnecting after a connection
 	// is lost. The wait doubles after every connection that does not last, up
 	// to ReconnectMaxBackoff.
@@ -144,6 +153,9 @@ func (c *OrchestratorConn) Handshake(agentID string) error {
 // ReceivePD has no deadline: the orchestrator may stay silent for as long as
 // it has nothing to issue, and a dead orchestrator is detected by TCP
 // keepalive.
+//
+// A line that is not a PD gives an error that wraps ErrMalformedPD, after
+// which ReceivePD can be called again. Any other error is the connection's.
 func (c *OrchestratorConn) ReceivePD() (PD, error) {
 	var line []byte
 	for len(line) == 0 {
@@ -153,40 +165,48 @@ func (c *OrchestratorConn) ReceivePD() (PD, error) {
 		}
 		line = bytes.TrimSpace(raw)
 	}
+	pd, err := parsePD(line)
+	if err != nil {
+		return PD{}, fmt.Errorf("%w: line %q: %w", ErrMalformedPD, line, err)
+	}
+	return pd, nil
+}
 
+// parsePD decodes one PD line, without its line ending.
+func parsePD(line []byte) (PD, error) {
 	var fields [6][]byte
 	rest := line
 	for i := range fields {
 		field, after, found := bytes.Cut(rest, []byte{','})
 		if found != (i < len(fields)-1) {
-			return PD{}, fmt.Errorf("cannot decode PD %q: want %d fields", line, len(fields))
+			return PD{}, fmt.Errorf("want %d fields", len(fields))
 		}
 		fields[i], rest = field, after
 	}
 
 	id, err := strconv.ParseUint(string(fields[0]), 10, 32)
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid id: %w", line, err)
+		return PD{}, fmt.Errorf("invalid id: %w", err)
 	}
 	destination, err := netip.ParseAddr(string(bytes.Trim(fields[1], `"`)))
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid destination: %w", line, err)
+		return PD{}, fmt.Errorf("invalid destination: %w", err)
 	}
 	nearTTL, err := strconv.ParseUint(string(fields[2]), 10, 8)
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid near TTL: %w", line, err)
+		return PD{}, fmt.Errorf("invalid near TTL: %w", err)
 	}
 	protocol, err := strconv.ParseUint(string(fields[3]), 10, 8)
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid protocol: %w", line, err)
+		return PD{}, fmt.Errorf("invalid protocol: %w", err)
 	}
 	firstHalfWord, err := strconv.ParseUint(string(fields[4]), 10, 16)
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid first half word: %w", line, err)
+		return PD{}, fmt.Errorf("invalid first half word: %w", err)
 	}
 	secondHalfWord, err := strconv.ParseUint(string(fields[5]), 10, 16)
 	if err != nil {
-		return PD{}, fmt.Errorf("cannot decode PD %q: invalid second half word: %w", line, err)
+		return PD{}, fmt.Errorf("invalid second half word: %w", err)
 	}
 
 	return PD{
@@ -231,6 +251,13 @@ func (c *OrchestratorConn) Flush() error {
 		return fmt.Errorf("cannot flush FIEs: %w", err)
 	}
 	return nil
+}
+
+// SetWriteDeadline sets the time after which SendFIE and Flush fail instead of
+// waiting for the orchestrator, also for a call that is already waiting. The
+// zero time means no deadline.
+func (c *OrchestratorConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
 }
 
 // RemoteAddr returns the orchestrator's network address.

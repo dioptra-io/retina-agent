@@ -6,10 +6,12 @@ package retina
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +25,8 @@ type Config struct {
 	ID           string             `json:"id"`
 	Orchestrator OrchestratorConfig `json:"orchestrator"`
 	Prober       ProberConfig       `json:"prober"`
+	// StatsPeriod is how often the agent logs its counters. Zero means never.
+	StatsPeriod time.Duration `json:"stats_period"`
 }
 
 // Validate reports whether the configuration is usable.
@@ -35,6 +39,9 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Prober.validate(); err != nil {
 		return fmt.Errorf("prober: %w", err)
+	}
+	if c.StatsPeriod < 0 {
+		return fmt.Errorf("stats period cannot be negative: got %v", c.StatsPeriod)
 	}
 	return nil
 }
@@ -49,6 +56,13 @@ type Agent struct {
 	// them when a connection is lost is handled on the next one.
 	pds  chan PD
 	fies chan FIE
+	// The counters of the stats log line, all since the agent started:
+	// connections that passed the handshake, PDs and malformed PD lines
+	// received, and FIEs written to a connection.
+	connections  atomic.Uint64
+	pdsReceived  atomic.Uint64
+	pdsMalformed atomic.Uint64
+	fiesSent     atomic.Uint64
 }
 
 // NewAgent creates an agent from the given configuration.
@@ -93,9 +107,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		cancel()
 	}()
 
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		a.logStats(runCtx)
+	}()
+
 	a.runSessions(runCtx)
 
 	err := <-proberDone
+	cancel()
+	<-statsDone
 	if ctx.Err() != nil {
 		a.logger.Info("Shutting down")
 		return nil
@@ -159,12 +181,22 @@ func (a *Agent) runSession(ctx context.Context) (time.Duration, error) {
 	}
 	defer end(nil)
 
-	stop := context.AfterFunc(ctx, func() { end(ctx.Err()) })
+	// At shutdown the last FIEs are sent before the connection is closed,
+	// unless it is still in its handshake.
+	var established atomic.Bool
+	stop := context.AfterFunc(ctx, func() {
+		if established.Load() {
+			a.sendLastFIEs(conn)
+		}
+		end(ctx.Err())
+	})
 	defer stop()
 
 	if err := conn.Handshake(a.config.ID); err != nil {
 		return 0, err
 	}
+	established.Store(true)
+	a.connections.Add(1)
 	start := time.Now()
 	a.logger.Info("Connected to orchestrator", slog.String("remote_addr", conn.RemoteAddr().String()))
 
@@ -176,44 +208,109 @@ func (a *Agent) runSession(ctx context.Context) (time.Duration, error) {
 	}
 
 	var group sync.WaitGroup
+	group.Go(func() { a.sendFIEs(conn, end, done) })
+	group.Go(func() { a.flushOrchestrator(conn, end, done) })
+	a.receivePDs(conn, end, done)
+	group.Wait()
+	return time.Since(start), sessionErr
+}
 
-	// The sender buffers the prober's FIEs for the flusher. A FIE it has
-	// taken when the connection fails is lost.
-	group.Go(func() {
-		for {
-			select {
-			case fie := <-a.fies:
-				if err := conn.SendFIE(&fie); err != nil {
-					end(err)
-					return
-				}
-			case <-done:
+// sendFIEs buffers the prober's FIEs for the flusher. A FIE it has taken when
+// the connection fails is lost. It returns when done is closed, and ends the
+// session when the connection fails.
+func (a *Agent) sendFIEs(conn *OrchestratorConn, end func(error), done <-chan struct{}) {
+	for {
+		select {
+		case fie := <-a.fies:
+			if err := conn.SendFIE(&fie); err != nil {
+				end(err)
 				return
 			}
+			a.fiesSent.Add(1)
+		case <-done:
+			return
 		}
-	})
+	}
+}
 
-	group.Go(func() {
-		a.flushOrchestrator(conn, end, done)
-	})
-
-	// A full PD queue blocks here, which slows the orchestrator down.
-receive:
+// receivePDs hands the orchestrator's PDs to the prober. A full PD queue
+// blocks it, which slows the orchestrator down. A line that is not a PD is
+// logged and skipped. It returns when done is closed, and ends the session
+// when the connection fails.
+func (a *Agent) receivePDs(conn *OrchestratorConn, end func(error), done <-chan struct{}) {
 	for {
 		pd, err := conn.ReceivePD()
+		if errors.Is(err, ErrMalformedPD) {
+			a.pdsMalformed.Add(1)
+			a.logger.Warn("Skipping PD", slog.Any("err", err))
+			continue
+		}
 		if err != nil {
 			end(err)
-			break
+			return
 		}
+		a.pdsReceived.Add(1)
 		select {
 		case a.pds <- pd:
 		case <-done:
-			break receive
+			return
 		}
 	}
+}
 
-	group.Wait()
-	return time.Since(start), sessionErr
+// sendLastFIEs sends the FIEs that wait in the queue and those already
+// buffered, within the shutdown flush timeout. It is called at shutdown,
+// before the connection is closed. FIEs of PDs still in flight are not waited
+// for.
+func (a *Agent) sendLastFIEs(conn *OrchestratorConn) {
+	err := conn.SetWriteDeadline(deadline(a.config.Orchestrator.ShutdownFlushTimeout))
+	for err == nil {
+		select {
+		case fie := <-a.fies:
+			if err = conn.SendFIE(&fie); err == nil {
+				a.fiesSent.Add(1)
+			}
+			continue
+		default:
+		}
+		err = conn.Flush()
+		break
+	}
+	if err != nil {
+		a.logger.Warn("Cannot send the last FIEs", slog.Any("err", err))
+	}
+}
+
+// logStats logs the agent's counters every stats period, and once more when
+// ctx is done. The counters are totals since the agent started; the queue
+// sizes are those of the moment.
+func (a *Agent) logStats(ctx context.Context) {
+	if a.config.StatsPeriod <= 0 {
+		return
+	}
+	ticker := time.NewTicker(a.config.StatsPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+		}
+		attrs := []slog.Attr{
+			slog.Uint64("connections", a.connections.Load()),
+			slog.Uint64("pds_received", a.pdsReceived.Load()),
+			slog.Uint64("pds_malformed", a.pdsMalformed.Load()),
+			slog.Uint64("fies_sent", a.fiesSent.Load()),
+			slog.Int("pd_queue", len(a.pds)),
+			slog.Int("fie_queue", len(a.fies)),
+		}
+		if prober, ok := a.prober.(statsProber); ok {
+			attrs = append(attrs, prober.stats()...)
+		}
+		a.logger.LogAttrs(context.Background(), slog.LevelInfo, "Stats", attrs...)
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
 // discardQueues drops the PDs and FIEs waiting in the queues.

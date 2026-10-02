@@ -7,7 +7,7 @@ help:
 	@echo "  fmt         - Format code"
 	@echo "  tidy        - Tidy go modules"
 	@echo "  test        - Run tests with race detection and generate coverage profile"
-	@echo "  smoke       - Run the agent against the mock orchestrator and check that every PD comes back as a FIE"
+	@echo "  smoke       - Run the agent against the mock orchestrator and check that every PD comes back as a FIE, without and with a reconnect"
 	@echo "  cover       - View test coverage in browser"
 	@echo "  run         - Build and run retina-agent"
 	@echo "  clean       - Remove built binaries and coverage files"
@@ -31,6 +31,7 @@ test:
 smoke:
 	go build -o retina-agent .
 	./scripts/smoke-test.sh $(SMOKE_ARGS)
+	./scripts/smoke-test.sh --drop-after 5 $(SMOKE_ARGS)
 
 cover:
 	go tool cover -html=coverage.out

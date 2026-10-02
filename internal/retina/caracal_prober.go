@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -180,6 +181,10 @@ type CaracalProber struct {
 	config *CaracalProberConfig
 	logger *slog.Logger
 	table  *caracalTable
+	// pdsUnprobeable counts the PDs that were not probed, and
+	// repliesUndecodable the lines of caracal's output that were not replies.
+	pdsUnprobeable     atomic.Uint64
+	repliesUndecodable atomic.Uint64
 }
 
 // NewCaracalProber creates a caracal prober. The caracal process is started
@@ -239,6 +244,21 @@ func (p *CaracalProber) Run(ctx context.Context, pds <-chan PD, fies chan<- FIE)
 	return fmt.Errorf("caracal stopped: %w", errors.Join(err, waitErr))
 }
 
+// stats implements statsProber.
+func (p *CaracalProber) stats() []slog.Attr {
+	table := p.table.snapshot()
+	return []slog.Attr{
+		slog.Uint64("pds_probed", table.registered),
+		slog.Uint64("pds_unprobeable", p.pdsUnprobeable.Load()),
+		slog.Uint64("pds_in_flight", table.inFlight()),
+		slog.Uint64("replies_matched", table.matched),
+		slog.Uint64("replies_unmatched", table.unmatched),
+		slog.Uint64("replies_undecodable", p.repliesUndecodable.Load()),
+		slog.Uint64("fies_complete", table.complete),
+		slog.Uint64("fies_incomplete", table.incomplete),
+	}
+}
+
 // writeProbes registers every PD and writes its near and far probe to
 // caracal. It returns when ctx is done or caracal no longer takes probes.
 func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, pds <-chan PD) error {
@@ -264,6 +284,7 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 		case pd := <-pds:
 			protocol, ok := caracalProtocol(pd.Protocol)
 			if !ok || pd.NearTTL == 255 {
+				p.pdsUnprobeable.Add(1)
 				p.logger.Warn("Cannot probe PD", slog.Uint64("pd_id", uint64(pd.ID)), slog.Int("protocol", int(pd.Protocol)), slog.Int("near_ttl", int(pd.NearTTL)))
 				continue
 			}
@@ -317,6 +338,7 @@ func (p *CaracalProber) readReplies(ctx context.Context, stdout io.Reader, fies 
 		}
 		reply, err := parseCaracalReply(line)
 		if err != nil {
+			p.repliesUndecodable.Add(1)
 			p.logger.Warn("Cannot decode caracal reply", slog.Any("err", err))
 			continue
 		}

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -431,5 +432,44 @@ func TestCaracalProber_FlushesFullBuffer(t *testing.T) {
 			t.Fatalf("got %+v, want one complete FIE per PD", fie)
 		}
 		seen[fie.PDID] = true
+	}
+}
+
+// TestCaracalProber_Stats checks the counters of the stats log line, with a
+// caracal that writes two lines that are not replies and answers nothing.
+func TestCaracalProber_Stats(t *testing.T) {
+	config := testCaracalConfig(fakeCaracal(t, `echo garbage; echo "1,2,3"; cat > /dev/null`))
+	prober := NewCaracalProber(config, slog.New(slog.DiscardHandler))
+	pds := make(chan PD)
+	fies := make(chan FIE, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- prober.Run(ctx, pds, fies) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// TCP is not a protocol caracal probes with.
+	sendPD(t, pds, PD{ID: 9, Destination: netip.MustParseAddr("198.51.100.9"), NearTTL: 4, Protocol: 6})
+	sendPD(t, pds, testPDs[0])
+	receiveFIEs(t, fies, 1)
+
+	got := map[string]uint64{}
+	for _, attr := range prober.stats() {
+		got[attr.Key] = attr.Value.Uint64()
+	}
+	want := map[string]uint64{
+		"pds_probed":          1,
+		"pds_unprobeable":     1,
+		"pds_in_flight":       0,
+		"replies_matched":     0,
+		"replies_unmatched":   0,
+		"replies_undecodable": 2,
+		"fies_complete":       0,
+		"fies_incomplete":     1,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("got stats %v, want %v", got, want)
 	}
 }

@@ -108,6 +108,31 @@ type caracalTable struct {
 	// order of their flush time, which is the order they expire in. Records
 	// whose FIE is already made stay in it until their turn.
 	flushed []*caracalRecord
+	stats   caracalTableStats
+}
+
+// caracalTableStats are the counters of a table, since it was made.
+type caracalTableStats struct {
+	// registered counts the records, one per PD issuance.
+	registered uint64
+	// matched counts the replies given to a record, and unmatched those no
+	// record waited for.
+	matched, unmatched uint64
+	// complete counts the FIEs made with both replies, and incomplete those
+	// made at the timeout.
+	complete, incomplete uint64
+}
+
+// inFlight returns the number of records that still wait for their FIE.
+func (s caracalTableStats) inFlight() uint64 {
+	return s.registered - s.complete - s.incomplete
+}
+
+// snapshot returns the table's counters.
+func (t *caracalTable) snapshot() caracalTableStats {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stats
 }
 
 func newCaracalTable(timeout time.Duration) *caracalTable {
@@ -131,6 +156,7 @@ func (t *caracalTable) register(pd *PD) *caracalRecord {
 	defer t.mu.Unlock()
 	t.sequence++
 	record.sequence = t.sequence
+	t.stats.registered++
 	t.nodes[record.nearKey] = append(t.nodes[record.nearKey], caracalPDNode{record: record})
 	t.nodes[record.farKey] = append(t.nodes[record.farKey], caracalPDNode{record: record, far: true})
 	return record
@@ -172,8 +198,10 @@ func (t *caracalTable) match(reply *caracalReply, now time.Time) (FIE, bool) {
 		}
 	}
 	if chosen == nil {
+		t.stats.unmatched++
 		return FIE{}, false
 	}
+	t.stats.matched++
 
 	record := chosen.record
 	if chosen.far {
@@ -184,6 +212,7 @@ func (t *caracalTable) match(reply *caracalReply, now time.Time) (FIE, bool) {
 	if !record.near.IsValid() || !record.far.IsValid() {
 		return FIE{}, false
 	}
+	t.stats.complete++
 	return t.finish(record, now), true
 }
 
@@ -222,6 +251,7 @@ func (t *caracalTable) expire(now time.Time, fies []FIE) []FIE {
 			break
 		}
 		if !record.done {
+			t.stats.incomplete++
 			fies = append(fies, t.finish(record, now))
 		}
 		count++

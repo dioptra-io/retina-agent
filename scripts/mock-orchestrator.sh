@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 #
-# mock-orchestrator.sh imitates the orchestrator for one agent connection, so
-# that the agent can be tried without one.
+# mock-orchestrator.sh imitates the orchestrator for one agent, so that the
+# agent can be tried without one.
 #
 # It listens for an agent, answers its handshake, sends it a set of PDs, and
 # writes the FIEs the agent returns to the standard output, one per line as
 # received. Logs go to the standard error. It exits with status 0 when every
 # PD got exactly one FIE, and 1 otherwise.
+#
+# With --drop-after it drops the connection once, part of the way through the
+# PDs, and waits for the agent to connect again before it sends the rest. The
+# connection is dropped as soon as the PDs sent so far have their FIEs, or
+# after one second: FIEs that come later are expected on the next connection.
+# FIEs the agent was sending at the time of the drop are lost.
 #
 # The PDs are made up from a seed: the same seed and count always give the
 # same PDs. Their destinations are in the documentation ranges (192.0.2.0/24,
@@ -39,6 +45,9 @@ Usage:
   -h, --help          Show this message
   -a, --address arg   Listening address for the agent connection (default: 127.0.0.1:50050)
   -n, --count arg     Number of PDs to send (default: 10)
+  -d, --drop-after arg
+                      Drop the connection after this many PDs and wait for the
+                      agent to connect again (default: 0, never)
   -s, --seed arg      Seed the PDs are made up from (default: 42)
   -w, --wait arg      Seconds to wait for the FIEs after the last PD is sent (default: 10)
 
@@ -53,6 +62,7 @@ fi
 
 address=127.0.0.1:50050
 count=10
+drop_after=0
 seed=42
 wait_seconds=10
 secret=${RETINA_SECRET:-}
@@ -65,7 +75,7 @@ while (($# > 0)); do
 		usage
 		exit 0
 		;;
-	-a | --address | -n | --count | -s | --seed | -w | --wait) ;;
+	-a | --address | -n | --count | -d | --drop-after | -s | --seed | -w | --wait) ;;
 	*)
 		echo "Option '${option}' does not exist" >&2
 		usage >&2
@@ -79,13 +89,14 @@ while (($# > 0)); do
 	case ${option} in
 	-a | --address) address=$1 ;;
 	-n | --count) count=$1 ;;
+	-d | --drop-after) drop_after=$1 ;;
 	-s | --seed) seed=$1 ;;
 	-w | --wait) wait_seconds=$1 ;;
 	esac
 	shift
 done
 
-for setting in count seed wait_seconds; do
+for setting in count drop_after seed wait_seconds; do
 	if [[ ! ${!setting} =~ ^[0-9]+$ ]]; then
 		echo "${setting} must be a non-negative integer: got '${!setting}'" >&2
 		exit 1
@@ -157,69 +168,99 @@ while ((id <= count)); do
 	id=$((id + 1))
 done
 
-log "Listening for an agent on ${address}"
-coproc NC { nc -l "${host}" "${port}"; }
-# shellcheck disable=SC2153 # NC_PID is set by coproc.
-nc_pid=${NC_PID}
-exec {from_agent}<&"${NC[0]}" {to_agent}>&"${NC[1]}"
-trap 'kill "${nc_pid}" 2>/dev/null || true' EXIT
+# connect waits for an agent to connect and answers its handshake, which is
+# one JSON line each way.
+connect() {
+	log "Listening for an agent on ${address}"
+	coproc NC { nc -l "${host}" "${port}"; }
+	# shellcheck disable=SC2153 # NC_PID is set by coproc.
+	nc_pid=${NC_PID}
+	exec {from_agent}<&"${NC[0]}" {to_agent}>&"${NC[1]}"
 
-# The handshake: one JSON line each way.
-if ! IFS= read -r -u "${from_agent}" request; then
-	log "No agent connected"
-	exit 1
-fi
-agent_id=
-if [[ ${request} =~ \"agent_id\":\"([^\"]*)\" ]]; then
-	agent_id=${BASH_REMATCH[1]}
-fi
-agent_secret=
-if [[ ${request} =~ \"secret\":\"([^\"]*)\" ]]; then
-	agent_secret=${BASH_REMATCH[1]}
-fi
-if [[ -z ${agent_id} ]]; then
-	echo '{"authenticated":false,"message":"agent id is empty"}' >&"${to_agent}"
-	log "Agent rejected: agent id is empty"
-	exit 1
-fi
-if [[ ${agent_secret} != "${secret}" ]]; then
-	echo '{"authenticated":false,"message":"secret is not correct"}' >&"${to_agent}"
-	log "Agent ${agent_id} rejected: secret is not correct"
-	exit 1
-fi
-echo '{"authenticated":true,"message":"authenticated"}' >&"${to_agent}"
-log "Agent ${agent_id} connected"
+	local request agent_id='' agent_secret=''
+	if ! IFS= read -r -u "${from_agent}" request; then
+		log "No agent connected"
+		exit 1
+	fi
+	if [[ ${request} =~ \"agent_id\":\"([^\"]*)\" ]]; then
+		agent_id=${BASH_REMATCH[1]}
+	fi
+	if [[ ${request} =~ \"secret\":\"([^\"]*)\" ]]; then
+		agent_secret=${BASH_REMATCH[1]}
+	fi
+	if [[ -z ${agent_id} ]]; then
+		echo '{"authenticated":false,"message":"agent id is empty"}' >&"${to_agent}"
+		log "Agent rejected: agent id is empty"
+		exit 1
+	fi
+	if [[ ${agent_secret} != "${secret}" ]]; then
+		echo '{"authenticated":false,"message":"secret is not correct"}' >&"${to_agent}"
+		log "Agent ${agent_id} rejected: secret is not correct"
+		exit 1
+	fi
+	echo '{"authenticated":true,"message":"authenticated"}' >&"${to_agent}"
+	log "Agent ${agent_id} connected"
+}
 
-for ((id = 1; id <= count; id++)); do
-	log "PD  ${pds[${id}]}"
-	printf '%s\n' "${pds[${id}]}" >&"${to_agent}"
-done
-log "Sent ${count} PDs, waiting up to ${wait_seconds}s for their FIEs"
+# disconnect drops the agent's connection.
+disconnect() {
+	exec {from_agent}<&- {to_agent}>&-
+	kill "${nc_pid}" 2>/dev/null || true
+	wait "${nc_pid}" 2>/dev/null || true
+}
 
 declare -A answered=()
 received=0
 unexpected=0
-deadline=$((SECONDS + wait_seconds))
-while ((received < count && SECONDS < deadline)); do
-	if ! IFS= read -r -t $((deadline - SECONDS)) -u "${from_agent}" fie; then
-		# The wait is over, or the agent closed the connection.
-		break
+
+# read_fies reads the agent's FIEs until $1 PDs have their FIE, for at most $2
+# seconds, or until the agent closes the connection.
+read_fies() {
+	local expected=$1 fie id now left timeout
+	local deadline=$((${EPOCHREALTIME/./} + $2 * 1000000))
+	while ((received < expected)); do
+		now=${EPOCHREALTIME/./}
+		left=$((deadline - now))
+		if ((left <= 0)); then
+			break
+		fi
+		printf -v timeout '%d.%06d' $((left / 1000000)) $((left % 1000000))
+		if ! IFS= read -r -t "${timeout}" -u "${from_agent}" fie; then
+			# The wait is over, or the agent closed the connection.
+			break
+		fi
+		printf '%s\n' "${fie}"
+		if [[ ! ${fie} =~ ^([0-9]+),[0-9]+,\"[^\"]*\",[0-9]+,\"[^\"]*\",[0-9]+$ ]]; then
+			log "Not a FIE: ${fie}"
+			unexpected=$((unexpected + 1))
+			continue
+		fi
+		id=${BASH_REMATCH[1]}
+		if [[ -z ${pds[${id}]:-} || -n ${answered[${id}]:-} ]]; then
+			log "FIE of an unknown or already answered PD: ${fie}"
+			unexpected=$((unexpected + 1))
+			continue
+		fi
+		answered[${id}]=1
+		received=$((received + 1))
+	done
+}
+
+trap 'kill "${nc_pid:-}" 2>/dev/null || true' EXIT
+connect
+
+for ((id = 1; id <= count; id++)); do
+	log "PD  ${pds[${id}]}"
+	printf '%s\n' "${pds[${id}]}" >&"${to_agent}"
+	if ((id == drop_after && id < count)); then
+		read_fies "${id}" 1
+		log "Dropping the connection after ${id} PDs, ${received} FIEs received"
+		disconnect
+		connect
 	fi
-	printf '%s\n' "${fie}"
-	if [[ ! ${fie} =~ ^([0-9]+),[0-9]+,\"[^\"]*\",[0-9]+,\"[^\"]*\",[0-9]+$ ]]; then
-		log "Not a FIE: ${fie}"
-		unexpected=$((unexpected + 1))
-		continue
-	fi
-	id=${BASH_REMATCH[1]}
-	if [[ -z ${pds[${id}]:-} || -n ${answered[${id}]:-} ]]; then
-		log "FIE of an unknown or already answered PD: ${fie}"
-		unexpected=$((unexpected + 1))
-		continue
-	fi
-	answered[${id}]=1
-	received=$((received + 1))
 done
+log "Sent ${count} PDs, waiting up to ${wait_seconds}s for their FIEs"
+read_fies "${count}" "${wait_seconds}"
 
 if ((received == count && unexpected == 0)); then
 	log "OK: all ${count} PDs got their FIE"
