@@ -8,6 +8,7 @@ package agent
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -324,5 +325,71 @@ func TestMockProber_Close(t *testing.T) {
 	err = prober.Close()
 	if err != nil {
 		t.Errorf("Second Close() returned error: %v", err)
+	}
+}
+
+func TestMockProber_AlwaysTimeout(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{ProbeTimeout: 150 * time.Millisecond, MockAlwaysTimeout: true}
+	prober := NewMockProber(cfg)
+	defer func() { _ = prober.Close() }()
+
+	pd := makeProbingDirective("8.8.8.8", api.ICMP)
+	for range 5 {
+		start := time.Now()
+		result, err := prober.Probe(context.Background(), pd, 10)
+		if err != nil {
+			t.Fatalf("Probe failed: %v", err)
+		}
+		if !result.TimedOut {
+			t.Fatal("probe should always time out")
+		}
+		if elapsed := time.Since(start); elapsed < cfg.ProbeTimeout {
+			t.Errorf("probe returned after %v, want at least %v", elapsed, cfg.ProbeTimeout)
+		}
+	}
+}
+
+func TestMockProber_ProbingRate(t *testing.T) {
+	t.Parallel()
+
+	// 20 probes at 100 probes/s: the last one is sent 190ms after the first.
+	cfg := &Config{ProbeTimeout: time.Millisecond, MockAlwaysTimeout: true, MockProbingRate: 100}
+	prober := NewMockProber(cfg)
+	defer func() { _ = prober.Close() }()
+
+	pd := makeProbingDirective("8.8.8.8", api.ICMP)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			if _, err := prober.Probe(context.Background(), pd, 10); err != nil {
+				t.Errorf("Probe failed: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if elapsed := time.Since(start); elapsed < 190*time.Millisecond {
+		t.Errorf("20 probes at 100/s took %v, want at least 190ms", elapsed)
+	}
+}
+
+func TestMockProber_ProbingRateContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{MockProbingRate: 1}
+	prober := NewMockProber(cfg)
+	defer func() { _ = prober.Close() }()
+
+	pd := makeProbingDirective("8.8.8.8", api.ICMP)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _, _ = prober.Probe(ctx, pd, 10) }() // takes the first send slot
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	if _, err := prober.Probe(ctx, pd, 10); err == nil {
+		t.Fatal("probe waiting for its send slot should return the context error")
 	}
 }

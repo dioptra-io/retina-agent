@@ -85,6 +85,8 @@ compatible with this protocol version.
 | `--pds-buffer` | `100` | Directives channel buffer size |
 | `--fies-buffer` | `100` | FIEs channel buffer size |
 | `--max-inflight-pds` | `100000` | Maximum concurrently processed PDs; `0` is unlimited |
+| `--mock-probing-rate` | `0` | Mock prober only: maximum probes per second; `0` is unlimited |
+| `--mock-always-timeout` | `false` | Mock prober only: every probe waits `--probe-timeout` and reports a timeout |
 | `--read-deadline` | `10s` | Shutdown-check interval while the orchestrator is idle (not an idle timeout) |
 | `--probe-timeout` | `5s` | Timeout for individual probe responses |
 | `--max-reconnect-backoff` | `5m` | Maximum wait time between reconnection attempts |
@@ -116,6 +118,8 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_PDS_BUFFER`                    | `100`             | Directives channel buffer size                                   |
 | `RETINA_FIES_BUFFER`                   | `100`             | FIEs channel buffer size                                         |
 | `RETINA_MAX_INFLIGHT_PDS`              | `100000`          | Maximum concurrently processed PDs; `0` is unlimited             |
+| `RETINA_MOCK_PROBING_RATE`             | `0`               | Mock prober only: maximum probes per second; `0` is unlimited    |
+| `RETINA_MOCK_ALWAYS_TIMEOUT`           | `false`           | Mock prober only: every probe waits the probe timeout and times out |
 | `RETINA_READ_DEADLINE`                 | `10s`             | Shutdown-check interval while the orchestrator is idle           |
 | `RETINA_PROBE_TIMEOUT`                 | `5s`              | Timeout for individual probe responses                           |
 | `RETINA_MAX_RECONNECT_BACKOFF`         | `5m`              | Maximum wait between reconnection attempts                       |

@@ -50,6 +50,13 @@ type Config struct {
 	// ProbeTimeout is the maximum time to wait for a probe response.
 	// Longer timeouts reduce false negatives but slow processing.
 	ProbeTimeout time.Duration
+	// MockProbingRate limits the mock prober to this many probes per second,
+	// standing in for caracal's probing rate. Zero means no limit.
+	// Only applies to mock prober type.
+	MockProbingRate int
+	// MockAlwaysTimeout makes every mock probe wait ProbeTimeout and report a
+	// timeout. Only applies to mock prober type.
+	MockAlwaysTimeout bool
 
 	PDsBufferSize  int
 	FIEsBufferSize int
@@ -162,6 +169,9 @@ func (c *Config) validateProber() error {
 	}
 	if c.ProbeTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got: %v", c.ProbeTimeout)
+	}
+	if c.MockProbingRate < 0 {
+		return fmt.Errorf("mock probing rate cannot be negative, got: %d", c.MockProbingRate)
 	}
 	return nil
 }

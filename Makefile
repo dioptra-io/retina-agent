@@ -13,7 +13,7 @@ help:
 	@echo "  setup-hooks - Configure local Git hooks for commit validation"
 
 build: lint
-	go build -o retina-agent ./cmd/retina-agent
+	go build -o retina-agent .
 
 lint: fmt
 	golangci-lint run

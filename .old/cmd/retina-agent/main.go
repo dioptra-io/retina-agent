@@ -59,6 +59,9 @@ var (
 		fmt.Sprintf("Prober implementation (%s, %s)", agent.ProberTypeCaracal, agent.ProberTypeMock))
 	proberPath = flag.String("prober-path", envOrDefault("RETINA_PROBER_PATH", ""), "Path to prober executable (searches PATH if empty)")
 
+	mockProbingRate   = flag.Int("mock-probing-rate", envOrDefaultInt("RETINA_MOCK_PROBING_RATE", 0), "Mock prober only: maximum probes per second (0 for no limit)")
+	mockAlwaysTimeout = flag.Bool("mock-always-timeout", envOrDefaultBool("RETINA_MOCK_ALWAYS_TIMEOUT", false), "Mock prober only: every probe waits the probe timeout and reports a timeout")
+
 	writeQueueSize  = flag.Int("write-queue-size", envOrDefaultInt("RETINA_WRITE_QUEUE_SIZE", 1000), "Prober write queue buffer size")
 	cleanupInterval = flag.Duration("cleanup-interval", envOrDefaultDuration("RETINA_CLEANUP_INTERVAL", 10*time.Second), "Prober stale probe cleanup interval")
 
@@ -114,6 +117,8 @@ func main() {
 		MaxInflightPDs:             *maxInflightPDs,
 		ReadDeadline:               *readDeadline,
 		ProbeTimeout:               *probeTimeout,
+		MockProbingRate:            *mockProbingRate,
+		MockAlwaysTimeout:          *mockAlwaysTimeout,
 		MaxReconnectBackoff:        *maxReconnectBackoff,
 		MaxConsecutiveDecodeErrors: *maxConsecutiveDecodeErrors,
 	}
@@ -161,6 +166,18 @@ func envOrDefaultInt(key string, def int) int {
 			os.Exit(1)
 		}
 		return i
+	}
+	return def
+}
+
+func envOrDefaultBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return b
 	}
 	return def
 }
