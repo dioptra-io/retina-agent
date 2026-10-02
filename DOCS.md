@@ -13,7 +13,7 @@ For every PD it sends two probes toward the destination, one at `near_ttl` and o
 
 ## 2. Process layout
 
-`main.go` holds every default in one `retina.Config` literal. Two flags exist, `-id` and `-address`; the secret is read from `RETINA_SECRET`. Logs are JSON on the standard output. SIGINT and SIGTERM stop the agent cleanly.
+`main.go` holds every default in one `retina.Config` literal. Every field has a flag, whose default is the value in the literal; the secret is read from `RETINA_SECRET` only. Logs are JSON on the standard output. SIGINT and SIGTERM stop the agent cleanly.
 
 `Agent.Run` (`internal/retina/agent.go`) starts the prober, the stats loop and the session loop. The prober runs for as long as the agent does; connections come and go around it. If the prober stops, the agent stops with an error.
 
@@ -117,7 +117,7 @@ The fields from `pds_probed` on come from the caracal prober. `replies_unmatched
 
 | Path | Contents |
 | --- | --- |
-| `main.go` | defaults, the two flags, signal handling |
+| `main.go` | defaults, flags, signal handling |
 | `internal/retina/agent.go` | `Config`, `Agent`, session loop, shutdown flush, stats line |
 | `internal/retina/orchestrator_client.go` | `OrchestratorConn`: handshake, PD and FIE lines |
 | `internal/retina/prober.go` | `Prober` interface, `ProberConfig` |

@@ -42,7 +42,20 @@ The Dockerfile builds an image with the agent and caracal v0.15.4.
 | `-max-in-flight-pds` | `40000` | Most PDs held at once, from receiving a PD to sending its FIE (0 for no limit) |
 | `RETINA_SECRET` (environment) | empty | Shared secret presented in the handshake |
 
-These are the only settings that can be changed without rebuilding. Every other value (timeouts, queue sizes, caracal's options, the stats period) is set in the one config literal in [main.go](main.go). Flags for them, and the `RETINA_*` environment variables of the previous agent, are not implemented yet.
+Every other field of the configuration has a flag too:
+
+| Flags | What they set |
+| --- | --- |
+| `-orchestrator-connect-timeout`, `-orchestrator-handshake-timeout` | Time limits of a connection attempt |
+| `-orchestrator-keepalive-idle`, `-orchestrator-keepalive-interval`, `-orchestrator-keepalive-count` | TCP keepalive of the orchestrator connection |
+| `-orchestrator-write-buffer-size`, `-orchestrator-flush-period`, `-orchestrator-shutdown-flush-timeout` | Buffering of the FIEs sent to the orchestrator |
+| `-orchestrator-reconnect-min-backoff`, `-orchestrator-reconnect-max-backoff` | Wait between attempts to connect again |
+| `-pd-queue-size`, `-fie-queue-size`, `-discard-queued-on-disconnect` | The queues between the session and the prober |
+| `-caracal-path`, `-caracal-batch-size`, `-caracal-log-level`, `-caracal-rate-limiting-method` | The caracal executable and its options |
+| `-caracal-probe-timeout`, `-caracal-write-buffer-size`, `-caracal-stop-timeout` | How the prober uses caracal |
+| `-stats-period` | How often the counters are logged |
+
+`./retina-agent -h` lists them with their defaults, which are the values of the one config literal in [main.go](main.go). The `RETINA_*` environment variables of the previous agent, other than `RETINA_SECRET`, are not read.
 
 ## Testing
 
