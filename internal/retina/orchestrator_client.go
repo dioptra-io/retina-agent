@@ -24,6 +24,8 @@ type OrchestratorConfig struct {
 	Address string `json:"address"`
 	// Secret is the shared secret presented in the handshake.
 	Secret string `json:"-"`
+	// ConnectTimeout bounds the TCP connection attempt. Zero means no limit.
+	ConnectTimeout time.Duration `json:"connect_timeout"`
 	// HandshakeTimeout bounds the whole handshake. Zero means no limit.
 	HandshakeTimeout time.Duration `json:"handshake_timeout"`
 	// KeepAliveIdle, KeepAliveInterval and KeepAliveCount are the TCP
@@ -41,6 +43,11 @@ type OrchestratorConfig struct {
 	// FIE reaches the orchestrator at most this long after SendFIE, sooner
 	// when the buffer fills up.
 	FlushPeriod time.Duration `json:"flush_period"`
+	// ReconnectMinBackoff is the wait before reconnecting after a connection
+	// is lost. The wait doubles after every connection that does not last, up
+	// to ReconnectMaxBackoff.
+	ReconnectMinBackoff time.Duration `json:"reconnect_min_backoff"`
+	ReconnectMaxBackoff time.Duration `json:"reconnect_max_backoff"`
 }
 
 func (c *OrchestratorConfig) validate() error {
@@ -52,6 +59,12 @@ func (c *OrchestratorConfig) validate() error {
 	}
 	if c.FlushPeriod <= 0 {
 		return fmt.Errorf("flush period must be positive: got %v", c.FlushPeriod)
+	}
+	if c.ReconnectMinBackoff <= 0 {
+		return fmt.Errorf("reconnect min backoff must be positive: got %v", c.ReconnectMinBackoff)
+	}
+	if c.ReconnectMaxBackoff < c.ReconnectMinBackoff {
+		return fmt.Errorf("reconnect max backoff cannot be below the min backoff: got %v", c.ReconnectMaxBackoff)
 	}
 	return nil
 }
@@ -75,7 +88,7 @@ type OrchestratorConn struct {
 // DialOrchestrator connects to the orchestrator. The returned connection is
 // not authenticated yet: call Handshake on it.
 func DialOrchestrator(ctx context.Context, config *OrchestratorConfig) (*OrchestratorConn, error) {
-	dialer := net.Dialer{KeepAliveConfig: net.KeepAliveConfig{
+	dialer := net.Dialer{Timeout: config.ConnectTimeout, KeepAliveConfig: net.KeepAliveConfig{
 		Enable:   true,
 		Idle:     config.KeepAliveIdle,
 		Interval: config.KeepAliveInterval,

@@ -25,6 +25,7 @@ func dialOrchestrator(t *testing.T) (orchestrator net.Conn, conn *OrchestratorCo
 		Address:          listener.Addr().String(),
 		Secret:           "s3cret",
 		HandshakeTimeout: time.Second,
+		ConnectTimeout:   time.Second,
 		WriteBufferSize:  4096,
 		FlushPeriod:      time.Second,
 	})
