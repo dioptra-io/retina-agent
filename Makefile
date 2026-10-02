@@ -1,4 +1,4 @@
-.PHONY: build lint fmt tidy test cover run clean setup-hooks help
+.PHONY: build lint fmt tidy test smoke cover run clean setup-hooks help
 
 help:
 	@echo "Valid targets:"
@@ -7,6 +7,7 @@ help:
 	@echo "  fmt         - Format code"
 	@echo "  tidy        - Tidy go modules"
 	@echo "  test        - Run tests with race detection and generate coverage profile"
+	@echo "  smoke       - Run the agent against the mock orchestrator and check that every PD comes back as a FIE"
 	@echo "  cover       - View test coverage in browser"
 	@echo "  run         - Build and run retina-agent"
 	@echo "  clean       - Remove built binaries and coverage files"
@@ -26,6 +27,10 @@ tidy:
 
 test:
 	go test -v -race -coverprofile=coverage.out ./...
+
+smoke:
+	go build -o retina-agent .
+	./scripts/smoke-test.sh $(SMOKE_ARGS)
 
 cover:
 	go tool cover -html=coverage.out
