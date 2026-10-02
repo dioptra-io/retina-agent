@@ -34,7 +34,7 @@ func requireMockCaracal(t *testing.T) {
 func testCaracalConfig(path string) *CaracalProberConfig {
 	return &CaracalProberConfig{
 		Path:            path,
-		ProbingRate:     10_000,
+		MaxPDRate:       5_000,
 		ProbeTimeout:    300 * time.Millisecond,
 		WriteBufferSize: 4096,
 		StopTimeout:     time.Second,
@@ -221,7 +221,7 @@ func TestCaracalProberConfig_Args(t *testing.T) {
 		// Every option left out: caracal uses its defaults for them.
 		fixed: {},
 		"--probing-rate 500 --batch-size 64 --log-level debug --rate-limiting-method sleep " + fixed: {
-			ProbingRate: 500, BatchSize: 64, LogLevel: "debug", RateLimitingMethod: "sleep",
+			MaxPDRate: 250, BatchSize: 64, LogLevel: "debug", RateLimitingMethod: "sleep",
 		},
 	} {
 		if got := strings.Join(config.args(), " "); got != want {

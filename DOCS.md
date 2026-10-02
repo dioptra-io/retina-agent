@@ -52,7 +52,7 @@ Answers every PD after a fixed delay with made-up addresses, and holds at most `
 
 ### CaracalProber (`caracal_prober.go`)
 
-Starts one caracal process (`Path`, looked up in `PATH`) with the four options of `CaracalProberConfig`: `--probing-rate`, `--batch-size`, `--log-level` and `--rate-limiting-method`. A zero value leaves the option out. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
+Starts one caracal process (`Path`, looked up in `PATH`) with the four options of `CaracalProberConfig`: `--probing-rate`, `--batch-size`, `--log-level` and `--rate-limiting-method`. The rate is configured as `MaxPDRate` (10,000), in PDs per second; a PD makes two packets, so caracal gets twice the value as `--probing-rate`. A zero value leaves an option out. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
 
 | Loop | Role |
 | --- | --- |
@@ -74,7 +74,7 @@ A reply does not say which line it answers: it carries the probe's protocol, des
 
 Consequences:
 
-- When PDs arrive faster than caracal's probing rate, probes wait inside caracal and can time out before they are sent. The agent has no rate limiter and no cap on PDs in flight.
+- When PDs arrive faster than `MaxPDRate`, probes wait inside caracal and can time out before they are sent. The agent has no rate limiter and no cap on PDs in flight.
 - The table has no size limit: it holds what arrived within one probe timeout.
 - When the reply to a probe shared by two PDs is lost, one of the two PDs is reported incomplete.
 

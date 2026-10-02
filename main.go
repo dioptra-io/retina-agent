@@ -56,7 +56,7 @@ func run() error {
 
 				// Caracal's options. An empty or zero value leaves the
 				// option out, so that caracal uses its default.
-				ProbingRate:        20_000,
+				MaxPDRate:          10_000, // 20,000 packets per second
 				BatchSize:          128,
 				LogLevel:           "info",
 				RateLimitingMethod: "auto",

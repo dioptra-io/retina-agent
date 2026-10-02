@@ -61,9 +61,14 @@ type CaracalProberConfig struct {
 	// PATH.
 	Path string `json:"path"`
 
-	// ProbingRate is the rate caracal sends at, in packets per second
-	// (--probing-rate). Caracal's own default is 100.
-	ProbingRate int `json:"probing_rate"`
+	// MaxPDRate is the most PDs per second caracal probes. A PD makes two
+	// packets, so caracal is given twice this as its rate in packets per
+	// second (--probing-rate). Left out, caracal's own default is 100
+	// packets per second, which is 50 PDs per second.
+	//
+	// It is a ceiling: PDs that come faster wait inside caracal, and their
+	// probe timeout runs while they wait.
+	MaxPDRate int `json:"max_pd_rate"`
 	// BatchSize is the number of packets sent between two checks of the rate
 	// (--batch-size).
 	BatchSize int `json:"batch_size"`
@@ -92,8 +97,8 @@ func (c *CaracalProberConfig) validate() error {
 	if c.Path == "" {
 		return fmt.Errorf("path cannot be empty")
 	}
-	if c.ProbingRate < 0 {
-		return fmt.Errorf("probing rate cannot be negative: got %d", c.ProbingRate)
+	if c.MaxPDRate < 0 {
+		return fmt.Errorf("max PD rate cannot be negative: got %d", c.MaxPDRate)
 	}
 	if c.BatchSize < 0 {
 		return fmt.Errorf("batch size cannot be negative: got %d", c.BatchSize)
@@ -123,7 +128,7 @@ func (c *CaracalProberConfig) args() []string {
 			args = append(args, option, strconv.Itoa(value))
 		}
 	}
-	number("--probing-rate", c.ProbingRate)
+	number("--probing-rate", 2*c.MaxPDRate)
 	number("--batch-size", c.BatchSize)
 	text("--log-level", c.LogLevel)
 	text("--rate-limiting-method", c.RateLimitingMethod)
