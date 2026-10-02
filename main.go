@@ -51,8 +51,29 @@ func run() error {
 			FIEQueueSize:              1024,
 			DiscardQueuedOnDisconnect: false,
 			Caracal: &retina.CaracalProberConfig{
-				Path:            "caracal",
-				Args:            []string{"--probing-rate", "20000"},
+				Path: "caracal",
+
+				// Caracal's options. An empty or zero value leaves the
+				// option out, so that caracal uses its default.
+				ProbingRate:              20_000,
+				Interface:                "", // caracal picks the default interface
+				BatchSize:                128,
+				LogLevel:                 "info",
+				NPackets:                 1,
+				MaxProbes:                0, // unlimited
+				SourceAddressV4:          "",
+				SourceAddressV6:          "",
+				SnifferWaitTime:          1,
+				RateLimitingMethod:       "auto",
+				FilterFromPrefixFileExcl: "",
+				FilterFromPrefixFileIncl: "",
+				FilterMinTTL:             0, // no filter
+				FilterMaxTTL:             0, // no filter
+				CaracalID:                0, // random
+				MetaRound:                "1",
+				NoIntegrityCheck:         false,
+
+				ProbeTimeout:    2 * time.Second,
 				WriteBufferSize: 64 * 1024,
 				StopTimeout:     2 * time.Second,
 			},

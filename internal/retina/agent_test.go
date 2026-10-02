@@ -147,6 +147,14 @@ func TestConfig_Validate(t *testing.T) {
 		"negative mock delay": func(c *Config) { c.Prober.Mock.Delay = -1 },
 		"no mock inflight":    func(c *Config) { c.Prober.Mock.MaxInflight = 0 },
 		"no caracal path":     func(c *Config) { c.Prober.Caracal = testCaracalConfig("") },
+		"negative caracal option": func(c *Config) {
+			c.Prober.Caracal = testCaracalConfig("caracal")
+			c.Prober.Caracal.NPackets = -1
+		},
+		"no caracal probe timeout": func(c *Config) {
+			c.Prober.Caracal = testCaracalConfig("caracal")
+			c.Prober.Caracal.ProbeTimeout = 0
+		},
 		"no caracal buffer": func(c *Config) {
 			c.Prober.Caracal = testCaracalConfig("caracal")
 			c.Prober.Caracal.WriteBufferSize = 0

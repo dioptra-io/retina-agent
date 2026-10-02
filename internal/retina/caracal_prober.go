@@ -27,18 +27,71 @@ const caracalHeader = "capture_timestamp,probe_protocol,probe_src_addr,probe_dst
 // is read through.
 const caracalReadBufferSize = 64 * 1024
 
-// CaracalProberConfig configures the caracal prober.
+// caracalExpiryPeriod is how often the PDs in flight are checked for their
+// timeout. A FIE that misses a reply is sent at most this long after the
+// timeout.
+const caracalExpiryPeriod = 100 * time.Millisecond
+
+// CaracalProberConfig configures the caracal prober. The first group of
+// fields are caracal's own options, named after them; a zero value leaves
+// the option out, so that caracal uses its default.
 type CaracalProberConfig struct {
 	// Path is the caracal executable. A name without a slash is looked up in
 	// PATH.
 	Path string `json:"path"`
-	// Args are the arguments caracal is started with, such as
-	// "--probing-rate", "20000". Caracal's own default rate is 100 packets
-	// per second.
-	Args []string `json:"args"`
+
+	// ProbingRate is the rate caracal sends at, in packets per second
+	// (--probing-rate). Caracal's own default is 100.
+	ProbingRate int `json:"probing_rate"`
+	// Interface is the interface the packets are sent from (--interface).
+	Interface string `json:"interface"`
+	// BatchSize is the number of packets sent between two checks of the rate
+	// (--batch-size).
+	BatchSize int `json:"batch_size"`
+	// LogLevel is caracal's minimum log level: trace, debug, info, warning,
+	// error or fatal (--log-level).
+	LogLevel string `json:"log_level"`
+	// NPackets is the number of packets sent per probe (--n-packets).
+	NPackets int `json:"n_packets"`
+	// MaxProbes is the number of probes after which caracal stops
+	// (--max-probes). The agent stops with it.
+	MaxProbes int `json:"max_probes"`
+	// SourceAddressV4 and SourceAddressV6 are the source addresses of the
+	// packets (--source-address-v4, --source-address-v6).
+	SourceAddressV4 string `json:"source_address_v4"`
+	SourceAddressV6 string `json:"source_address_v6"`
+	// SnifferWaitTime is the time in seconds caracal waits for replies after
+	// its input ends (--sniffer-wait-time).
+	SnifferWaitTime int `json:"sniffer_wait_time"`
+	// RateLimitingMethod is how caracal limits its rate: auto, active, sleep
+	// or none (--rate-limiting-method).
+	RateLimitingMethod string `json:"rate_limiting_method"`
+	// FilterFromPrefixFileExcl and FilterFromPrefixFileIncl are files of
+	// prefixes not to probe, and of the only prefixes to probe
+	// (--filter-from-prefix-file-excl, --filter-from-prefix-file-incl).
+	FilterFromPrefixFileExcl string `json:"filter_from_prefix_file_excl"`
+	FilterFromPrefixFileIncl string `json:"filter_from_prefix_file_incl"`
+	// FilterMinTTL and FilterMaxTTL make caracal skip probes with a TTL
+	// below or above them (--filter-min-ttl, --filter-max-ttl).
+	FilterMinTTL int `json:"filter_min_ttl"`
+	FilterMaxTTL int `json:"filter_max_ttl"`
+	// CaracalID is the identifier encoded in the probes (--caracal-id).
+	CaracalID int `json:"caracal_id"`
+	// MetaRound is the value of the round column of the output
+	// (--meta-round).
+	MetaRound string `json:"meta_round"`
+	// NoIntegrityCheck makes caracal keep the replies it cannot tell to be
+	// answers to its own probes (--no-integrity-check).
+	NoIntegrityCheck bool `json:"no_integrity_check"`
+
+	// ProbeTimeout is how long the replies to a PD's probes are waited for,
+	// from when the probes are sent to caracal. A PD whose two probes are
+	// answered gets its FIE at once; the others get theirs, with the replies
+	// that came, once the timeout has passed.
+	ProbeTimeout time.Duration `json:"probe_timeout"`
 	// WriteBufferSize is the size in bytes of the buffer probes are written
-	// to before they are sent to caracal. The buffer is also sent whenever
-	// no PD is waiting.
+	// to before they are sent to caracal. The buffer is sent when it is full
+	// and whenever no PD is waiting.
 	WriteBufferSize int `json:"write_buffer_size"`
 	// StopTimeout is how long caracal is given to exit once it has been
 	// killed, before its output is abandoned.
@@ -49,6 +102,23 @@ func (c *CaracalProberConfig) validate() error {
 	if c.Path == "" {
 		return fmt.Errorf("path cannot be empty")
 	}
+	for name, value := range map[string]int{
+		"probing rate":      c.ProbingRate,
+		"batch size":        c.BatchSize,
+		"n packets":         c.NPackets,
+		"max probes":        c.MaxProbes,
+		"sniffer wait time": c.SnifferWaitTime,
+		"filter min ttl":    c.FilterMinTTL,
+		"filter max ttl":    c.FilterMaxTTL,
+		"caracal id":        c.CaracalID,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%s cannot be negative: got %d", name, value)
+		}
+	}
+	if c.ProbeTimeout <= 0 {
+		return fmt.Errorf("probe timeout must be positive: got %v", c.ProbeTimeout)
+	}
 	if c.WriteBufferSize < 1 {
 		return fmt.Errorf("write buffer size must be at least 1: got %d", c.WriteBufferSize)
 	}
@@ -56,6 +126,41 @@ func (c *CaracalProberConfig) validate() error {
 		return fmt.Errorf("stop timeout must be positive: got %v", c.StopTimeout)
 	}
 	return nil
+}
+
+// args returns the arguments caracal is started with.
+func (c *CaracalProberConfig) args() []string {
+	var args []string
+	text := func(option, value string) {
+		if value != "" {
+			args = append(args, option, value)
+		}
+	}
+	number := func(option string, value int) {
+		if value != 0 {
+			args = append(args, option, strconv.Itoa(value))
+		}
+	}
+	number("--probing-rate", c.ProbingRate)
+	text("--interface", c.Interface)
+	number("--batch-size", c.BatchSize)
+	text("--log-level", c.LogLevel)
+	number("--n-packets", c.NPackets)
+	number("--max-probes", c.MaxProbes)
+	text("--source-address-v4", c.SourceAddressV4)
+	text("--source-address-v6", c.SourceAddressV6)
+	number("--sniffer-wait-time", c.SnifferWaitTime)
+	text("--rate-limiting-method", c.RateLimitingMethod)
+	text("--filter-from-prefix-file-excl", c.FilterFromPrefixFileExcl)
+	text("--filter-from-prefix-file-incl", c.FilterFromPrefixFileIncl)
+	number("--filter-min-ttl", c.FilterMinTTL)
+	number("--filter-max-ttl", c.FilterMaxTTL)
+	number("--caracal-id", c.CaracalID)
+	text("--meta-round", c.MetaRound)
+	if c.NoIntegrityCheck {
+		args = append(args, "--no-integrity-check")
+	}
+	return args
 }
 
 // CaracalProber is a prober that sends its probes with a caracal process.
@@ -66,15 +171,25 @@ func (c *CaracalProberConfig) validate() error {
 // its logs to its standard error. A reply does not say which line it answers:
 // it carries the probe's destination, ports and TTL, read back from the
 // packet the reply quotes.
+//
+// The prober registers the probes it writes in a table, which gives the PDs
+// a reply answers. A PD's FIE is sent as soon as both of its probes are
+// answered. A separate loop looks for the PDs whose timeout has passed, and
+// sends their FIEs with the replies that came.
 type CaracalProber struct {
 	config *CaracalProberConfig
 	logger *slog.Logger
+	table  *caracalTable
 }
 
 // NewCaracalProber creates a caracal prober. The caracal process is started
 // by Run.
 func NewCaracalProber(config *CaracalProberConfig, logger *slog.Logger) *CaracalProber {
-	return &CaracalProber{config: config, logger: logger}
+	return &CaracalProber{
+		config: config,
+		logger: logger,
+		table:  newCaracalTable(config.ProbeTimeout),
+	}
 }
 
 // Run implements Prober. It starts caracal and returns an error when caracal
@@ -82,7 +197,7 @@ func NewCaracalProber(config *CaracalProberConfig, logger *slog.Logger) *Caracal
 func (p *CaracalProber) Run(ctx context.Context, pds <-chan PD, fies chan<- FIE) error {
 	// Canceling the command's context kills caracal.
 	group, groupCtx := errgroup.WithContext(ctx)
-	cmd := exec.CommandContext(groupCtx, p.config.Path, p.config.Args...) //nolint:gosec // G204: the path is the operator's configuration
+	cmd := exec.CommandContext(groupCtx, p.config.Path, p.config.args()...) //nolint:gosec // G204: the path is the operator's configuration
 	cmd.WaitDelay = p.config.StopTimeout
 
 	stdin, err := cmd.StdinPipe()
@@ -111,8 +226,9 @@ func (p *CaracalProber) Run(ctx context.Context, pds <-chan PD, fies chan<- FIE)
 	defer stop()
 
 	group.Go(func() error { return p.logOutput(stderr) })
-	group.Go(func() error { return p.readReplies(stdout, fies) })
+	group.Go(func() error { return p.readReplies(groupCtx, stdout, fies) })
 	group.Go(func() error { return p.writeProbes(groupCtx, stdin, pds) })
+	group.Go(func() error { return p.expirePDs(groupCtx, fies) })
 
 	err = group.Wait()
 	// Wait only once the pipes are no longer read.
@@ -123,19 +239,29 @@ func (p *CaracalProber) Run(ctx context.Context, pds <-chan PD, fies chan<- FIE)
 	return fmt.Errorf("caracal stopped: %w", errors.Join(err, waitErr))
 }
 
-// writeProbes writes the near and the far probe of every PD to caracal. It
-// returns when ctx is done or caracal no longer takes probes.
+// writeProbes registers every PD and writes its near and far probe to
+// caracal. It returns when ctx is done or caracal no longer takes probes.
 func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, pds <-chan PD) error {
 	defer func() { _ = stdin.Close() }()
 	writer := bufio.NewWriterSize(stdin, p.config.WriteBufferSize)
 	var line []byte
+	// unflushed are the records whose probes are still in the buffer.
+	var unflushed []*caracalRecord
+
+	// flush sends the buffer to caracal. The flush time of the records is
+	// taken after the write: caracal has their probes by then.
+	flush := func() error {
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("cannot write probes: %w", err)
+		}
+		p.table.markFlushed(unflushed, time.Now())
+		unflushed = unflushed[:0]
+		return nil
+	}
 
 	for {
 		select {
 		case pd := <-pds:
-			// TODO: register the PD as in flight before its probes are
-			// written, bound the PDs in flight, and report the PDs whose
-			// probes are not answered in time.
 			protocol, ok := caracalProtocol(pd.Protocol)
 			if !ok || pd.NearTTL == 255 {
 				p.logger.Warn("Cannot probe PD", slog.Uint64("pd_id", uint64(pd.ID)), slog.Int("protocol", int(pd.Protocol)), slog.Int("near_ttl", int(pd.NearTTL)))
@@ -143,14 +269,24 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 			}
 			line = appendCaracalProbe(line[:0], &pd, pd.NearTTL, protocol)
 			line = appendCaracalProbe(line, &pd, pd.NearTTL+1, protocol)
+			// The buffer is only ever sent by flush, so that every record
+			// gets its flush time.
+			if writer.Available() < len(line) {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+			// The probes are registered before they are written, so that
+			// no reply comes before them.
+			unflushed = append(unflushed, p.table.register(&pd))
 			if _, err := writer.Write(line); err != nil {
 				return fmt.Errorf("cannot write probes: %w", err)
 			}
 			// Probes are sent in groups while PDs keep coming, and at once
 			// when none is waiting.
 			if len(pds) == 0 {
-				if err := writer.Flush(); err != nil {
-					return fmt.Errorf("cannot write probes: %w", err)
+				if err := flush(); err != nil {
+					return err
 				}
 			}
 		case <-ctx.Done():
@@ -159,9 +295,11 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 	}
 }
 
-// readReplies reads the replies caracal captures. It returns an error when
-// caracal's output ends, which it only does when caracal stops.
-func (p *CaracalProber) readReplies(stdout io.Reader, _ chan<- FIE) error {
+// readReplies reads the replies caracal captures and gives each to a PD that
+// waits for it. It sends the FIE of a PD once both of its probes are
+// answered. It returns an error when caracal's output ends, which it only
+// does when caracal stops.
+func (p *CaracalProber) readReplies(ctx context.Context, stdout io.Reader, fies chan<- FIE) error {
 	reader := bufio.NewReaderSize(stdout, caracalReadBufferSize)
 
 	header, err := reader.ReadSlice('\n')
@@ -182,19 +320,56 @@ func (p *CaracalProber) readReplies(stdout io.Reader, _ chan<- FIE) error {
 			p.logger.Warn("Cannot decode caracal reply", slog.Any("err", err))
 			continue
 		}
-		// TODO: match the reply to the PD in flight it answers, and write
-		// the PD's FIE to fies once both probes are answered or timed out.
-		_ = reply
+		if fie, complete := p.table.match(&reply, time.Now()); complete {
+			select {
+			case fies <- fie:
+			case <-ctx.Done():
+				return nil
+			}
+		}
 	}
 }
 
-// logOutput logs what caracal writes to its standard error.
-func (p *CaracalProber) logOutput(stderr io.Reader) error {
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		p.logger.Info(scanner.Text(), slog.String("source", "caracal"))
+// expirePDs looks every expiry period for the PDs whose timeout has passed,
+// and sends their FIEs, which miss one reply or both. It returns when ctx is
+// done.
+func (p *CaracalProber) expirePDs(ctx context.Context, fies chan<- FIE) error {
+	ticker := time.NewTicker(caracalExpiryPeriod)
+	defer ticker.Stop()
+	var expired []FIE
+
+	for {
+		select {
+		case now := <-ticker.C:
+			expired = p.table.expire(now, expired[:0])
+			for i := range expired {
+				select {
+				case fies <- expired[i]:
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			return nil
+		}
 	}
-	return nil
+}
+
+// logOutput logs what caracal writes to its standard error, until it ends.
+// It reports no error: caracal stopping is noticed where its replies are
+// read. A line longer than the read buffer is logged in pieces, so that
+// caracal is never left waiting for its logs to be read.
+func (p *CaracalProber) logOutput(stderr io.Reader) error {
+	reader := bufio.NewReader(stderr)
+	for {
+		line, err := reader.ReadSlice('\n')
+		if text := bytes.TrimRight(line, "\r\n"); len(text) > 0 {
+			p.logger.Info(string(text), slog.String("source", "caracal"))
+		}
+		if err != nil && !errors.Is(err, bufio.ErrBufferFull) {
+			return nil
+		}
+	}
 }
 
 // caracalProtocol returns caracal's name for an IP protocol number.
@@ -214,14 +389,14 @@ func caracalProtocol(protocol uint8) (string, bool) {
 // appendCaracalProbe appends the line that makes caracal send one probe of a
 // PD with the given TTL: dst_addr,src_port,dst_port,ttl,protocol.
 //
-// For ICMP and ICMPv6, caracal puts src_port in the ICMP checksum and
-// identifier, and ignores dst_port.
+// For ICMP and ICMPv6, dst_port is written as zero: it is not what tells
+// these probes apart.
 func appendCaracalProbe(line []byte, pd *PD, ttl uint8, protocol string) []byte {
 	line = pd.Destination.AppendTo(line)
 	line = append(line, ',')
 	line = strconv.AppendUint(line, uint64(pd.FirstHalfWord), 10)
 	line = append(line, ',')
-	line = strconv.AppendUint(line, uint64(pd.SecondHalfWord), 10)
+	line = strconv.AppendUint(line, uint64(caracalDstPort(pd.Protocol, pd.SecondHalfWord)), 10)
 	line = append(line, ',')
 	line = strconv.AppendUint(line, uint64(ttl), 10)
 	line = append(line, ',')
