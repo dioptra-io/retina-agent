@@ -45,6 +45,15 @@ func issue(table *caracalTable, pd *PD, after time.Duration) {
 	table.markFlushed([]*caracalRecord{table.register(pd)}, tableStart.Add(after))
 }
 
+// expireIdle expires the records at the given time, in the conditions that
+// let every record past its timeout go: caracal was just written to, a
+// first call of expire has let that write settle, and the reader is idle.
+func expireIdle(table *caracalTable, now time.Time) []FIE {
+	table.markFlushed(nil, now)
+	fies := table.expire(now, true, nil)
+	return table.expire(now, true, fies)
+}
+
 // checkEmpty checks that nothing is left in the table.
 func checkEmpty(t *testing.T, table *caracalTable) {
 	t.Helper()
@@ -83,7 +92,7 @@ func TestCaracalTable_CompletesWithBothReplies(t *testing.T) {
 	if len(table.nodes) != 0 {
 		t.Errorf("%d probes are still waited for", len(table.nodes))
 	}
-	if fies := table.expire(tableStart.Add(2*time.Second), true, nil); len(fies) != 0 {
+	if fies := expireIdle(table, tableStart.Add(2*time.Second)); len(fies) != 0 {
 		t.Errorf("got %+v at the timeout of a complete PD", fies)
 	}
 	checkEmpty(t, table)
@@ -96,10 +105,10 @@ func TestCaracalTable_ExpiresIncompletePDs(t *testing.T) {
 	issue(table, tablePD(3, 20), time.Second)
 	table.match(tableReply(11, 0), tableStart)
 
-	if fies := table.expire(tableStart.Add(1999*time.Millisecond), true, nil); len(fies) != 0 {
+	if fies := expireIdle(table, tableStart.Add(1999*time.Millisecond)); len(fies) != 0 {
 		t.Fatalf("got %+v before the timeout", fies)
 	}
-	fies := table.expire(tableStart.Add(2*time.Second), true, nil)
+	fies := expireIdle(table, tableStart.Add(2*time.Second))
 	if len(fies) != 2 {
 		t.Fatalf("got %+v, want the FIEs of PDs 1 and 2", fies)
 	}
@@ -111,7 +120,7 @@ func TestCaracalTable_ExpiresIncompletePDs(t *testing.T) {
 	}
 
 	// The third PD was flushed a second later.
-	if fies := table.expire(tableStart.Add(3*time.Second), true, nil); len(fies) != 1 || fies[0].PDID != 3 {
+	if fies := expireIdle(table, tableStart.Add(3*time.Second)); len(fies) != 1 || fies[0].PDID != 3 {
 		t.Fatalf("got %+v, want the FIE of PD 3", fies)
 	}
 	checkEmpty(t, table)
@@ -140,7 +149,7 @@ func TestCaracalTable_OneReplyOnePD(t *testing.T) {
 		t.Fatalf("got %+v (complete %v), want PD 2 with the second reply as its near one", fie, complete)
 	}
 
-	table.expire(tableStart.Add(2*time.Second), true, nil)
+	expireIdle(table, tableStart.Add(2*time.Second))
 	checkEmpty(t, table)
 }
 
@@ -154,7 +163,7 @@ func TestCaracalTable_LostReplyLeavesOnePDIncomplete(t *testing.T) {
 		table.match(tableReply(ttl, 0), tableStart)
 	}
 
-	fies := table.expire(tableStart.Add(2*time.Second), true, nil)
+	fies := expireIdle(table, tableStart.Add(2*time.Second))
 	if len(fies) != 1 || fies[0].PDID != 2 || fies[0].Near.IsValid() || !fies[0].Far.IsValid() {
 		t.Fatalf("got %+v, want PD 2 with only its far reply", fies)
 	}
@@ -180,7 +189,7 @@ func TestCaracalTable_SamePDTwice(t *testing.T) {
 		t.Fatalf("got %+v (complete %v), want the second issuance complete", fie, complete)
 	}
 
-	table.expire(tableStart.Add(3*time.Second), true, nil)
+	expireIdle(table, tableStart.Add(3*time.Second))
 	checkEmpty(t, table)
 }
 
@@ -197,7 +206,7 @@ func TestCaracalTable_SkipsExpiredRecords(t *testing.T) {
 	if fie, complete := table.match(capturedAt(tableReply(5, 0), 2100*time.Millisecond), now); !complete || fie.PDID != 2 {
 		t.Fatalf("got %+v (complete %v), want PD 2 complete", fie, complete)
 	}
-	if fies := table.expire(now, true, nil); len(fies) != 1 || fies[0].PDID != 1 || fies[0].Near.IsValid() {
+	if fies := expireIdle(table, now); len(fies) != 1 || fies[0].PDID != 1 || fies[0].Near.IsValid() {
 		t.Fatalf("got %+v, want PD 1 without replies", fies)
 	}
 }
@@ -246,6 +255,37 @@ func TestCaracalTable_RepliesReadLate(t *testing.T) {
 	}
 }
 
+// TestCaracalTable_RepliesHeldByCaracal is what happens when the probes
+// stop: caracal holds the replies it captures until it is written to again,
+// so a PD is not expired, even with an idle reader, before a write that came
+// after its timeout has had the time to bring its replies.
+func TestCaracalTable_RepliesHeldByCaracal(t *testing.T) {
+	table := newCaracalTable(2 * time.Second)
+	issue(table, tablePD(1, 4), 0)
+
+	// Nothing was written to caracal since the PD's probes.
+	for _, after := range []time.Duration{2 * time.Second, 3 * time.Second} {
+		if fies := table.expire(tableStart.Add(after), true, nil); len(fies) != 0 {
+			t.Fatalf("got %+v while caracal may hold replies", fies)
+		}
+	}
+
+	// A wake line is written. Caracal has yet to read it.
+	now := tableStart.Add(3100 * time.Millisecond)
+	table.markFlushed(nil, now)
+	if fies := table.expire(now, true, nil); len(fies) != 0 {
+		t.Fatalf("got %+v before caracal could hand over its replies", fies)
+	}
+
+	// The near reply, captured in time, is handed over and read.
+	table.match(capturedAt(tableReply(4, 0), time.Second), now)
+	fies := table.expire(now.Add(100*time.Millisecond), true, nil)
+	if len(fies) != 1 || fies[0].PDID != 1 || fies[0].Near != netip.MustParseAddr("10.0.0.4") || fies[0].Far.IsValid() {
+		t.Fatalf("got %+v, want PD 1 with its near reply only", fies)
+	}
+	checkEmpty(t, table)
+}
+
 // TestCaracalTable_UnflushedRecord checks that a record whose probes are
 // still in the write buffer can be answered, does not expire, and is served
 // after the flushed ones.
@@ -254,7 +294,7 @@ func TestCaracalTable_UnflushedRecord(t *testing.T) {
 	unflushed := table.register(tablePD(1, 4))
 	issue(table, tablePD(2, 4), 0)
 
-	if fies := table.expire(tableStart.Add(time.Hour), true, nil); len(fies) != 1 || fies[0].PDID != 2 {
+	if fies := expireIdle(table, tableStart.Add(time.Hour)); len(fies) != 1 || fies[0].PDID != 2 {
 		t.Fatalf("got %+v, want only the flushed PD 2 to expire", fies)
 	}
 
@@ -271,7 +311,7 @@ func TestCaracalTable_UnflushedRecord(t *testing.T) {
 
 	// Its flush comes after its FIE: it then leaves the table at its timeout.
 	table.markFlushed([]*caracalRecord{unflushed}, now)
-	if fies := table.expire(now.Add(2*time.Second), true, nil); len(fies) != 0 {
+	if fies := expireIdle(table, now.Add(2*time.Second)); len(fies) != 0 {
 		t.Fatalf("got %+v for records that are complete", fies)
 	}
 	checkEmpty(t, table)
@@ -329,7 +369,7 @@ func TestCaracalTable_ManyRounds(t *testing.T) {
 			}
 		}
 		now = now.Add(time.Second)
-		fies += len(table.expire(now, true, nil))
+		fies += len(expireIdle(table, now))
 		checkEmpty(t, table)
 	}
 	if fies != 50*20 {
@@ -355,7 +395,7 @@ func TestCaracalTable_Stats(t *testing.T) {
 		t.Fatalf("got %+v with %d in flight, want %+v with 1 in flight", got, got.inFlight(), want)
 	}
 
-	table.expire(tableStart.Add(3*time.Second), true, nil)
+	expireIdle(table, tableStart.Add(3*time.Second))
 	want.incomplete = 1
 	if got := table.snapshot(); got != want || got.inFlight() != 0 {
 		t.Fatalf("after expiry: got %+v with %d in flight, want %+v with none", got, got.inFlight(), want)

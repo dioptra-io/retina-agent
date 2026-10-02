@@ -53,16 +53,22 @@ When the agent is stopped while connected, it sends the FIEs waiting in the queu
 
 ### CaracalProber (`caracal_prober.go`)
 
-Starts one caracal process (`Path`, looked up in `PATH`) with the three options of `CaracalProberConfig` (`--batch-size`, `--log-level`, `--rate-limiting-method`; a zero value leaves one out) and a `--probing-rate` derived from the prober's `MaxPDRate`: two packets per PD, plus a tenth. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
+Starts one caracal process (`Path`, looked up in `PATH`) with the three options of `CaracalProberConfig` (`--batch-size`, `--log-level`, `--rate-limiting-method`; a zero value leaves one out) and a `--probing-rate` derived from the prober's `MaxPDRate`: two packets per PD, plus a tenth. Caracal is also always given `--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 1 --filter-max-ttl 255`: these are its v0.15.4 defaults, passed explicitly so that a later version with other defaults behaves the same, except `--filter-min-ttl`, which is 1 so that caracal does not send the wake line described below. Its remaining options are never passed. The header caracal writes first is checked against that of v0.15.4. Four loops run until caracal stops or the agent does:
 
 | Loop | Role |
 | --- | --- |
-| `writeProbes` | registers each PD in the table and writes its two probes to caracal's standard input as `dst_addr,src_port,dst_port,ttl,protocol`. Probes are buffered while PDs keep coming and sent at once when none is waiting |
+| `writeProbes` | registers each PD in the table and writes its two probes to caracal's standard input as `dst_addr,src_port,dst_port,ttl,protocol`. Probes are buffered while PDs keep coming and sent at once when none is waiting. While PDs are in flight and no probe was written for 100 ms, it writes a wake line |
 | `readReplies` | reads caracal's output, gives each reply to a record of the table, and sends the FIE of a PD as soon as both of its probes are answered |
 | `expirePDs` | every 100 ms sends the FIEs of the PDs whose `ProbeTimeout` (2 s) has passed, with the replies that came |
 | `logOutput` | logs caracal's standard error with `source=caracal` |
 
 If caracal exits, the prober returns an error and the agent stops.
+
+### The wake line
+
+Caracal v0.15.4 keeps the replies it captures in its output buffer and only hands them over when it reads its input. This is not documented; it was observed with the real binary on 2026-10-02, and neither `SIGINT` nor `SIGTERM` makes it hand them over. While probes keep coming, replies arrive at once. When they stop, as at the end of a single-issuance measurement, the replies to the last probes would stay in caracal until it exits, and their PDs would be reported unanswered.
+
+So while PDs are in flight and no probe was written for 100 ms, `writeProbes` writes the line `0.0.0.0,0,0,0,udp`. Caracal reads it, which hands over its replies, and does not send it: its TTL of 0 is below `--filter-min-ttl 1`. Caracal counts these lines in `filtered_low_ttl`. In a continuous measurement none is written. `scripts/mock-caracal.sh` holds its replies in the same way.
 
 ### The table (`caracal_table.go`)
 
@@ -73,7 +79,7 @@ A reply does not say which line it answers: it carries the probe's protocol, des
 - One reply goes to one record: the one with the earliest flush time, then the lowest near TTL, then the one registered first.
 - A record's timeout starts at its flush time, which is taken after the write to caracal returns. It is when caracal received the probes, not when they went on the wire.
 - Whether a reply is on time is told by caracal's capture timestamp, not by when the agent reads it: a reply captured within the timeout of the flush time is accepted however long it waited to be read. This relies on the capture timestamps being Unix microseconds of the clock the agent uses.
-- A record whose timeout has passed is only expired once no reply captured in time can still be waiting to be read: when the reader of caracal's output has been idle for 10 ms, or when it has read a reply captured after the record's timeout. So when the orchestrator stops reading FIEs and the prober pauses, the PDs in flight keep their replies.
+- A record whose timeout has passed is only expired once no reply captured in time can still be on its way: when the reader of caracal's output has read a reply captured after the record's timeout, or when caracal was written to after the record's timeout, at least one expiry period (100 ms) ago, and the reader has been idle for 10 ms. So when the orchestrator stops reading FIEs and the prober pauses, the PDs in flight keep their replies.
 
 Consequences:
 

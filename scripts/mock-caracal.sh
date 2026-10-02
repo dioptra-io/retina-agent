@@ -25,11 +25,12 @@
 #   - at the end of the input it waits --sniffer-wait-time seconds and exits;
 #   - sending does not wait for the output: when the replies are not read,
 #     the probes go on being sent, and their replies keep the time they were
-#     captured at.
+#     captured at;
+#   - the replies are only handed over when the input is read: a reply
+#     captured after the last line was read stays inside until another line
+#     comes, even one that is filtered or invalid, or until the end.
 #
 # What it does not imitate:
-#   - caracal never flushes its output, so its replies may reach the reader
-#     in blocks; here every reply is written at once;
 #   - echo replies and destination unreachable: every reply is a time
 #     exceeded from a made up router;
 #   - replies to probes that are not its own, duplicate replies, loss in the
@@ -184,7 +185,8 @@ sleep_micros() {
 }
 
 # send_probes reads the probes and writes the replies they will get, each
-# with the time it is captured at.
+# with the time it is captured at. Before each line it reads, it writes the
+# time as a line "#micros": the replies captured by then are handed over.
 send_probes() {
 	local line dst_addr src_port dst_port ttl protocol _flow_label wait_us extra
 	local protocol_number reply_protocol icmp_type probe_dst reply_src probe_src
@@ -195,6 +197,7 @@ send_probes() {
 	local batch_start=${EPOCHREALTIME/./} now elapsed packet
 
 	while IFS=, read -r dst_addr src_port dst_port ttl protocol _flow_label wait_us extra; do
+		printf '#%s\n' "${EPOCHREALTIME/./}"
 		# Only used in the warnings: an invalid line is logged without its
 		# optional columns.
 		line=${dst_addr}${src_port:+,${src_port}}${dst_port:+,${dst_port}}${ttl:+,${ttl}}${protocol:+,${protocol}}
@@ -281,11 +284,15 @@ send_probes() {
 	log info "probes_read=${read_count} packets_sent=${sent} packets_failed=0 filtered_low_ttl=${filtered_lo} filtered_high_ttl=${filtered_hi} filtered_prefix_excl=0 filtered_prefix_not_incl=0"
 }
 
-# capture_replies writes each reply of the spool once its capture time has
-# come, until the sender is gone and the spool is read to its end. The round
-# trip time is the same for all, so they arrive in order.
+# capture_replies holds the replies of the spool, and writes those captured
+# by the time the sender next read its input. Once the sender is gone and the
+# spool is read to its end, it writes the rest, each once its capture time
+# has come. The round trip time is the same for all, so they are in order.
 capture_replies() {
-	local reply partial='' now capture
+	local reply partial='' now capture read_at
+	# The replies held are those from first to last - 1.
+	local -a held=()
+	local first=0 last=0
 	while true; do
 		if ! IFS= read -r -u "${spool_fd}" reply; then
 			# The end of the spool for now. What was read is the start of a
@@ -299,12 +306,29 @@ capture_replies() {
 		fi
 		reply=${partial}${reply}
 		partial=''
-		capture=${reply%%,*}
+		if [[ ${reply} != '#'* ]]; then
+			held[last]=${reply}
+			last=$((last + 1))
+			continue
+		fi
+		read_at=${reply#'#'}
+		while ((first < last)); do
+			capture=${held[first]%%,*}
+			if ((capture > read_at)); then
+				break
+			fi
+			printf '%s\n' "${held[first]}"
+			unset 'held[first]'
+			first=$((first + 1))
+		done
+	done
+	for ((; first < last; first++)); do
+		capture=${held[first]%%,*}
 		now=${EPOCHREALTIME/./}
 		if ((capture > now)); then
 			sleep_micros $((capture - now))
 		fi
-		printf '%s\n' "${reply}"
+		printf '%s\n' "${held[first]}"
 	done
 }
 

@@ -214,7 +214,7 @@ func TestMockCaracal(t *testing.T) {
 }
 
 func TestCaracalProberConfig_Args(t *testing.T) {
-	const fixed = "--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 0 --filter-max-ttl 255"
+	const fixed = "--n-packets 1 --sniffer-wait-time 1 --meta-round 1 --filter-min-ttl 1 --filter-max-ttl 255"
 
 	// The rate is that of two packets per PD, and a tenth more.
 	config := testCaracalConfig("caracal")
@@ -280,14 +280,20 @@ func TestCaracalProber_WritesProbes(t *testing.T) {
 	want := "198.51.100.9,24000,33434,4,udp\n198.51.100.9,24000,33434,5,udp\n" +
 		"2001:db8::9,7,0,254,icmp6\n2001:db8::9,7,0,255,icmp6\n" +
 		"203.0.113.1,9,0,1,icmp\n203.0.113.1,9,0,2,icmp\n"
-	var got []byte
+	// With the PDs in flight and no more probes to write, wake lines follow.
+	want += caracalWakeLine
+	var got string
 	deadline := time.Now().Add(5 * time.Second)
-	for string(got) != want && time.Now().Before(deadline) {
+	for !strings.HasPrefix(got, want) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
-		got, _ = os.ReadFile(received)
+		content, _ := os.ReadFile(received)
+		got = string(content)
 	}
-	if string(got) != want {
-		t.Errorf("caracal received %q, want %q", got, want)
+	if !strings.HasPrefix(got, want) {
+		t.Errorf("caracal received %q, want it to start with %q", got, want)
+	}
+	if rest := strings.ReplaceAll(strings.TrimPrefix(got, want), caracalWakeLine, ""); rest != "" {
+		t.Errorf("caracal received %q after the probes, want only wake lines", rest)
 	}
 }
 

@@ -37,12 +37,28 @@ const caracalIdleTime = 10 * time.Millisecond
 // timeout.
 const caracalExpiryPeriod = 100 * time.Millisecond
 
+// caracalWakePeriod is how often caracal is written a wake line while PDs
+// are in flight and no probe is written to it.
+const caracalWakePeriod = 100 * time.Millisecond
+
+// caracalWakeLine is a probe caracal reads and does not send: its TTL of 0 is
+// below --filter-min-ttl.
+//
+// Caracal v0.15.4 keeps the replies it captures in its output buffer, and
+// only hands them over when it reads its input. While probes keep coming
+// that is all the time. Once they stop, the replies to the last probes would
+// stay in caracal until it exits: the wake line makes it hand them over.
+const caracalWakeLine = "0.0.0.0,0,0,0,udp\n"
+
 // caracalFixedArgs are the options caracal is always started with. They are
 // the defaults of caracal v0.15.4, passed all the same so that a later
 // caracal with other defaults behaves as this one: one packet per probe,
 // which the matching of replies relies on, one second of capture after the
-// input ends, the round column at 1, and TTL filters that let every TTL
-// through.
+// input ends, the round column at 1, and no upper limit on the TTL.
+//
+// The lower limit on the TTL is 1 where caracal's default is 0: no PD makes
+// a probe with a TTL of 0, and it is what keeps caracalWakeLine from being
+// sent.
 //
 // The rest of caracal's options cannot be given their default and are left
 // out: caracal probes from the default interface and its addresses, with a
@@ -52,7 +68,7 @@ var caracalFixedArgs = []string{
 	"--n-packets", "1",
 	"--sniffer-wait-time", "1",
 	"--meta-round", "1",
-	"--filter-min-ttl", "0",
+	"--filter-min-ttl", "1",
 	"--filter-max-ttl", "255",
 }
 
@@ -238,28 +254,75 @@ func (p *CaracalProber) stats() []slog.Attr {
 	}
 }
 
-// writeProbes registers every PD and writes its near and far probe to
-// caracal. It returns when ctx is done or caracal no longer takes probes.
-func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, pds <-chan PD) error {
-	defer func() { _ = stdin.Close() }()
-	writer := bufio.NewWriterSize(stdin, p.config.WriteBufferSize)
-	var line []byte
+// caracalWriter writes to caracal's input through a buffer.
+type caracalWriter struct {
+	writer *bufio.Writer
+	table  *caracalTable
 	// unflushed are the records whose probes are still in the buffer.
-	var unflushed []*caracalRecord
+	unflushed []*caracalRecord
+	// written tells that caracal was written to since the last wake period.
+	written bool
+}
 
-	// flush sends the buffer to caracal. The flush time of the records is
-	// taken after the write: caracal has their probes by then.
-	flush := func() error {
-		if err := writer.Flush(); err != nil {
-			return fmt.Errorf("cannot write probes: %w", err)
+// flush sends the buffer to caracal. The flush time of the records is taken
+// after the write: caracal has their probes by then.
+func (w *caracalWriter) flush() error {
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("cannot write probes: %w", err)
+	}
+	w.table.markFlushed(w.unflushed, time.Now())
+	w.unflushed = w.unflushed[:0]
+	w.written = true
+	return nil
+}
+
+// write puts lines in the buffer. The buffer is only ever sent by flush, so
+// that every record gets its flush time.
+func (w *caracalWriter) write(lines []byte) error {
+	if w.writer.Available() < len(lines) {
+		if err := w.flush(); err != nil {
+			return err
 		}
-		p.table.markFlushed(unflushed, time.Now())
-		unflushed = unflushed[:0]
+	}
+	if _, err := w.writer.Write(lines); err != nil {
+		return fmt.Errorf("cannot write probes: %w", err)
+	}
+	return nil
+}
+
+// wake is called every wake period. It writes caracal a wake line if records
+// wait for replies and caracal was not written to during the period.
+func (w *caracalWriter) wake() error {
+	if w.written || !w.table.waiting() {
+		w.written = false
 		return nil
 	}
+	if err := w.write([]byte(caracalWakeLine)); err != nil {
+		return err
+	}
+	err := w.flush()
+	w.written = false
+	return err
+}
+
+// writeProbes registers every PD and writes its near and far probe to
+// caracal. While PDs are in flight and it has no probe to write, it writes
+// caracal a wake line every wake period, so that caracal hands over the
+// replies it holds. It returns when ctx is done or caracal no longer takes
+// probes.
+func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, pds <-chan PD) error {
+	defer func() { _ = stdin.Close() }()
+	writer := &caracalWriter{writer: bufio.NewWriterSize(stdin, p.config.WriteBufferSize), table: p.table}
+	var line []byte
+	wake := time.NewTicker(caracalWakePeriod)
+	defer wake.Stop()
 
 	for {
 		select {
+		case <-wake.C:
+			if err := writer.wake(); err != nil {
+				return err
+			}
 		case pd := <-pds:
 			protocol, ok := caracalProtocol(pd.Protocol)
 			if !ok || pd.NearTTL == 255 {
@@ -269,23 +332,17 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 			}
 			line = appendCaracalProbe(line[:0], &pd, pd.NearTTL, protocol)
 			line = appendCaracalProbe(line, &pd, pd.NearTTL+1, protocol)
-			// The buffer is only ever sent by flush, so that every record
-			// gets its flush time.
-			if writer.Available() < len(line) {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
 			// The probes are registered before they are written, so that
 			// no reply comes before them.
-			unflushed = append(unflushed, p.table.register(&pd))
-			if _, err := writer.Write(line); err != nil {
-				return fmt.Errorf("cannot write probes: %w", err)
+			record := p.table.register(&pd)
+			if err := writer.write(line); err != nil {
+				return err
 			}
+			writer.unflushed = append(writer.unflushed, record)
 			// Probes are sent in groups while PDs keep coming, and at once
 			// when none is waiting.
 			if len(pds) == 0 {
-				if err := flush(); err != nil {
+				if err := writer.flush(); err != nil {
 					return err
 				}
 			}

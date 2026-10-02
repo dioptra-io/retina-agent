@@ -112,7 +112,14 @@ type caracalTable struct {
 	// match. Caracal writes its replies in the order it captures them, so
 	// every reply captured before it has been given to match too.
 	lastCapture time.Time
-	stats       caracalTableStats
+	// lastWrite is when caracal was last written to, and settledWrite what
+	// lastWrite was at the previous call of expire. Caracal only hands over
+	// the replies it has captured when it reads its input, so a reply
+	// captured after its last write may still be inside caracal. By the next
+	// call of expire, caracal has read that write, and handed over every
+	// reply captured before it.
+	lastWrite, settledWrite time.Time
+	stats                   caracalTableStats
 }
 
 // caracalTableStats are the counters of a table, since it was made.
@@ -166,11 +173,13 @@ func (t *caracalTable) register(pd *PD) *caracalRecord {
 	return record
 }
 
-// markFlushed sets the flush time of the records whose probes were just sent
-// to caracal. From then on they expire after the timeout.
+// markFlushed records that caracal was just written to, and sets the flush
+// time of the records whose probes were in that write, if any. From then on
+// they expire after the timeout.
 func (t *caracalTable) markFlushed(records []*caracalRecord, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.lastWrite = now
 	for _, record := range records {
 		record.lastFlushTime = now
 	}
@@ -246,6 +255,14 @@ func waitsBefore(a, b *caracalPDNode) bool {
 	return a.record.sequence < b.record.sequence
 }
 
+// waiting reports whether records are still to expire: caracal may hold
+// replies for them.
+func (t *caracalTable) waiting() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.flushed) > 0
+}
+
 // expired reports whether the timeout of a record has passed at the given
 // time.
 func (t *caracalTable) expired(record *caracalRecord, at time.Time) bool {
@@ -258,19 +275,24 @@ func (t *caracalTable) expired(record *caracalRecord, at time.Time) bool {
 //
 // A record whose timeout has passed may still have replies on their way to
 // match, captured in time but not read yet. So a record only leaves the
-// table once no such reply can come: when idle tells that no reply is
-// waiting to be read, or when match has been given a reply captured after
-// the record's timeout.
+// table once no such reply can come: when match has been given a reply
+// captured after the record's timeout, or when caracal was written to after
+// the record's timeout, by the previous call of expire at the latest, and
+// idle tells that no reply is waiting to be read. Caracal has then handed
+// over every reply it captured in time, and they have been read.
 func (t *caracalTable) expire(now time.Time, idle bool, fies []FIE) []FIE {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	settledWrite := t.settledWrite
+	t.settledWrite = t.lastWrite
 
 	count := 0
 	for _, record := range t.flushed {
 		if !t.expired(record, now) {
 			break
 		}
-		if !idle && !t.expired(record, t.lastCapture) {
+		handedOver := idle && t.expired(record, settledWrite)
+		if !handedOver && !t.expired(record, t.lastCapture) {
 			break
 		}
 		if !record.done {
