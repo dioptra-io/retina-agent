@@ -1,4 +1,4 @@
-.PHONY: build lint fmt tidy test smoke cover run clean setup-hooks help
+.PHONY: build lint fmt tidy test smoke scenarios cover run clean setup-hooks help
 
 help:
 	@echo "Valid targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  tidy        - Tidy go modules"
 	@echo "  test        - Run tests with race detection and generate coverage profile"
 	@echo "  smoke       - Run the agent against the mock orchestrator and check that every PD comes back as a FIE, without and with a reconnect"
+	@echo "  scenarios   - Run the agent through the scenarios of tests/scenarios.sh (pressure, loss, reconnects, failures)"
 	@echo "  cover       - View test coverage in browser"
 	@echo "  run         - Build and run retina-agent"
 	@echo "  clean       - Remove built binaries and coverage files"
@@ -32,6 +33,10 @@ smoke:
 	go build -o retina-agent .
 	./scripts/smoke-test.sh $(SMOKE_ARGS)
 	./scripts/smoke-test.sh --drop-after 5 $(SMOKE_ARGS)
+
+scenarios:
+	go build -o retina-agent .
+	./tests/scenarios.sh $(SCENARIOS)
 
 cover:
 	go tool cover -html=coverage.out

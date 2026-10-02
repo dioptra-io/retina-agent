@@ -60,6 +60,12 @@ make smoke
 make smoke SMOKE_ARGS="--count 2000 --seed 7"
 ```
 
+```bash
+make scenarios
+```
+
+`make scenarios` runs `tests/scenarios.sh`, which takes the agent through a set of scenarios with the same two mocks: a burst of PDs, PDs above the agent's rate, an orchestrator that stops reading FIEs or reads them slowly, lost and late replies, lines that are not PDs, dropped connections, a stop while PDs are in flight, caracal dying, and a rejected secret. `./tests/scenarios.sh --list` describes them, and `SCENARIOS="burst malformed"` runs only some.
+
 The scripts need bash 5, and the mock orchestrator an OpenBSD-style `nc`. Nothing is probed for real: the mock caracal sends no packets.
 
 ## Wire protocol

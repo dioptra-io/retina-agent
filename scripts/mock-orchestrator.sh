@@ -14,6 +14,15 @@
 # after one second: FIEs that come later are expected on the next connection.
 # FIEs the agent was sending at the time of the drop are lost.
 #
+# The PDs are sent as fast as the agent takes them, while the FIEs are read:
+# like the orchestrator, it never waits for FIEs before it sends more PDs.
+# With --read-delay it puts pressure on the agent: it does not read any FIE
+# for a while after it starts sending, so the agent has to hold its FIEs, and
+# then its PDs, without losing any. With --read-rate it is a slow reader for
+# the whole run: it reads no more than that many FIEs per second. With
+# --garbage it sends lines that are
+# not PDs among the first PDs, which the agent must skip.
+#
 # The PDs are made up from a seed: the same seed and count always give the
 # same PDs. Their destinations are in the documentation ranges (192.0.2.0/24,
 # 198.51.100.0/24, 203.0.113.0/24 and 2001:db8::/32), which are not routed,
@@ -48,6 +57,14 @@ Usage:
   -d, --drop-after arg
                       Drop the connection after this many PDs and wait for the
                       agent to connect again (default: 0, never)
+  -g, --garbage arg   Number of lines that are not PDs to send, one before each
+                      of the first PDs (default: 0)
+  -q, --quiet         Do not log each PD
+  -r, --read-delay arg
+                      Seconds during which no FIE is read after the PDs start
+                      to be sent on the last connection (default: 0)
+  -R, --read-rate arg
+                      Most FIEs read per second (default: 0, no limit)
   -s, --seed arg      Seed the PDs are made up from (default: 42)
   -w, --wait arg      Seconds to wait for the FIEs after the last PD is sent (default: 10)
 
@@ -63,6 +80,10 @@ fi
 address=127.0.0.1:50050
 count=10
 drop_after=0
+garbage=0
+quiet=0
+read_delay=0
+read_rate=0
 seed=42
 wait_seconds=10
 secret=${RETINA_SECRET:-}
@@ -75,7 +96,11 @@ while (($# > 0)); do
 		usage
 		exit 0
 		;;
-	-a | --address | -n | --count | -d | --drop-after | -s | --seed | -w | --wait) ;;
+	-q | --quiet)
+		quiet=1
+		continue
+		;;
+	-a | --address | -n | --count | -d | --drop-after | -g | --garbage | -r | --read-delay | -R | --read-rate | -s | --seed | -w | --wait) ;;
 	*)
 		echo "Option '${option}' does not exist" >&2
 		usage >&2
@@ -90,13 +115,16 @@ while (($# > 0)); do
 	-a | --address) address=$1 ;;
 	-n | --count) count=$1 ;;
 	-d | --drop-after) drop_after=$1 ;;
+	-g | --garbage) garbage=$1 ;;
+	-r | --read-delay) read_delay=$1 ;;
+	-R | --read-rate) read_rate=$1 ;;
 	-s | --seed) seed=$1 ;;
 	-w | --wait) wait_seconds=$1 ;;
 	esac
 	shift
 done
 
-for setting in count drop_after seed wait_seconds; do
+for setting in count drop_after garbage read_delay read_rate seed wait_seconds; do
 	if [[ ! ${!setting} =~ ^[0-9]+$ ]]; then
 		echo "${setting} must be a non-negative integer: got '${!setting}'" >&2
 		exit 1
@@ -202,8 +230,33 @@ connect() {
 	log "Agent ${agent_id} connected"
 }
 
+# send_pds sends the PDs $1 to $2 to the agent, as fast as it takes them.
+send_pds() {
+	local id
+	for ((id = $1; id <= $2; id++)); do
+		if ((id <= garbage)); then
+			printf 'this is not a PD (%d)\n' "${id}"
+		fi
+		if ((!quiet)); then
+			log "PD  ${pds[${id}]}"
+		fi
+		printf '%s\n' "${pds[${id}]}"
+	done >&"${to_agent}"
+	log "Sent the PDs $1 to $2"
+}
+
+# start_sending sends the PDs $1 to $2 in the background, so that FIEs can be
+# read meanwhile.
+sender_pid=
+start_sending() {
+	send_pds "$1" "$2" &
+	sender_pid=$!
+}
+
 # disconnect drops the agent's connection.
 disconnect() {
+	kill "${sender_pid}" 2>/dev/null || true
+	wait "${sender_pid}" 2>/dev/null || true
 	exec {from_agent}<&- {to_agent}>&-
 	kill "${nc_pid}" 2>/dev/null || true
 	wait "${nc_pid}" 2>/dev/null || true
@@ -212,6 +265,26 @@ disconnect() {
 declare -A answered=()
 received=0
 unexpected=0
+
+# pace_reading waits when the FIEs read so far are ahead of the read rate.
+lines_read=0
+reading_since=
+pace_reading() {
+	local ahead
+	if ((read_rate == 0)); then
+		return
+	fi
+	if [[ -z ${reading_since} ]]; then
+		reading_since=${EPOCHREALTIME/./}
+	fi
+	lines_read=$((lines_read + 1))
+	ahead=$((reading_since + lines_read * 1000000 / read_rate - ${EPOCHREALTIME/./}))
+	# Waiting starts a process: it is done for 5 ms or more at a time.
+	if ((ahead >= 5000)); then
+		printf -v ahead '%d.%06d' $((ahead / 1000000)) $((ahead % 1000000))
+		sleep "${ahead}"
+	fi
+}
 
 # read_fies reads the agent's FIEs until $1 PDs have their FIE, for at most $2
 # seconds, or until the agent closes the connection.
@@ -230,6 +303,7 @@ read_fies() {
 			break
 		fi
 		printf '%s\n' "${fie}"
+		pace_reading
 		if [[ ! ${fie} =~ ^([0-9]+),[0-9]+,\"[^\"]*\",[0-9]+,\"[^\"]*\",[0-9]+$ ]]; then
 			log "Not a FIE: ${fie}"
 			unexpected=$((unexpected + 1))
@@ -246,20 +320,26 @@ read_fies() {
 	done
 }
 
-trap 'kill "${nc_pid:-}" 2>/dev/null || true' EXIT
+trap 'kill "${sender_pid:-}" "${nc_pid:-}" 2>/dev/null || true' EXIT
 connect
 
-for ((id = 1; id <= count; id++)); do
-	log "PD  ${pds[${id}]}"
-	printf '%s\n' "${pds[${id}]}" >&"${to_agent}"
-	if ((id == drop_after && id < count)); then
-		read_fies "${id}" 1
-		log "Dropping the connection after ${id} PDs, ${received} FIEs received"
-		disconnect
-		connect
-	fi
-done
-log "Sent ${count} PDs, waiting up to ${wait_seconds}s for their FIEs"
+next=1
+if ((drop_after > 0 && drop_after < count)); then
+	start_sending 1 "${drop_after}"
+	wait "${sender_pid}"
+	read_fies "${drop_after}" 1
+	log "Dropping the connection after ${drop_after} PDs, ${received} FIEs received"
+	disconnect
+	connect
+	next=$((drop_after + 1))
+fi
+
+start_sending "${next}" "${count}"
+if ((read_delay > 0)); then
+	log "Not reading FIEs for ${read_delay}s"
+	sleep "${read_delay}"
+fi
+log "Waiting up to ${wait_seconds}s for the FIEs of the ${count} PDs"
 read_fies "${count}" "${wait_seconds}"
 
 if ((received == count && unexpected == 0)); then
