@@ -60,7 +60,7 @@ func run() error {
 				// option out, so that caracal uses its default.
 				BatchSize:          128,
 				LogLevel:           "info",
-				RateLimitingMethod: "auto",
+				RateLimitingMethod: "sleep", // "auto" cost caracal 21% of an e2-small vCPU at 3,100 PDs/s
 
 				ProbeTimeout:    2 * time.Second,
 				WriteBufferSize: 64 * 1024,
