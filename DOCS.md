@@ -67,6 +67,8 @@ A reply does not say which line it answers: it carries the probe's protocol, des
 - Each issuance of a PD has its own record. A PD issued again while in flight gets a second record and a second FIE.
 - One reply goes to one record: the one with the earliest flush time, then the lowest near TTL, then the one registered first.
 - A record's timeout starts at its flush time, which is taken after the write to caracal returns. It is when caracal received the probes, not when they went on the wire.
+- Whether a reply is on time is told by caracal's capture timestamp, not by when the agent reads it: a reply captured within the timeout of the flush time is accepted however long it waited to be read. This relies on the capture timestamps being Unix microseconds of the clock the agent uses.
+- A record whose timeout has passed is only expired once no reply captured in time can still be waiting to be read: when the reader of caracal's output has been idle for 10 ms, or when it has read a reply captured after the record's timeout. So when the orchestrator stops reading FIEs and the prober pauses, the PDs in flight keep their replies.
 
 Consequences:
 

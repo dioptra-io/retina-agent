@@ -22,7 +22,10 @@
 #     addresses are written as IPv6 (IPv4 as ::ffff:a.b.c.d);
 #   - the destination port of an ICMP or ICMPv6 probe comes back as 0;
 #   - capture_timestamp is in microseconds, rtt in tenths of a millisecond;
-#   - at the end of the input it waits --sniffer-wait-time seconds and exits.
+#   - at the end of the input it waits --sniffer-wait-time seconds and exits;
+#   - sending does not wait for the output: when the replies are not read,
+#     the probes go on being sent, and their replies keep the time they were
+#     captured at.
 #
 # What it does not imitate:
 #   - caracal never flushes its output, so its replies may reach the reader
@@ -278,11 +281,24 @@ send_probes() {
 	log info "probes_read=${read_count} packets_sent=${sent} packets_failed=0 filtered_low_ttl=${filtered_lo} filtered_high_ttl=${filtered_hi} filtered_prefix_excl=0 filtered_prefix_not_incl=0"
 }
 
-# capture_replies writes each reply once its capture time has come. The round
+# capture_replies writes each reply of the spool once its capture time has
+# come, until the sender is gone and the spool is read to its end. The round
 # trip time is the same for all, so they arrive in order.
 capture_replies() {
-	local reply now capture
-	while IFS= read -r reply; do
+	local reply partial='' now capture
+	while true; do
+		if ! IFS= read -r -u "${spool_fd}" reply; then
+			# The end of the spool for now. What was read is the start of a
+			# line the sender is still writing.
+			partial+=${reply}
+			if ! kill -0 "${sender_pid}" 2>/dev/null && [[ -z ${reply} ]]; then
+				break
+			fi
+			sleep_micros 1000
+			continue
+		fi
+		reply=${partial}${reply}
+		partial=''
 		capture=${reply%%,*}
 		now=${EPOCHREALTIME/./}
 		if ((capture > now)); then
@@ -297,4 +313,13 @@ log info "caracal_id=0 n_packets=${n_packets} probing_rate=${probing_rate} sniff
 echo "capture_timestamp,probe_protocol,probe_src_addr,probe_dst_addr,probe_src_port,probe_dst_port,probe_ttl,quoted_ttl,reply_src_addr,reply_protocol,reply_icmp_type,reply_icmp_code,reply_ttl,reply_size,reply_mpls_labels,rtt,round"
 log info "Reading from stdin, press CTRL+D to stop..."
 
-send_probes | capture_replies
+# The sender writes the replies to a spool file, not to a pipe, so that it
+# never waits for them to be read: like caracal's sender, which does not wait
+# for its sniffer.
+spool=$(mktemp)
+exec {spool_fd}<"${spool}"
+send_probes <&0 >"${spool}" &
+sender_pid=$!
+rm "${spool}"
+capture_replies
+wait "${sender_pid}"

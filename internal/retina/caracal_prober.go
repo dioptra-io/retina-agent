@@ -28,6 +28,10 @@ const caracalHeader = "capture_timestamp,probe_protocol,probe_src_addr,probe_dst
 // is read through.
 const caracalReadBufferSize = 64 * 1024
 
+// caracalIdleTime is how long the reader of caracal's output must have been
+// waiting for a reply before it is taken that no reply is waiting to be read.
+const caracalIdleTime = 10 * time.Millisecond
+
 // caracalExpiryPeriod is how often the PDs in flight are checked for their
 // timeout. A FIE that misses a reply is sent at most this long after the
 // timeout.
@@ -80,7 +84,9 @@ type CaracalProberConfig struct {
 	RateLimitingMethod string `json:"rate_limiting_method"`
 
 	// ProbeTimeout is how long the replies to a PD's probes are waited for,
-	// from when the probes are sent to caracal. A PD whose two probes are
+	// from when the probes are sent to caracal to when caracal captures the
+	// replies. It relies on caracal's capture timestamps and the agent's
+	// clock being the same clock. A PD whose two probes are
 	// answered gets its FIE at once; the others get theirs, with the replies
 	// that came, once the timeout has passed.
 	ProbeTimeout time.Duration `json:"probe_timeout"`
@@ -156,6 +162,11 @@ type CaracalProber struct {
 	// repliesUndecodable the lines of caracal's output that were not replies.
 	pdsUnprobeable     atomic.Uint64
 	repliesUndecodable atomic.Uint64
+	// idleSince is when the reader of caracal's output started to wait for
+	// its next line with nothing left to read, in Unix nanoseconds. It is
+	// zero while the reader is busy: decoding replies, or waiting for room in
+	// the FIE queue.
+	idleSince atomic.Int64
 }
 
 // NewCaracalProber creates a caracal prober. The caracal process is started
@@ -287,6 +298,24 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 	}
 }
 
+// readLine reads the next line of caracal's output. While it waits with
+// nothing left in the buffer, the reader counts as idle.
+func (p *CaracalProber) readLine(reader *bufio.Reader) ([]byte, error) {
+	if reader.Buffered() == 0 {
+		p.idleSince.Store(time.Now().UnixNano())
+		defer p.idleSince.Store(0)
+	}
+	return reader.ReadSlice('\n')
+}
+
+// readerIdle reports whether no reply is waiting to be read: the reader has
+// been waiting for caracal's next line for the idle time. A reader that only
+// just started to wait may be about to find replies in the pipe.
+func (p *CaracalProber) readerIdle(now time.Time) bool {
+	since := p.idleSince.Load()
+	return since != 0 && now.UnixNano()-since >= int64(caracalIdleTime)
+}
+
 // readReplies reads the replies caracal captures and gives each to a PD that
 // waits for it. It sends the FIE of a PD once both of its probes are
 // answered. It returns an error when caracal's output ends, which it only
@@ -294,7 +323,7 @@ func (p *CaracalProber) writeProbes(ctx context.Context, stdin io.WriteCloser, p
 func (p *CaracalProber) readReplies(ctx context.Context, stdout io.Reader, fies chan<- FIE) error {
 	reader := bufio.NewReaderSize(stdout, caracalReadBufferSize)
 
-	header, err := reader.ReadSlice('\n')
+	header, err := p.readLine(reader)
 	if err != nil {
 		return fmt.Errorf("cannot read caracal header: %w", err)
 	}
@@ -303,7 +332,7 @@ func (p *CaracalProber) readReplies(ctx context.Context, stdout io.Reader, fies 
 	}
 
 	for {
-		line, err := reader.ReadSlice('\n')
+		line, err := p.readLine(reader)
 		if err != nil {
 			return fmt.Errorf("cannot read caracal replies: %w", err)
 		}
@@ -324,8 +353,9 @@ func (p *CaracalProber) readReplies(ctx context.Context, stdout io.Reader, fies 
 }
 
 // expirePDs looks every expiry period for the PDs whose timeout has passed,
-// and sends their FIEs, which miss one reply or both. It returns when ctx is
-// done.
+// and sends their FIEs, which miss one reply or both. PDs whose replies may
+// still be waiting to be read are left for a later round: see
+// caracalTable.expire. It returns when ctx is done.
 func (p *CaracalProber) expirePDs(ctx context.Context, fies chan<- FIE) error {
 	ticker := time.NewTicker(caracalExpiryPeriod)
 	defer ticker.Stop()
@@ -334,7 +364,7 @@ func (p *CaracalProber) expirePDs(ctx context.Context, fies chan<- FIE) error {
 	for {
 		select {
 		case now := <-ticker.C:
-			expired = p.table.expire(now, expired[:0])
+			expired = p.table.expire(now, p.readerIdle(now), expired[:0])
 			for i := range expired {
 				select {
 				case fies <- expired[i]:

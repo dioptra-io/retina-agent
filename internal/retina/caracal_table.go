@@ -108,7 +108,11 @@ type caracalTable struct {
 	// order of their flush time, which is the order they expire in. Records
 	// whose FIE is already made stay in it until their turn.
 	flushed []*caracalRecord
-	stats   caracalTableStats
+	// lastCapture is the latest capture time among the replies given to
+	// match. Caracal writes its replies in the order it captures them, so
+	// every reply captured before it has been given to match too.
+	lastCapture time.Time
+	stats       caracalTableStats
 }
 
 // caracalTableStats are the counters of a table, since it was made.
@@ -177,20 +181,29 @@ func (t *caracalTable) markFlushed(records []*caracalRecord, now time.Time) {
 // completes the record, both of its probes being answered, match takes the
 // record out of the table and returns its FIE.
 //
-// Among the records that still wait for this reply and have not expired, the
-// one with the earliest flush time is chosen, then the one with the lowest
-// near TTL, then the one registered first.
+// Among the records that still wait for this reply, and for which it is not
+// late, the one with the earliest flush time is chosen, then the one with the
+// lowest near TTL, then the one registered first.
+//
+// Whether a reply is late for a record is told by when caracal captured it,
+// not by now, which is when it is read: a reply captured within the timeout
+// is on time however long it then waited to be read. now is only the time of
+// the FIE.
 func (t *caracalTable) match(reply *caracalReply, now time.Time) (FIE, bool) {
 	key := caracalReplyProbeKey(reply)
+	captured := time.UnixMicro(reply.CaptureMicros)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if captured.After(t.lastCapture) {
+		t.lastCapture = captured
+	}
 
 	var chosen *caracalPDNode
 	nodes := t.nodes[key]
 	for i := range nodes {
 		node := &nodes[i]
-		if node.answered() || t.expired(node.record, now) {
+		if node.answered() || t.expired(node.record, captured) {
 			continue
 		}
 		if chosen == nil || waitsBefore(node, chosen) {
@@ -233,21 +246,31 @@ func waitsBefore(a, b *caracalPDNode) bool {
 	return a.record.sequence < b.record.sequence
 }
 
-// expired reports whether the timeout of a record has passed.
-func (t *caracalTable) expired(record *caracalRecord, now time.Time) bool {
-	return !record.lastFlushTime.IsZero() && now.Sub(record.lastFlushTime) >= t.timeout
+// expired reports whether the timeout of a record has passed at the given
+// time.
+func (t *caracalTable) expired(record *caracalRecord, at time.Time) bool {
+	return !record.lastFlushTime.IsZero() && at.Sub(record.lastFlushTime) >= t.timeout
 }
 
 // expire takes the records whose timeout has passed out of the table and
 // appends their FIEs to fies. These FIEs miss one reply or both: the FIE of
 // a record with both replies was already returned by match.
-func (t *caracalTable) expire(now time.Time, fies []FIE) []FIE {
+//
+// A record whose timeout has passed may still have replies on their way to
+// match, captured in time but not read yet. So a record only leaves the
+// table once no such reply can come: when idle tells that no reply is
+// waiting to be read, or when match has been given a reply captured after
+// the record's timeout.
+func (t *caracalTable) expire(now time.Time, idle bool, fies []FIE) []FIE {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	count := 0
 	for _, record := range t.flushed {
 		if !t.expired(record, now) {
+			break
+		}
+		if !idle && !t.expired(record, t.lastCapture) {
 			break
 		}
 		if !record.done {
