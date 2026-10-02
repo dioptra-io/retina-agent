@@ -63,10 +63,15 @@ func NewAgent(config *Config, logger *slog.Logger) (*Agent, error) {
 		logger = slog.Default()
 	}
 
+	var prober Prober = NewMockProber(&config.Prober.Mock)
+	if config.Prober.Caracal != nil {
+		prober = NewCaracalProber(config.Prober.Caracal, logger)
+	}
+
 	return &Agent{
 		config: config,
 		logger: logger,
-		prober: NewMockProber(&config.Prober.Mock),
+		prober: prober,
 		pds:    make(chan PD, config.Prober.PDQueueSize),
 		fies:   make(chan FIE, config.Prober.FIEQueueSize),
 	}, nil
@@ -165,7 +170,7 @@ func (a *Agent) runSession(ctx context.Context) (time.Duration, error) {
 
 	// The queues are emptied at both ends of the session: the prober went on
 	// filling the FIE queue while there was no connection.
-	if a.config.Prober.DiscardOnDisconnect {
+	if a.config.Prober.DiscardQueuedOnDisconnect {
 		a.discardQueues()
 		defer a.discardQueues()
 	}

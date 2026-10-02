@@ -47,9 +47,9 @@ func run() error {
 			ReconnectMaxBackoff: 30 * time.Second,
 		},
 		Prober: retina.ProberConfig{
-			PDQueueSize:         1024,
-			FIEQueueSize:        1024,
-			DiscardOnDisconnect: false,
+			PDQueueSize:               1024,
+			FIEQueueSize:              1024,
+			DiscardQueuedOnDisconnect: false,
 			Mock: retina.MockProberConfig{
 				Delay:       100 * time.Millisecond,
 				MaxInflight: 100_000,

@@ -17,15 +17,18 @@ type ProberConfig struct {
 	// FIEQueueSize is how many FIEs may wait to be sent to the orchestrator.
 	// The prober pauses while the queue is full.
 	FIEQueueSize int `json:"fie_queue_size"`
-	// DiscardOnDisconnect empties both queues when the connection to the
+	// DiscardQueuedOnDisconnect empties both queues when the connection to the
 	// orchestrator is lost, and again when the next one is made. When false,
 	// what the queues hold is handled on the next connection.
 	//
 	// PDs the prober has already taken are not discarded: their FIEs are sent
 	// if they are produced after the next connection is made.
-	DiscardOnDisconnect bool `json:"discard_on_disconnect"`
+	DiscardQueuedOnDisconnect bool `json:"discard_queued_on_disconnect"`
 
-	Mock MockProberConfig `json:"mock"`
+	// Caracal configures the caracal prober. When it is nil the mock prober
+	// is used, with the Mock configuration.
+	Caracal *CaracalProberConfig `json:"caracal"`
+	Mock    MockProberConfig     `json:"mock"`
 }
 
 func (c *ProberConfig) validate() error {
@@ -34,6 +37,12 @@ func (c *ProberConfig) validate() error {
 	}
 	if c.FIEQueueSize < 0 {
 		return fmt.Errorf("FIE queue size cannot be negative: got %d", c.FIEQueueSize)
+	}
+	if c.Caracal != nil {
+		if err := c.Caracal.validate(); err != nil {
+			return fmt.Errorf("caracal: %w", err)
+		}
+		return nil
 	}
 	if err := c.Mock.validate(); err != nil {
 		return fmt.Errorf("mock: %w", err)

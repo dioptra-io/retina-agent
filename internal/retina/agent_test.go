@@ -224,7 +224,7 @@ func TestAgent_DiscardsQueuesOnDisconnect(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 
 	config := testConfig(listener.Addr().String())
-	config.Prober.DiscardOnDisconnect = true
+	config.Prober.DiscardQueuedOnDisconnect = true
 	agent, err := NewAgent(config, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
