@@ -50,9 +50,11 @@ func run() error {
 			PDQueueSize:               1024,
 			FIEQueueSize:              1024,
 			DiscardQueuedOnDisconnect: false,
-			Mock: retina.MockProberConfig{
-				Delay:       100 * time.Millisecond,
-				MaxInflight: 100_000,
+			Caracal: &retina.CaracalProberConfig{
+				Path:            "caracal",
+				Args:            []string{"--probing-rate", "20000"},
+				WriteBufferSize: 64 * 1024,
+				StopTimeout:     2 * time.Second,
 			},
 		},
 	}
