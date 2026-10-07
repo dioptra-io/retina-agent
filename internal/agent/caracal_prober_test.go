@@ -28,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/model"
-	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -6,17 +6,26 @@ Retina Agent executes coordinated network probes to infer forwarding behavior ac
 
 The agent connects to an orchestrator via TCP, receives probing directives, executes network probes, and returns forwarding information elements (FIEs).
 
-**Part of the Retina system:**
-- **Generator**: Creates probing directives
-- **Orchestrator**: Distributes directives to agents, collects FIEs
-- **Agent**: Executes network probes (this component)
+**Retina Architecture:**
+- **PD source**: Produces probing directives (PDs) as JSONL files: the
+  [Generator](https://github.com/dioptra-io/retina-generator) or the
+  [retina-tools](https://github.com/dioptra-io/retina-tools) pipeline for
+  Iris-derived directives
+- **[Orchestrator](https://github.com/dioptra-io/retina-orchestrator)**: Loads PD files,
+  distributes directives to agents, collects forwarding info elements (FIEs)
+- **[Agents](https://github.com/dioptra-io/retina-agent)** (this component): Execute network probes and
+  return measurements
+
+Orchestrator-agent communication uses Protobuf messages over length-prefixed
+TCP streams (see the `framing` package in
+[retina-commons](https://github.com/dioptra-io/retina-commons)).
 
 ## Architecture
 ```
 ┌─────────────┐
 │Orchestrator │
 └──────┬──────┘
-       │ TCP (JSON over newline-delimited stream)
+       │ TCP (length-prefixed protobuf)
        │
 ┌──────▼──────────────────────────────┐
 │         Retina Agent                │
@@ -46,7 +55,7 @@ The agent connects to an orchestrator via TCP, receives probing directives, exec
 
 ### Prerequisites
 
-- Go 1.24.4
+- Go 1.26.1
 - For production: [caracal](https://github.com/dioptra-io/caracal) and raw socket privileges
 
 ### Installation
@@ -66,7 +75,7 @@ go build -o retina-agent ./cmd/retina-agent
 Use the mock orchestrator to test the complete pipeline:
 ```bash
 # Terminal 1: Start mock orchestrator
-go run test/mock_orchestrator.go
+go run ./cmd/mock-orchestrator
 
 # Terminal 2: Start agent with mock prober
 ./retina-agent --id agent-1 --address localhost:50050 --prober-type mock
@@ -148,8 +157,9 @@ The caracal prober uses a high-throughput pipeline:
 
 ### Error Handling
 
-- **Network errors**: Trigger reconnection with exponential backoff
-- **Decode errors**: Log and skip (reconnect after `--max-consecutive-decode-errors` consecutive)
+- **Network and framing errors**: Trigger reconnection with exponential backoff; a partial or corrupt frame desynchronizes the stream, so the connection is dropped
+- **Invalid directives**: Logged, counted and skipped
+- **Other decode errors**: Log and skip (reconnect after `--max-consecutive-decode-errors` consecutive)
 - **Probe timeouts**: Expected behavior, FIE sent with nil NearInfo/FarInfo
 - **Context cancellation**: Clean shutdown
 
@@ -160,7 +170,7 @@ The caracal prober uses a high-throughput pipeline:
 1. Implement the `Prober` interface:
 ```go
 type Prober interface {
-    Probe(ctx context.Context, pd *api.ProbingDirective, ttl uint8) (*ProbeResult, error)
+    Probe(ctx context.Context, pd *model.ProbingDirective, ttl uint8) (*ProbeResult, error)
     Close() error
 }
 ```

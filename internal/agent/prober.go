@@ -10,7 +10,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/model"
+	"github.com/dioptra-io/retina-commons/v2/model"
 )
 
 var ErrDuplicatePD = errors.New("probing directive is already in-flight")

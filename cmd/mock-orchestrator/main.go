@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/framing"
-	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/dioptra-io/retina-commons/v2/framing"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 )
 
 var (
