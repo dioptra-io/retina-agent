@@ -388,9 +388,20 @@ func (p *caracalProber) handleResult(record []string) error {
 		return err
 	}
 
-	p.metrics.ICMPReplyTotal.WithLabelValues(record[10], record[11]).Inc()
+	p.metrics.ICMPReplyTotal.WithLabelValues(replyIPVersion(record[9]), record[10], record[11]).Inc()
 	p.matchAndDeliverResult(key, result)
 	return nil
+}
+
+func replyIPVersion(replyProtocol string) string {
+	switch replyProtocol {
+	case "1":
+		return "4"
+	case "58":
+		return "6"
+	default:
+		return "unknown"
+	}
 }
 
 func parseProbeResult(record []string) (*ProbeResult, error) {

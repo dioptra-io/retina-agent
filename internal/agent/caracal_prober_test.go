@@ -360,6 +360,23 @@ func TestProtocolToString(t *testing.T) {
 	}
 }
 
+func TestReplyIPVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"1":  "4",
+		"58": "6",
+		"17": "unknown",
+		"":   "unknown",
+	}
+
+	for input, expected := range tests {
+		if result := replyIPVersion(input); result != expected {
+			t.Errorf("replyIPVersion(%q): expected %s, got %s", input, expected, result)
+		}
+	}
+}
+
 func TestParseProbeResult(t *testing.T) {
 	t.Parallel()
 
