@@ -164,8 +164,8 @@ func NewMetrics(registry prometheus.Registerer, agentID string) *Metrics {
 		}, []string{"type"}),
 		ICMPReplyTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name:        "retina_agent_icmp_reply_total",
-			Help:        "Total number of ICMP replies by type and code. A rising port_unreachable rate means we are hitting end systems rather than routers.",
+			Help:        "Total number of ICMP replies by IP version, type and code.",
 			ConstLabels: constLabels,
-		}, []string{"type", "code"}),
+		}, []string{"ip_version", "type", "code"}),
 	}
 }
