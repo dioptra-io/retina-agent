@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   test:
+    name: Test & Coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

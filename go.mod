@@ -4,7 +4,7 @@ go 1.26.1
 
 require golang.org/x/sync v0.19.0
 
-require github.com/dioptra-io/retina-commons/v2 v2.0.0
+require github.com/dioptra-io/retina-commons/v2 v2.0.1
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
